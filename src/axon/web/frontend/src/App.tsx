@@ -1,6 +1,7 @@
 import { Header } from '@/components/layout/Header';
 import { StatusBar } from '@/components/layout/StatusBar';
 import { PanelLayout } from '@/components/layout/PanelLayout';
+import { ExplorerSidebar } from '@/components/explorer/ExplorerSidebar';
 import { useViewStore } from '@/stores/viewStore';
 
 export function App() {
@@ -15,11 +16,7 @@ export function App() {
       <main className="flex-1 overflow-hidden">
         {activeView === 'explorer' && (
           <PanelLayout
-            left={
-              <div className="p-2" style={{ color: 'var(--text-secondary)' }}>
-                Explorer sidebar
-              </div>
-            }
+            left={<ExplorerSidebar />}
             center={
               <div
                 className="flex items-center justify-center h-full"
