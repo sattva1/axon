@@ -58,6 +58,13 @@ axon = "axon.cli.main:app"
 
 [tool.uv.build-backend]
 module-name = "axon"
+source-exclude = [
+    "web/frontend/node_modules/**",
+    "web/frontend/src/**",
+    "web/frontend/*.ts",
+    "web/frontend/*.json",
+    "web/frontend/*.html",
+]
 
 
 [build-system]

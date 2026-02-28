@@ -19,10 +19,14 @@ from fastapi.staticfiles import StaticFiles
 logger = logging.getLogger(__name__)
 
 
+FRONTEND_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
+
+
 def create_app(
     db_path: Path,
     repo_path: Path | None = None,
     watch: bool = False,
+    dev: bool = False,
 ) -> FastAPI:
     """Build and return a fully configured FastAPI application.
 
@@ -30,6 +34,7 @@ def create_app(
         db_path: Path to the KuzuDB database directory.
         repo_path: Root of the repository (for file serving and reindex).
         watch: When True, enables SSE event streaming and reindex support.
+        dev: When True, skips static file serving (use Vite dev server instead).
 
     Returns:
         A ready-to-run FastAPI instance.
@@ -87,9 +92,11 @@ def create_app(
     app.include_router(processes_router)
     app.include_router(events_router)
 
-    # Mount frontend SPA if built assets exist
-    frontend_dist = Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist"
-    if frontend_dist.is_dir():
-        app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
+    # Mount frontend SPA if built assets exist (skip in dev mode)
+    if not dev and FRONTEND_DIR.is_dir():
+        app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+        logger.info("Serving frontend from %s", FRONTEND_DIR)
+    elif dev:
+        logger.info("Dev mode: skipping static file mount (use Vite on :5173)")
 
     return app

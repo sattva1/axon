@@ -3,6 +3,8 @@ import { ChevronRight, ChevronDown, Folder, File } from 'lucide-react';
 import { fileApi } from '@/api/client';
 import { useGraphStore } from '@/stores/graphStore';
 import type { FolderNode } from '@/types';
+import { LoadingSpinner } from '@/components/shared/LoadingSpinner';
+import { EmptyState } from '@/components/shared/EmptyState';
 
 /** Map language names to CSS variable colors. */
 const LANGUAGE_COLOR: Record<string, string> = {
@@ -58,18 +60,29 @@ export function FileTree() {
 
   if (loading) {
     return (
-      <div className="p-2" style={{ color: 'var(--text-secondary)' }}>
-        Loading file tree...
+      <div className="p-4">
+        <LoadingSpinner message="Loading file tree..." />
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="p-2" style={{ color: 'var(--danger)' }}>
-        Error: {error}
+      <div
+        className="p-2"
+        style={{
+          color: 'var(--danger)',
+          fontFamily: "'JetBrains Mono', monospace",
+          fontSize: 11,
+        }}
+      >
+        {error}
       </div>
     );
+  }
+
+  if (tree.length === 0) {
+    return <EmptyState message="No files indexed" />;
   }
 
   return (

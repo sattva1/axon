@@ -14,6 +14,7 @@ import { DeadCodeReport } from './DeadCodeReport';
 import { CouplingHeatmap } from './CouplingHeatmap';
 import { InheritanceTree } from './InheritanceTree';
 import { BranchDiff } from './BranchDiff';
+import { LoadingSpinner } from '@/components/shared/LoadingSpinner';
 
 interface DashboardData {
   health: HealthScoreType | null;
@@ -50,15 +51,19 @@ function Card({
   title,
   children,
   style,
+  loading: isLoading,
 }: {
   title: string;
   children: React.ReactNode;
   style?: React.CSSProperties;
+  loading?: boolean;
 }) {
   return (
-    <div style={{ ...CARD_STYLE, ...style }}>
+    <div style={{ ...CARD_STYLE, ...style, position: 'relative' }}>
       <h3 style={HEADING_STYLE}>{title}</h3>
-      <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>{children}</div>
+      <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
+        {isLoading ? <LoadingSpinner /> : children}
+      </div>
     </div>
   );
 }
@@ -136,15 +141,14 @@ export function AnalysisView() {
         padding: 8,
         height: '100%',
         overflow: 'auto',
-        opacity: loading ? 0.6 : 1,
-        transition: 'opacity 0.2s',
+        opacity: 1,
       }}
     >
       {/* Row 1 */}
-      <Card title="Health Score">
+      <Card title="Health Score" loading={loading}>
         <HealthScore data={data.health} />
       </Card>
-      <Card title="Quick Stats">
+      <Card title="Quick Stats" loading={loading}>
         <QuickStats
           overview={data.overview}
           health={data.health}
@@ -156,18 +160,18 @@ export function AnalysisView() {
       </Card>
 
       {/* Row 2 */}
-      <Card title="Dead Code Report" style={{ gridColumn: 'span 1' }}>
+      <Card title="Dead Code Report" style={{ gridColumn: 'span 1' }} loading={loading}>
         <DeadCodeReport data={data.deadCode} />
       </Card>
-      <Card title="Coupling Heatmap" style={{ gridColumn: 'span 1' }}>
+      <Card title="Coupling Heatmap" style={{ gridColumn: 'span 1' }} loading={loading}>
         <CouplingHeatmap pairs={data.coupling} />
       </Card>
 
       {/* Row 3 */}
-      <Card title="Inheritance Tree" style={{ gridColumn: 'span 1' }}>
+      <Card title="Inheritance Tree" style={{ gridColumn: 'span 1' }} loading={loading}>
         <InheritanceTree />
       </Card>
-      <Card title="Branch Diff" style={{ gridColumn: 'span 1' }}>
+      <Card title="Branch Diff" style={{ gridColumn: 'span 1' }} loading={loading}>
         <BranchDiff />
       </Card>
     </div>

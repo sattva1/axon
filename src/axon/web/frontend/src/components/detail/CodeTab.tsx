@@ -3,6 +3,7 @@ import { fileApi, graphApi } from '@/api/client';
 import { useDataStore } from '@/stores/dataStore';
 import { codeToHtml } from 'shiki';
 import type { NodeContext } from '@/types';
+import { LoadingSpinner } from '@/components/shared/LoadingSpinner';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -139,8 +140,8 @@ export function CodeTab({ nodeId }: CodeTabProps) {
   // Loading
   if (loading['code']) {
     return (
-      <div className="p-2" style={{ color: 'var(--text-secondary)', fontSize: 11 }}>
-        <span style={{ color: 'var(--accent)' }}>{'\u25CF'}</span> Loading...
+      <div className="p-4">
+        <LoadingSpinner message="Loading source..." />
       </div>
     );
   }

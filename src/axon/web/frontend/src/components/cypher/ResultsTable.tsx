@@ -1,6 +1,7 @@
 import { useState, useMemo, useCallback } from 'react';
 import { RESULTS_PAGE_SIZE } from '@/lib/constants';
 import type { CypherResult } from '@/types';
+import { EmptyState } from '@/components/shared/EmptyState';
 
 interface ResultsTableProps {
   result: CypherResult | null;
@@ -105,16 +106,7 @@ export function ResultsTable({ result, error }: ResultsTableProps) {
   }
 
   if (!result) {
-    return (
-      <div className="flex items-center justify-center h-full">
-        <span
-          className="text-[11px]"
-          style={{ color: 'var(--text-dimmed)', fontFamily: "'JetBrains Mono', monospace" }}
-        >
-          Run a query to see results
-        </span>
-      </div>
-    );
+    return <EmptyState message="Run a query to see results" />;
   }
 
   return (

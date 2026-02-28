@@ -5,6 +5,7 @@ import { useGraphStore } from '@/stores/graphStore';
 import { useViewStore } from '@/stores/viewStore';
 import type { GraphNode, CallerCalleeEntry } from '@/types';
 import { Zap, Eye } from 'lucide-react';
+import { LoadingSpinner } from '@/components/shared/LoadingSpinner';
 
 // ---------------------------------------------------------------------------
 // Type badge helper
@@ -294,8 +295,8 @@ export function ContextTab({ nodeId }: ContextTabProps) {
   // Loading
   if (loading['nodeContext']) {
     return (
-      <div className="p-2" style={{ color: 'var(--text-secondary)', fontSize: 11 }}>
-        <span style={{ color: 'var(--accent)' }}>{'\u25CF'}</span> Loading...
+      <div className="p-4">
+        <LoadingSpinner message="Loading context..." />
       </div>
     );
   }

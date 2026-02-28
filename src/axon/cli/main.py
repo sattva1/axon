@@ -489,7 +489,7 @@ def ui(
 
     from axon.web.app import create_app
 
-    web_app = create_app(db_path=db_path, repo_path=repo_path, watch=watch_files)
+    web_app = create_app(db_path=db_path, repo_path=repo_path, watch=watch_files, dev=dev)
 
     if not no_open:
         import threading

@@ -4,6 +4,7 @@ import { ContextTab } from './ContextTab';
 import { ImpactTab } from './ImpactTab';
 import { CodeTab } from './CodeTab';
 import { ProcessesTab } from './ProcessesTab';
+import { EmptyState } from '@/components/shared/EmptyState';
 
 const TABS: { id: RightTab; label: string }[] = [
   { id: 'context', label: 'Context' },
@@ -60,16 +61,7 @@ export function DetailPanel() {
       {/* Content */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden">
         {!selectedNodeId ? (
-          <div
-            className="flex items-center justify-center h-full"
-            style={{
-              color: 'var(--text-dimmed)',
-              fontFamily: "'JetBrains Mono', monospace",
-              fontSize: 12,
-            }}
-          >
-            Select a node on the graph
-          </div>
+          <EmptyState message="Select a node on the graph" />
         ) : (
           <>
             {activeTab === 'context' && <ContextTab nodeId={selectedNodeId} />}

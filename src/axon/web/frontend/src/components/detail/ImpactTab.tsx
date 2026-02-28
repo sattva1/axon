@@ -4,6 +4,7 @@ import { useDataStore } from '@/stores/dataStore';
 import { useGraphStore } from '@/stores/graphStore';
 import type { ImpactResult, GraphNode } from '@/types';
 import { ChevronDown, ChevronRight, Radar } from 'lucide-react';
+import { LoadingSpinner } from '@/components/shared/LoadingSpinner';
 
 // ---------------------------------------------------------------------------
 // Type badge (reused pattern)
@@ -235,8 +236,8 @@ export function ImpactTab({ nodeId }: ImpactTabProps) {
   // Loading
   if (loading['impact']) {
     return (
-      <div className="p-2" style={{ color: 'var(--text-secondary)', fontSize: 11 }}>
-        <span style={{ color: 'var(--accent)' }}>{'\u25CF'}</span> Loading...
+      <div className="p-4">
+        <LoadingSpinner message="Analyzing impact..." />
       </div>
     );
   }

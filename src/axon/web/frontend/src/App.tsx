@@ -7,6 +7,7 @@ import { DetailPanel } from '@/components/detail/DetailPanel';
 import { AnalysisView } from '@/components/analysis/AnalysisView';
 import { CypherView } from '@/components/cypher/CypherView';
 import { CommandPalette } from '@/components/shared/CommandPalette';
+import { ErrorBoundary } from '@/components/shared/ErrorBoundary';
 import { useKeyboard } from '@/hooks/useKeyboard';
 import { useViewStore } from '@/stores/viewStore';
 import { useSSE } from '@/hooks/useSSE';
@@ -25,15 +26,17 @@ export function App() {
     >
       <Header />
       <main className="flex-1 overflow-hidden">
-        {activeView === 'explorer' && (
-          <PanelLayout
-            left={<ExplorerSidebar />}
-            center={<GraphCanvas />}
-            right={<DetailPanel />}
-          />
-        )}
-        {activeView === 'analysis' && <AnalysisView />}
-        {activeView === 'cypher' && <CypherView />}
+        <ErrorBoundary>
+          {activeView === 'explorer' && (
+            <PanelLayout
+              left={<ExplorerSidebar />}
+              center={<GraphCanvas />}
+              right={<DetailPanel />}
+            />
+          )}
+          {activeView === 'analysis' && <AnalysisView />}
+          {activeView === 'cypher' && <CypherView />}
+        </ErrorBoundary>
       </main>
       <StatusBar />
       <CommandPalette />
