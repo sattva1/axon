@@ -18,6 +18,7 @@ from axon.core.graph.model import (
     generate_id,
 )
 from axon.core.ingestion.parser_phase import FileParseData
+from axon.core.ingestion.resolved import ResolvedEdge
 from axon.core.parsers.base import ImportInfo
 
 logger = logging.getLogger(__name__)
@@ -101,10 +102,74 @@ def resolve_import_path(
 
     return None
 
+def resolve_file_imports(
+    fpd: FileParseData,
+    file_index: dict[str, str],
+    source_roots: set[str],
+) -> list[ResolvedEdge]:
+    """Resolve imports for a single file — pure read, no graph mutation.
+
+    Returns one :class:`ResolvedEdge` per unique ``(source, target)`` pair
+    with per-file merged symbols.  Cross-file symbol merging happens in the
+    caller.
+    """
+    source_file_id = generate_id(NodeLabel.FILE, fpd.file_path)
+    # Per-file dedup: merge symbols for same (source, target) pair.
+    pair_symbols: dict[str, set[str]] = {}
+
+    for imp in fpd.parse_result.imports:
+        target_id = resolve_import_path(fpd.file_path, imp, file_index, source_roots)
+        if target_id is None:
+            continue
+        if target_id not in pair_symbols:
+            pair_symbols[target_id] = set()
+        pair_symbols[target_id].update(imp.names)
+
+    edges: list[ResolvedEdge] = []
+    for target_id, symbols in pair_symbols.items():
+        rel_id = f"imports:{source_file_id}->{target_id}"
+        edges.append(ResolvedEdge(
+            rel_id=rel_id,
+            rel_type=RelType.IMPORTS,
+            source=source_file_id,
+            target=target_id,
+            properties={"symbols": symbols},
+        ))
+    return edges
+
+
+def _write_import_edges(
+    all_edges: list[list[ResolvedEdge]],
+    graph: KnowledgeGraph,
+) -> None:
+    """Merge cross-file symbol sets and write IMPORTS edges to the graph."""
+    merged: dict[str, tuple[str, str, set[str]]] = {}
+    for file_edges in all_edges:
+        for edge in file_edges:
+            if edge.rel_id in merged:
+                merged[edge.rel_id][2].update(edge.properties["symbols"])
+            else:
+                merged[edge.rel_id] = (edge.source, edge.target, set(edge.properties["symbols"]))
+
+    for rel_id, (source, target, symbols) in merged.items():
+        graph.add_relationship(
+            GraphRelationship(
+                id=rel_id,
+                type=RelType.IMPORTS,
+                source=source,
+                target=target,
+                properties={"symbols": ",".join(sorted(symbols))},
+            )
+        )
+
+
 def process_imports(
     parse_data: list[FileParseData],
     graph: KnowledgeGraph,
-) -> None:
+    *,
+    parallel: bool = False,
+    collect: bool = False,
+) -> list[ResolvedEdge] | None:
     """Resolve imports and create IMPORTS relationships in the graph.
 
     For each file's parsed imports, resolves the target file and creates
@@ -114,36 +179,30 @@ def process_imports(
     Args:
         parse_data: Parse results from the parsing phase.
         graph: The knowledge graph to populate with IMPORTS relationships.
+        parallel: When ``True``, resolve files in parallel using threads.
+        collect: When ``True``, return flat list of edges instead of writing.
     """
     file_index = build_file_index(graph)
     source_roots = _detect_source_roots(file_index)
-    # Merge symbols from multiple imports of the same file pair.
-    seen: dict[tuple[str, str], set[str]] = {}
 
-    for fpd in parse_data:
-        source_file_id = generate_id(NodeLabel.FILE, fpd.file_path)
+    if parallel:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
 
-        for imp in fpd.parse_result.imports:
-            target_id = resolve_import_path(fpd.file_path, imp, file_index, source_roots)
-            if target_id is None:
-                continue
+        workers = min(os.cpu_count() or 4, 8, len(parse_data))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            all_edges = list(pool.map(
+                lambda fpd: resolve_file_imports(fpd, file_index, source_roots),
+                parse_data,
+            ))
+    else:
+        all_edges = [resolve_file_imports(fpd, file_index, source_roots) for fpd in parse_data]
 
-            pair = (source_file_id, target_id)
-            if pair not in seen:
-                seen[pair] = set()
-            seen[pair].update(imp.names)
+    if collect:
+        return [edge for file_edges in all_edges for edge in file_edges]
 
-    for (source_file_id, target_id), symbols in seen.items():
-        rel_id = f"imports:{source_file_id}->{target_id}"
-        graph.add_relationship(
-            GraphRelationship(
-                id=rel_id,
-                type=RelType.IMPORTS,
-                source=source_file_id,
-                target=target_id,
-                properties={"symbols": ",".join(sorted(symbols))},
-            )
-        )
+    _write_import_edges(all_edges, graph)
+    return None
 
 def _detect_language(file_path: str) -> str:
     """Infer language from a file's extension."""

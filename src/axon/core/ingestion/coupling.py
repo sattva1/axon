@@ -25,6 +25,7 @@ from axon.core.graph.model import (
     RelType,
     generate_id,
 )
+from axon.core.ingestion.resolved import ResolvedEdge
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +168,52 @@ def calculate_coupling(
         return 0.0
     return co_changes / max_changes
 
+def resolve_coupling(
+    graph: KnowledgeGraph,
+    repo_path: Path,
+    min_strength: float = 0.3,
+    *,
+    commits: list[list[str]] | None = None,
+    min_cochanges: int = 3,
+) -> list[ResolvedEdge]:
+    """Compute coupling edges without writing to the graph.
+
+    Does the git log parsing, co-change matrix, and strength calculation,
+    returning a list of :class:`ResolvedEdge` objects ready to be written.
+    """
+    file_nodes = graph.get_nodes_by_label(NodeLabel.FILE)
+    graph_files: set[str] = {n.file_path for n in file_nodes}
+
+    if commits is None:
+        commits = parse_git_log(repo_path, graph_files=graph_files)
+
+    cochange, total_changes = build_cochange_matrix(commits, min_cochanges=min_cochanges)
+
+    path_to_id: dict[str, str] = {n.file_path: n.id for n in file_nodes}
+
+    edges: list[ResolvedEdge] = []
+    for (file_a, file_b), co_changes in cochange.items():
+        strength = calculate_coupling(file_a, file_b, co_changes, total_changes)
+        if strength < min_strength:
+            continue
+
+        id_a = path_to_id.get(file_a)
+        id_b = path_to_id.get(file_b)
+        if id_a is None or id_b is None:
+            continue
+
+        rel_id = f"coupled:{id_a}->{id_b}"
+        edges.append(ResolvedEdge(
+            rel_id=rel_id,
+            rel_type=RelType.COUPLED_WITH,
+            source=id_a,
+            target=id_b,
+            properties={"strength": strength, "co_changes": co_changes},
+        ))
+
+    return edges
+
+
 def process_coupling(
     graph: KnowledgeGraph,
     repo_path: Path,
@@ -194,38 +241,21 @@ def process_coupling(
     Returns:
         The number of ``COUPLED_WITH`` relationships created.
     """
-    file_nodes = graph.get_nodes_by_label(NodeLabel.FILE)
-    graph_files: set[str] = {n.file_path for n in file_nodes}
+    edges = resolve_coupling(
+        graph, repo_path, min_strength,
+        commits=commits, min_cochanges=min_cochanges,
+    )
 
-    if commits is None:
-        commits = parse_git_log(repo_path, graph_files=graph_files)
-
-    cochange, total_changes = build_cochange_matrix(commits, min_cochanges=min_cochanges)
-
-    path_to_id: dict[str, str] = {n.file_path: n.id for n in file_nodes}
-
-    count = 0
-    for (file_a, file_b), co_changes in cochange.items():
-        strength = calculate_coupling(file_a, file_b, co_changes, total_changes)
-        if strength < min_strength:
-            continue
-
-        id_a = path_to_id.get(file_a)
-        id_b = path_to_id.get(file_b)
-        if id_a is None or id_b is None:
-            continue
-
-        rel_id = f"coupled:{id_a}->{id_b}"
+    for edge in edges:
         graph.add_relationship(
             GraphRelationship(
-                id=rel_id,
-                type=RelType.COUPLED_WITH,
-                source=id_a,
-                target=id_b,
-                properties={"strength": strength, "co_changes": co_changes},
+                id=edge.rel_id,
+                type=edge.rel_type,
+                source=edge.source,
+                target=edge.target,
+                properties=edge.properties,
             )
         )
-        count += 1
 
-    logger.info("Created %d COUPLED_WITH relationships", count)
-    return count
+    logger.info("Created %d COUPLED_WITH relationships", len(edges))
+    return len(edges)

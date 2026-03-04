@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,12 +32,13 @@ from axon.core.graph.model import GraphRelationship, NodeLabel
 from axon.core.embeddings.embedder import embed_graph
 from axon.core.ingestion.calls import process_calls
 from axon.core.ingestion.community import process_communities
-from axon.core.ingestion.coupling import process_coupling
+from axon.core.ingestion.coupling import resolve_coupling
 from axon.core.ingestion.dead_code import process_dead_code
 from axon.core.ingestion.heritage import process_heritage
 from axon.core.ingestion.imports import process_imports
 from axon.core.ingestion.parser_phase import process_parsing
 from axon.core.ingestion.processes import process_processes
+from axon.core.ingestion.resolved import ResolvedEdge
 from axon.core.ingestion.structure import process_structure
 from axon.core.ingestion.symbol_lookup import build_name_index
 from axon.core.ingestion.types import process_types
@@ -65,6 +67,23 @@ _SYMBOL_LABELS: frozenset[NodeLabel] = frozenset(NodeLabel) - {
     NodeLabel.COMMUNITY,
     NodeLabel.PROCESS,
 }
+
+def _write_collected_edges(
+    edges: list[ResolvedEdge],
+    graph: KnowledgeGraph,
+) -> None:
+    """Write a batch of resolved edges to the graph (sequential, deduped)."""
+    for edge in edges:
+        graph.add_relationship(
+            GraphRelationship(
+                id=edge.rel_id,
+                type=edge.rel_type,
+                source=edge.source,
+                target=edge.target,
+                properties=edge.properties,
+            )
+        )
+
 
 def run_pipeline(
     repo_path: Path,
@@ -121,7 +140,7 @@ def run_pipeline(
     report("Parsing code", 1.0)
 
     report("Resolving imports", 0.0)
-    process_imports(parse_data, graph)
+    process_imports(parse_data, graph, parallel=True)
     report("Resolving imports", 1.0)
 
     # Build shared name index once — used by calls, heritage, and types phases.
@@ -131,33 +150,49 @@ def run_pipeline(
     )
     shared_name_index = build_name_index(graph, _SHARED_LABELS)
 
-    report("Tracing calls", 0.0)
-    process_calls(parse_data, graph, name_index=shared_name_index)
-    report("Tracing calls", 1.0)
+    # --- Phase-level concurrency: calls/heritage/types resolve in parallel ---
+    report("Resolving relationships", 0.0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        calls_f = pool.submit(
+            process_calls, parse_data, graph,
+            name_index=shared_name_index, parallel=False, collect=True,
+        )
+        heritage_f = pool.submit(
+            process_heritage, parse_data, graph,
+            name_index=shared_name_index, parallel=False, collect=True,
+        )
+        types_f = pool.submit(
+            process_types, parse_data, graph,
+            name_index=shared_name_index, parallel=False, collect=True,
+        )
 
-    report("Extracting heritage", 0.0)
-    process_heritage(parse_data, graph, name_index=shared_name_index)
-    report("Extracting heritage", 1.0)
+    # Sequential batch write — all edges collected, graph is single-threaded.
+    _write_collected_edges(calls_f.result() or [], graph)
+    _write_collected_edges(heritage_f.result() or [], graph)
+    _write_collected_edges(types_f.result() or [], graph)
+    report("Resolving relationships", 1.0)
 
-    report("Analyzing types", 0.0)
-    process_types(parse_data, graph, name_index=shared_name_index)
-    report("Analyzing types", 1.0)
+    # --- Overlap coupling (git I/O) with sequential global phases ---
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        coupling_future = pool.submit(resolve_coupling, graph, repo_path)
 
-    report("Detecting communities", 0.0)
-    result.clusters = process_communities(graph)
-    report("Detecting communities", 1.0)
+        report("Detecting communities", 0.0)
+        result.clusters = process_communities(graph)
+        report("Detecting communities", 1.0)
 
-    report("Detecting execution flows", 0.0)
-    result.processes = process_processes(graph)
-    report("Detecting execution flows", 1.0)
+        report("Detecting execution flows", 0.0)
+        result.processes = process_processes(graph)
+        report("Detecting execution flows", 1.0)
 
-    report("Finding dead code", 0.0)
-    result.dead_code = process_dead_code(graph)
-    report("Finding dead code", 1.0)
+        report("Finding dead code", 0.0)
+        result.dead_code = process_dead_code(graph)
+        report("Finding dead code", 1.0)
 
-    report("Analyzing git history", 0.0)
-    result.coupled_pairs = process_coupling(graph, repo_path)
-    report("Analyzing git history", 1.0)
+        report("Analyzing git history", 0.0)
+        coupling_edges = coupling_future.result()
+        _write_collected_edges(coupling_edges, graph)
+        result.coupled_pairs = len(coupling_edges)
+        report("Analyzing git history", 1.0)
 
     # Compute result counts before the optional embedding step so a
     # fastembed failure never leaves symbols/relationships at zero.
@@ -219,6 +254,9 @@ def reindex_files(
     KnowledgeGraph
         The partial in-memory graph containing only the reindexed files.
     """
+    # Deliberately sequential — the watcher path handles 1-3 files and
+    # runs in <100ms.  Concurrency overhead isn't worth it here.
+
     # DETACH DELETE drops inbound edges from unchanged files — save them
     # before deletion and re-insert after rebuild.
     changed_files = {entry.path for entry in file_entries}

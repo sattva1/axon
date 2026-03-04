@@ -113,8 +113,7 @@ class TestRunPipelineProgressCallback:
         assert "Processing structure" in phase_names
         assert "Parsing code" in phase_names
         assert "Resolving imports" in phase_names
-        assert "Tracing calls" in phase_names
-        assert "Extracting heritage" in phase_names
+        assert "Resolving relationships" in phase_names
         assert "Loading to storage" in phase_names
 
 
@@ -242,16 +241,16 @@ class TestRunPipelineProgressIncludesNewPhases:
 
         phase_names = {name for name, _ in calls}
 
-        # Phases 1-6 (existing).
+        # Phases 1-4 (sequential).
         assert "Walking files" in phase_names
         assert "Processing structure" in phase_names
         assert "Parsing code" in phase_names
         assert "Resolving imports" in phase_names
-        assert "Tracing calls" in phase_names
-        assert "Extracting heritage" in phase_names
 
-        # Phases 7-11 (new).
-        assert "Analyzing types" in phase_names
+        # Phases 5-7 (concurrent calls/heritage/types).
+        assert "Resolving relationships" in phase_names
+
+        # Phases 8-11 (global).
         assert "Detecting communities" in phase_names
         assert "Detecting execution flows" in phase_names
         assert "Finding dead code" in phase_names
