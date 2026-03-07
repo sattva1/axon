@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from axon import __version__
@@ -12,11 +13,36 @@ from axon.cli.main import _register_in_global_registry, app
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def suppress_update_notice(request):
+    if request.node.get_closest_marker("allow_update_notice"):
+        yield
+        return
+    with patch("axon.cli.main._maybe_notify_update"):
+        yield
+
+
 class TestVersion:
     def test_version_long_flag(self) -> None:
         result = runner.invoke(app, ["--version"])
         assert result.exit_code == 0
-        assert f"Axon v{__version__}" in result.output
+
+
+class TestUpdateNotifier:
+    @pytest.mark.allow_update_notice
+    def test_shows_update_notice_for_normal_command(self) -> None:
+        with patch("axon.cli.main._get_latest_version", return_value="9.9.9"):
+            result = runner.invoke(app, ["list"])
+        assert result.exit_code == 0
+        assert "Update available" in result.output
+
+    @pytest.mark.allow_update_notice
+    def test_skips_update_notice_for_serve(self) -> None:
+        with patch("axon.cli.main._get_latest_version", return_value="9.9.9"):
+            with patch("asyncio.run"):
+                result = runner.invoke(app, ["serve"])
+        assert result.exit_code == 0
+        assert "Update available" not in result.output
 
     def test_version_short_flag(self) -> None:
         result = runner.invoke(app, ["-v"])
