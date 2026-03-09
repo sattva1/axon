@@ -43,5 +43,23 @@ jobs:
         run: npm ci && npm run build
 
       - uses: astral-sh/setup-uv@v5
-      - run: uv build
+
+      - name: Build sdist and wheel independently
+        run: |
+          uv build --sdist
+          uv build --wheel
+
+      - name: Verify wheel contains source
+        run: |
+          python3 -c "
+          import zipfile, sys, pathlib
+          whl = next(p for p in pathlib.Path('dist').iterdir() if p.suffix == '.whl')
+          with zipfile.ZipFile(whl) as z:
+            py_files = [n for n in z.namelist() if n.endswith('.py')]
+            print(f'Wheel contains {len(py_files)} Python files')
+            if len(py_files) < 10:
+              print('ERROR: Wheel appears empty — aborting publish')
+              sys.exit(1)
+          "
+
       - run: uv publish
