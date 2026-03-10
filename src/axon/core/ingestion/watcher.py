@@ -195,7 +195,7 @@ def _run_incremental_global_phases(
         try:
             meta = json.loads(meta_path.read_text())
             stored_model = meta.get("embedding_model")
-            if stored_model is not None and stored_model != _DEFAULT_MODEL:
+            if stored_model != _DEFAULT_MODEL:
                 needs_full_reembed = True
         except Exception:
             pass

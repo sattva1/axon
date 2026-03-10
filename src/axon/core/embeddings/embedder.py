@@ -183,7 +183,7 @@ def embed_nodes(
     for node in nodes:
         text = generate_text(node, graph, class_method_idx)
         if text and text.strip():
-            texts.append(text)
+            texts.append(text[:_MAX_TEXT_CHARS])
             valid_nodes.append(node)
 
     if not texts:
