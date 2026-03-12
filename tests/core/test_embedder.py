@@ -127,7 +127,7 @@ class TestModelDefaults:
         assert _DEFAULT_DIMENSIONS == 384
 
     def test_default_batch_size(self) -> None:
-        assert _DEFAULT_BATCH_SIZE == 128
+        assert _DEFAULT_BATCH_SIZE == 32
 
 
 class TestEmbeddableLabels:
@@ -318,7 +318,9 @@ class TestEmbedGraphModelConfig:
 
         embed_graph(sample_graph)
 
-        mock_te_cls.assert_called_once_with(model_name="nomic-ai/nomic-embed-text-v1.5")
+        mock_te_cls.assert_called_once()
+        assert mock_te_cls.call_args.kwargs["model_name"] == "nomic-ai/nomic-embed-text-v1.5"
+        assert mock_te_cls.call_args.kwargs["threads"] >= 2
 
     @patch("fastembed.TextEmbedding")
     def test_custom_model_name(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
@@ -330,7 +332,8 @@ class TestEmbedGraphModelConfig:
 
         embed_graph(sample_graph, model_name="BAAI/bge-base-en-v1.5")
 
-        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-base-en-v1.5")
+        mock_te_cls.assert_called_once()
+        assert mock_te_cls.call_args.kwargs["model_name"] == "BAAI/bge-base-en-v1.5"
 
     @patch("fastembed.TextEmbedding")
     def test_custom_batch_size_passed_to_passage_embed(
@@ -424,7 +427,7 @@ class TestEmbedGraphBatchProcessing:
         assert all(len(r.embedding) == EMBEDDING_DIMENSIONS for r in results)
 
     @patch("fastembed.TextEmbedding")
-    def test_default_batch_size_is_128(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
+    def test_default_batch_size_is_32(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
         mock_model = MagicMock()
         mock_model.passage_embed.return_value = iter(
             [_vec768([0.1, 0.2, 0.3]), _vec768([0.4, 0.5, 0.6])]
@@ -434,8 +437,8 @@ class TestEmbedGraphBatchProcessing:
         embed_graph(sample_graph)
 
         embed_call = mock_model.passage_embed.call_args
-        assert embed_call.kwargs.get("batch_size") == 128 or (
-            len(embed_call.args) > 1 and embed_call.args[1] == 128
+        assert embed_call.kwargs.get("batch_size") == 32 or (
+            len(embed_call.args) > 1 and embed_call.args[1] == 32
         )
 
 

@@ -48,6 +48,55 @@ MAX_DIRTY_AGE = 60.0
 _POLL_INTERVAL_MS = 500
 
 
+def _embedding_meta_path(repo_path: Path) -> Path:
+    return repo_path / ".axon" / "meta.json"
+
+
+def _load_embedding_meta(repo_path: Path) -> dict | None:
+    meta_path = _embedding_meta_path(repo_path)
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.debug("Failed to read meta.json", exc_info=True)
+        return None
+
+
+def ensure_current_embeddings(storage: StorageBackend, repo_path: Path) -> bool:
+    """Re-embed the full graph when the stored embedding model is outdated."""
+    meta = _load_embedding_meta(repo_path)
+    if meta is None:
+        return False
+
+    stored_model = meta.get("embedding_model")
+    if stored_model == _DEFAULT_MODEL:
+        return False
+
+    logger.info(
+        "Embedding model changed from %s to %s, re-embedding all symbols",
+        stored_model or "unknown",
+        _DEFAULT_MODEL,
+    )
+
+    try:
+        graph = storage.load_graph()
+        embeddings = embed_graph(graph)
+        if embeddings:
+            storage.store_embeddings(embeddings)
+
+        meta["embedding_model"] = _DEFAULT_MODEL
+        meta["embedding_dimensions"] = EMBEDDING_DIMENSIONS
+        _embedding_meta_path(repo_path).write_text(
+            json.dumps(meta, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return True
+    except Exception:
+        logger.warning("Full re-embedding failed", exc_info=True)
+        return False
+
+
 def _get_head_sha(repo_path: Path) -> str | None:
     """Return the current git HEAD sha, or None if not in a git repo."""
     try:
@@ -188,36 +237,7 @@ def _run_incremental_global_phases(
             storage.add_relationships(coupled_rels)
         logger.info("Coupling: %d pairs", num_coupled)
 
-    # Check if embedding model changed — if so, re-embed everything
-    meta_path = repo_path / ".axon" / "meta.json"
-    needs_full_reembed = False
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text())
-            stored_model = meta.get("embedding_model")
-            if stored_model != _DEFAULT_MODEL:
-                needs_full_reembed = True
-        except Exception:
-            pass
-
-    if needs_full_reembed:
-        logger.info("Embedding model changed, re-embedding all symbols")
-        try:
-            embeddings = embed_graph(graph)
-            if embeddings:
-                storage.store_embeddings(embeddings)
-            # Update meta with new model info
-            if meta_path.exists():
-                try:
-                    meta = json.loads(meta_path.read_text())
-                    meta["embedding_model"] = _DEFAULT_MODEL
-                    meta["embedding_dimensions"] = EMBEDDING_DIMENSIONS
-                    meta_path.write_text(json.dumps(meta, indent=2) + "\n")
-                except Exception:
-                    logger.debug("Failed to update meta.json", exc_info=True)
-        except Exception:
-            logger.warning("Full re-embedding failed", exc_info=True)
-    else:
+    if not ensure_current_embeddings(storage, repo_path):
         dirty_node_ids = _compute_dirty_node_ids(graph, dirty_files)
         if dirty_node_ids:
             logger.info("Re-embedding %d nodes...", len(dirty_node_ids))

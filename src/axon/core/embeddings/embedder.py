@@ -12,6 +12,7 @@ richness that makes embedding worthwhile.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -38,7 +39,11 @@ def _get_model(model_name: str) -> "TextEmbedding":
         if cached is not None:
             return cached
         from fastembed import TextEmbedding
-        model = TextEmbedding(model_name=model_name)
+
+        # Cap ONNX threads to avoid saturating all CPU cores.
+        # Default to half the available cores (minimum 2).
+        max_threads = max(2, os.cpu_count() // 2) if os.cpu_count() else 2
+        model = TextEmbedding(model_name=model_name, threads=max_threads)
         _model_cache[model_name] = model
         return model
 
@@ -66,7 +71,7 @@ EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
 
 _DEFAULT_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 _DEFAULT_DIMENSIONS = EMBEDDING_DIMENSIONS  # 384 via Matryoshka
-_DEFAULT_BATCH_SIZE = 128
+_DEFAULT_BATCH_SIZE = 32
 _MAX_TEXT_CHARS = 8192
 
 
