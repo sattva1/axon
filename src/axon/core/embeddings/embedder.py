@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 _model_cache: dict[str, "TextEmbedding"] = {}
 _model_lock = threading.Lock()
 
+# BGE-small max sequence is 512 tokens (~2000 chars).  Truncating long
+# descriptions avoids wasting tokenisation and padding time on text that
+# the model would discard anyway.
+_MAX_TEXT_CHARS = 2000
+
 
 def _get_model(model_name: str) -> "TextEmbedding":
     cached = _model_cache.get(model_name)
@@ -144,7 +149,6 @@ def embed_graph(
         Python ``list[float]``.
     """
     all_nodes = [n for n in graph.iter_nodes() if n.label in EMBEDDABLE_LABELS]
-
     if not all_nodes:
         return []
 
@@ -174,10 +178,8 @@ def embed_nodes(
     """Like :func:`embed_graph`, but only for the given *node_ids*."""
     if not node_ids:
         return []
-
     nodes = [graph.get_node(nid) for nid in node_ids]
     nodes = [n for n in nodes if n is not None and n.label in EMBEDDABLE_LABELS]
-
     if not nodes:
         return []
 

@@ -30,6 +30,7 @@ EMBEDDING_DIMENSIONS: int = 384
 """Number of dimensions expected for all embedding vectors."""
 
 
+
 @dataclass
 class NodeEmbedding:
     """An embedding vector associated with a graph node."""
