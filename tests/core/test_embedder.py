@@ -8,7 +8,14 @@ import pytest
 from axon.core.embeddings.embedder import EMBEDDABLE_LABELS, _get_model, embed_graph, embed_nodes
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import GraphNode, GraphRelationship, NodeLabel, RelType, generate_id
-from axon.core.storage.base import NodeEmbedding
+from axon.core.storage.base import EMBEDDING_DIMENSIONS, NodeEmbedding
+
+# Helper to create 384d mock vectors with a distinguishable base value.
+_D = EMBEDDING_DIMENSIONS
+
+def _mock_vec(base: float = 0.1) -> np.ndarray:
+    """Return a 384d numpy array filled with *base*."""
+    return np.array([base] * _D)
 
 
 @pytest.fixture(autouse=True)
@@ -128,9 +135,7 @@ class TestEmbedGraphBasic:
     @patch("fastembed.TextEmbedding")
     def test_returns_node_embeddings(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         results = embed_graph(sample_graph)
@@ -143,9 +148,7 @@ class TestEmbedGraphBasic:
         self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
     ) -> None:
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         results = embed_graph(sample_graph)
@@ -159,26 +162,22 @@ class TestEmbedGraphBasic:
         self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
     ) -> None:
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         results = embed_graph(sample_graph)
 
         # We should get two results with the two mock vectors
         embeddings = [r.embedding for r in results]
-        assert [0.1, 0.2, 0.3] in embeddings or pytest.approx([0.1, 0.2, 0.3]) in embeddings
-        assert [0.4, 0.5, 0.6] in embeddings or pytest.approx([0.4, 0.5, 0.6]) in embeddings
+        assert [0.1] * _D in embeddings or pytest.approx([0.1] * _D) in embeddings
+        assert [0.4] * _D in embeddings or pytest.approx([0.4] * _D) in embeddings
 
     @patch("fastembed.TextEmbedding")
     def test_node_ids_are_correct(
         self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
     ) -> None:
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         results = embed_graph(sample_graph)
@@ -194,9 +193,7 @@ class TestEmbedGraphFiltering:
         self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
     ) -> None:
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         results = embed_graph(sample_graph)
@@ -211,7 +208,7 @@ class TestEmbedGraphFiltering:
         embeddable_count = 7  # FILE, FUNCTION, CLASS, METHOD, INTERFACE, TYPE_ALIAS, ENUM
         mock_model = MagicMock()
         mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]) for _ in range(embeddable_count)]
+            [_mock_vec(0.1) for _ in range(embeddable_count)]
         )
         mock_te_cls.return_value = mock_model
 
@@ -230,7 +227,7 @@ class TestEmbedGraphFiltering:
         embeddable_count = 7
         mock_model = MagicMock()
         mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]) for _ in range(embeddable_count)]
+            [_mock_vec(0.1) for _ in range(embeddable_count)]
         )
         mock_te_cls.return_value = mock_model
 
@@ -281,35 +278,29 @@ class TestEmbedGraphModelConfig:
     @patch("fastembed.TextEmbedding")
     def test_default_model_name(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         embed_graph(sample_graph)
 
-        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-small-en-v1.5")
+        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-small-en-v1.5", threads=0)
 
     @patch("fastembed.TextEmbedding")
     def test_custom_model_name(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         embed_graph(sample_graph, model_name="BAAI/bge-base-en-v1.5")
 
-        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-base-en-v1.5")
+        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-base-en-v1.5", threads=0)
 
     @patch("fastembed.TextEmbedding")
     def test_custom_batch_size_passed_to_embed(
         self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
     ) -> None:
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         embed_graph(sample_graph, batch_size=32)
@@ -332,9 +323,7 @@ class TestEmbedGraphTextGeneration:
     ) -> None:
         mock_gen_text.return_value = "mock text"
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         embed_graph(sample_graph)
@@ -352,9 +341,7 @@ class TestEmbedGraphTextGeneration:
     ) -> None:
         mock_gen_text.side_effect = ["text for foo", "text for Bar"]
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         embed_graph(sample_graph)
@@ -383,29 +370,27 @@ class TestEmbedGraphBatchProcessing:
 
         mock_model = MagicMock()
         mock_model.embed.return_value = iter(
-            [np.array([float(i), float(i + 1), float(i + 2)]) for i in range(count)]
+            [_mock_vec(float(i)) for i in range(count)]
         )
         mock_te_cls.return_value = mock_model
 
         results = embed_graph(graph, batch_size=16)
 
         assert len(results) == count
-        # Each embedding should have 3 dimensions
-        assert all(len(r.embedding) == 3 for r in results)
+        # Each embedding should have 384 dimensions
+        assert all(len(r.embedding) == _D for r in results)
 
     @patch("fastembed.TextEmbedding")
-    def test_default_batch_size_is_64(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
+    def test_default_batch_size_is_256(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         embed_graph(sample_graph)
 
         embed_call = mock_model.embed.call_args
-        assert embed_call.kwargs.get("batch_size") == 64 or (
-            len(embed_call.args) > 1 and embed_call.args[1] == 64
+        assert embed_call.kwargs.get("batch_size") == 256 or (
+            len(embed_call.args) > 1 and embed_call.args[1] == 256
         )
 
 
@@ -459,8 +444,8 @@ class TestEmbeddingAlignment:
         )
 
         # Two distinguishable embedding vectors.
-        embedding_a = np.array([1.0, 0.0, 0.0])
-        embedding_b = np.array([0.0, 1.0, 0.0])
+        embedding_a = _mock_vec(1.0)
+        embedding_b = _mock_vec(2.0)
 
         mock_model = MagicMock()
         mock_te_cls.return_value = mock_model
@@ -484,7 +469,7 @@ class TestEmbedNodes:
         node_ids = {generate_id(NodeLabel.FUNCTION, "src/a.py", "func_a")}
 
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter([np.array([0.1, 0.2, 0.3])])
+        mock_model.embed.return_value = iter([_mock_vec(0.1)])
         mock_te_cls.return_value = mock_model
 
         results = embed_nodes(graph, node_ids)
@@ -522,9 +507,7 @@ class TestEmbedNodes:
         node_ids = {id_a, id_b}
 
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
+        mock_model.embed.return_value = iter([_mock_vec(0.1), _mock_vec(0.4)])
         mock_te_cls.return_value = mock_model
 
         results = embed_nodes(graph, node_ids)
@@ -539,7 +522,7 @@ class TestEmbedNodes:
         id_a = generate_id(NodeLabel.FUNCTION, "src/a.py", "func_a")
 
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter([np.array([1.0, 2.0, 3.0])])
+        mock_model.embed.return_value = iter([_mock_vec(1.0)])
         mock_te_cls.return_value = mock_model
 
         results = embed_nodes(graph, {id_a})
@@ -547,4 +530,22 @@ class TestEmbedNodes:
         assert len(results) == 1
         assert results[0].node_id == id_a
         assert isinstance(results[0].embedding, list)
-        assert results[0].embedding == pytest.approx([1.0, 2.0, 3.0])
+        assert results[0].embedding == pytest.approx([1.0] * _D)
+
+
+class TestNodeEmbeddingValidation:
+    def test_valid_dimensions_accepted(self) -> None:
+        emb = NodeEmbedding(node_id="fn:a", embedding=[0.1] * 384)
+        assert len(emb.embedding) == 384
+
+    def test_wrong_dimensions_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Expected 384"):
+            NodeEmbedding(node_id="fn:a", embedding=[0.1] * 768)
+
+    def test_empty_embedding_accepted(self) -> None:
+        emb = NodeEmbedding(node_id="fn:a", embedding=[])
+        assert emb.embedding == []
+
+    def test_default_factory_accepted(self) -> None:
+        emb = NodeEmbedding(node_id="fn:a")
+        assert emb.embedding == []
