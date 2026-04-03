@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import warnings
 from typing import TYPE_CHECKING
 
 from axon.core.embeddings.text import build_class_method_index, generate_text
@@ -26,21 +27,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_model_cache: dict[str, "TextEmbedding"] = {}
+_model_cache: dict[tuple[str, bool], "TextEmbedding"] = {}
 _model_lock = threading.Lock()
+_cuda_enabled: bool = False
 
-# BGE-small max sequence is 512 tokens (~2000 chars).  Truncating long
-# descriptions avoids wasting tokenisation and padding time on text that
-# the model would discard anyway.
-_MAX_TEXT_CHARS = 2000
+
+def configure_cuda(enabled: bool) -> None:
+    """Enable or disable CUDA for all embedding operations."""
+    global _cuda_enabled
+    _cuda_enabled = enabled
+
+
+def _resolve_cuda() -> bool:
+    """Return True if CUDA is enabled via configure_cuda() or AXON_CUDA env var."""
+    return _cuda_enabled or os.environ.get(
+        "AXON_CUDA", ""
+    ).strip() in ("1", "true", "yes")
 
 
 def _get_model(model_name: str) -> "TextEmbedding":
-    cached = _model_cache.get(model_name)
+    cuda = _resolve_cuda()
+    cache_key = (model_name, cuda)
+    cached = _model_cache.get(cache_key)
     if cached is not None:
         return cached
     with _model_lock:
-        cached = _model_cache.get(model_name)
+        cached = _model_cache.get(cache_key)
         if cached is not None:
             return cached
         from fastembed import TextEmbedding
@@ -48,8 +60,30 @@ def _get_model(model_name: str) -> "TextEmbedding":
         # Cap ONNX threads to avoid saturating all CPU cores.
         # Default to half the available cores (minimum 2).
         max_threads = max(2, os.cpu_count() // 2) if os.cpu_count() else 2
-        model = TextEmbedding(model_name=model_name, threads=max_threads)
-        _model_cache[model_name] = model
+        if cuda:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                model = TextEmbedding(
+                    model_name=model_name, threads=max_threads, cuda=True
+                )
+            for w in caught:
+                if issubclass(w.category, RuntimeWarning) and (
+                    "CUDAExecutionProvider" in str(w.message)
+                ):
+                    raise RuntimeError(
+                        "--cuda / AXON_CUDA requested but "
+                        "CUDAExecutionProvider failed to initialize.\n"
+                        "Install CUDA dependencies:\n"
+                        "  pip install onnxruntime-gpu "
+                        "nvidia-cublas-cu12 nvidia-cudnn-cu12 "
+                        "nvidia-cufft-cu12 nvidia-curand-cu12 "
+                        "nvidia-cuda-runtime-cu12\n"
+                        "See https://onnxruntime.ai/docs/execution-providers"
+                        "/CUDA-ExecutionProvider.html"
+                    )
+        else:
+            model = TextEmbedding(model_name=model_name, threads=max_threads)
+        _model_cache[cache_key] = model
         return model
 
 
@@ -60,6 +94,18 @@ def _get_model_cache_clear() -> None:
 
 
 _get_model.cache_clear = _get_model_cache_clear  # type: ignore[attr-defined]
+
+
+def validate_cuda() -> None:
+    """Eagerly initialize the default model to validate CUDA configuration.
+
+    Raises RuntimeError if CUDA was requested but CUDAExecutionProvider
+    failed to initialize.
+    """
+    if not _resolve_cuda():
+        return
+    _get_model(_DEFAULT_MODEL)
+
 
 # Labels worth embedding — skip Folder, Community, Process (structural only).
 EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
