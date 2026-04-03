@@ -33,9 +33,11 @@ def _vec768(base: list[float] | None = None) -> np.ndarray:
 
 
 @pytest.fixture(autouse=True)
-def _clear_model_cache():
-    """Clear the lru_cache on _get_model before each test so mocks work."""
+def _clear_model_cache(monkeypatch):
+    """Reset embedding state before each test so mocks work."""
     _get_model.cache_clear()
+    configure_cuda(False)
+    monkeypatch.delenv("AXON_CUDA", raising=False)
     yield
     _get_model.cache_clear()
 
@@ -694,14 +696,14 @@ class TestCudaSupport:
     def test_get_model_no_cuda_by_default(
         self, mock_te_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """TextEmbedding is instantiated without cuda kwarg when CUDA is off."""
+        """TextEmbedding is instantiated with cuda=False to override auto-detect."""
         monkeypatch.delenv("AXON_CUDA", raising=False)
         mock_te_cls.return_value = MagicMock()
 
         _get_model("test-model")
 
         _, kwargs = mock_te_cls.call_args
-        assert not kwargs.get("cuda")
+        assert kwargs.get("cuda") is False
 
     @patch("fastembed.TextEmbedding")
     def test_cuda_cache_key_separation(

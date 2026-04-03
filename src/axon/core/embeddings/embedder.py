@@ -82,7 +82,12 @@ def _get_model(model_name: str) -> "TextEmbedding":
                         "/CUDA-ExecutionProvider.html"
                     )
         else:
-            model = TextEmbedding(model_name=model_name, threads=max_threads)
+            # Explicitly disable CUDA to override fastembed's Device.AUTO
+            # default, which would auto-detect and use GPU when
+            # onnxruntime-gpu is installed.
+            model = TextEmbedding(
+                model_name=model_name, threads=max_threads, cuda=False
+            )
         _model_cache[cache_key] = model
         return model
 
