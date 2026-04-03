@@ -133,7 +133,7 @@ class TestModelDefaults:
         assert _DEFAULT_DIMENSIONS == 384
 
     def test_default_batch_size(self) -> None:
-        assert _DEFAULT_BATCH_SIZE == 32
+        assert _DEFAULT_BATCH_SIZE == 8
 
 
 class TestEmbeddableLabels:
@@ -438,7 +438,7 @@ class TestEmbedGraphBatchProcessing:
         assert all(len(r.embedding) == EMBEDDING_DIMENSIONS for r in results)
 
     @patch("fastembed.TextEmbedding")
-    def test_default_batch_size_is_32(
+    def test_default_batch_size_is_8(
         self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
     ) -> None:
         mock_model = MagicMock()
@@ -450,8 +450,8 @@ class TestEmbedGraphBatchProcessing:
         embed_graph(sample_graph)
 
         embed_call = mock_model.passage_embed.call_args
-        assert embed_call.kwargs.get("batch_size") == 32 or (
-            len(embed_call.args) > 1 and embed_call.args[1] == 32
+        assert embed_call.kwargs.get("batch_size") == 8 or (
+            len(embed_call.args) > 1 and embed_call.args[1] == 8
         )
 
 

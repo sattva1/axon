@@ -127,7 +127,11 @@ EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
 
 _DEFAULT_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 _DEFAULT_DIMENSIONS = EMBEDDING_DIMENSIONS  # 384 via Matryoshka
-_DEFAULT_BATCH_SIZE = 32
+# Nomic-embed-text-v1.5 has 12 attention heads and 2048-token context.
+# With long texts, each batch element's attention matrix is ~192 MB
+# (12 * 2048 * 2048 * 4 bytes).  Batch size 8 keeps peak memory under
+# ~2 GB for the attention pass, safe for both CPU and 8 GB GPUs.
+_DEFAULT_BATCH_SIZE = 8
 _MAX_TEXT_CHARS = 8192
 
 
