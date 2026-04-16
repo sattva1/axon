@@ -606,15 +606,20 @@ def _run_background_embeddings(
     db_path: Path,
     meta_path: Path,
     repo_path: Path,
-) -> None:
-    """Generate embeddings in a background thread with its own storage connection."""
+    progress_callback: "Callable[[str, float], None] | None" = None,
+) -> int:
+    """Generate embeddings with a separate storage connection.
+
+    Returns the number of embeddings generated.
+    """
     from axon.core.ingestion.pipeline import _run_embedding_phase, PipelineResult
 
+    report = progress_callback or (lambda _phase, _pct: None)
     bg_storage = KuzuBackend()
     bg_storage.initialize(db_path)
     try:
         bg_result = PipelineResult()
-        _run_embedding_phase(graph, bg_storage, bg_result, lambda _phase, _pct: None)
+        _run_embedding_phase(graph, bg_storage, bg_result, report)
 
         # Update meta.json with embedding count.
         try:
@@ -624,13 +629,10 @@ def _run_background_embeddings(
         except Exception:
             logger.debug("Failed to update meta.json with embedding count", exc_info=True)
 
-        if bg_result.embeddings > 0:
-            console.print(
-                f"[dim]Background embeddings complete: "
-                f"{bg_result.embeddings} vectors generated.[/dim]"
-            )
+        return bg_result.embeddings
     except Exception:
         logger.warning("Background embedding failed — semantic search unavailable", exc_info=True)
+        return 0
     finally:
         bg_storage.close()
 
@@ -735,15 +737,6 @@ def analyze(
 
     storage.close()
 
-    # Launch background embedding thread if needed.
-    if not no_embeddings and not run_embeddings_inline:
-        embed_thread = threading.Thread(
-            target=_run_background_embeddings,
-            args=(graph, db_path, meta_path, repo_path),
-            daemon=True,
-        )
-        embed_thread.start()
-
     console.print()
     console.print("[bold green]Indexing complete.[/bold green]")
     console.print(f"  Files:          {result.files}")
@@ -757,15 +750,38 @@ def analyze(
         console.print(f"  Dead code:      {result.dead_code}")
     if result.coupled_pairs > 0:
         console.print(f"  Coupled pairs:  {result.coupled_pairs}")
-    if run_embeddings_inline and result.embeddings > 0:
-        console.print(f"  Embeddings:     {result.embeddings}")
-    elif not no_embeddings and not run_embeddings_inline:
-        console.print("  Embeddings:     [dim]generating in background...[/dim]")
-    console.print(f"  Duration:       {result.duration_seconds:.2f}s")
 
-    # Wait for background embeddings to finish before exiting.
+    # Generate embeddings with a visible progress bar.
     if not no_embeddings and not run_embeddings_inline:
-        embed_thread.join()
+        embed_count = 0
+        with Progress(
+            SpinnerColumn(),
+            BarColumn(),
+            TaskProgressColumn(),
+            "•",
+            TimeElapsedColumn(),
+            "•",
+            TimeRemainingColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            console=console,
+            transient=True,
+        ) as embed_progress:
+            embed_task = embed_progress.add_task(
+                "Generating embeddings...", total=100
+            )
+
+            def on_embed_progress(_phase: str, pct: float) -> None:
+                embed_progress.update(embed_task, completed=pct * 100)
+
+            embed_count = _run_background_embeddings(
+                graph, db_path, meta_path, repo_path, on_embed_progress
+            )
+        if embed_count > 0:
+            console.print(f"  Embeddings:     {embed_count}")
+    elif run_embeddings_inline and result.embeddings > 0:
+        console.print(f"  Embeddings:     {result.embeddings}")
+
+    console.print(f"  Duration:       {result.duration_seconds:.2f}s")
 
 
 @app.command()
