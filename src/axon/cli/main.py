@@ -484,9 +484,12 @@ async def _proxy_stdio_to_http_mcp(mcp_url: str) -> None:
                     async for message in reader:
                         await writer.send(message)
 
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(_forward, local_read, remote_write)
-                tg.start_soon(_forward, remote_read, local_write)
+            try:
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(_forward, local_read, remote_write)
+                    tg.start_soon(_forward, remote_read, local_write)
+            except KeyboardInterrupt:
+                pass
 
 
 def _run_shared_host(
@@ -1062,6 +1065,8 @@ def serve(
     _configure_and_validate_accelerator(cuda, coreml)
     set_db_path(repo_path / ".axon" / "kuzu")
     if not watch:
+        # Print ready message to stderr (stdout is the MCP stdio transport).
+        print("MCP server ready (stdio)", file=sys.stderr, flush=True)
         asyncio.run(mcp_main())
         return
 
@@ -1078,8 +1083,18 @@ def serve(
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
+    # Print ready message to stderr (stdout is the MCP stdio transport).
+    print(
+        f"MCP server ready (proxying to {live_host['mcp_url']}, "
+        f"file watching enabled)",
+        file=sys.stderr,
+        flush=True,
+    )
+
     try:
         asyncio.run(_proxy_stdio_to_http_mcp(live_host["mcp_url"]))
+    except KeyboardInterrupt:
+        pass
     finally:
         _remove_host_lease(lease_path)
 
