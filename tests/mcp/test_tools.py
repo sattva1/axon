@@ -416,7 +416,7 @@ class TestConfidenceInContext:
         assert "login_handler" in result
         # There should be no "(?)" for the high-confidence caller
         lines = result.split("\n")
-        caller_line = [l for l in lines if "login_handler" in l][0]
+        caller_line = [line for line in lines if "login_handler" in line][0]
         assert "(?)" not in caller_line
         assert "(~)" not in caller_line
 
@@ -487,7 +487,7 @@ class TestFormatQueryResults:
         output = _format_query_results(results, {})
         # Snippet in output should be at most 200 chars
         lines = output.split("\n")
-        snippet_lines = [l for l in lines if l.strip().startswith("xxx")]
+        snippet_lines = [line for line in lines if line.strip().startswith("xxx")]
         for line in snippet_lines:
             assert len(line.strip()) <= 200
 
@@ -590,8 +590,29 @@ class TestHandleCoupling:
         assert "No temporal coupling" in result
 
     def test_empty_file_path(self, mock_storage):
-        result = handle_coupling(mock_storage, "")
-        assert "required" in result.lower()
+        result = handle_coupling(mock_storage, '')
+        assert 'required' in result.lower()
+
+    def test_queries_use_code_relation(self, mock_storage):
+        """Coupling queries use CodeRelation with rel_type, not bare table names."""
+        mock_storage.execute_raw.side_effect = [
+            [['src/auth/session.py', 0.85, 12]],
+            [],
+        ]
+        handle_coupling(mock_storage, 'src/auth/login.py')
+
+        all_queries = [
+            str(call.args[0])
+            for call in mock_storage.execute_raw.call_args_list
+        ]
+        coupling_queries = [q for q in all_queries if 'coupled_with' in q]
+        assert coupling_queries, (
+            'Expected at least one query referencing coupled_with'
+        )
+        for q in coupling_queries:
+            assert 'CodeRelation' in q
+            assert 'rel_type' in q
+        assert not any('[:COUPLED_WITH]' in q for q in all_queries)
 
 
 class TestHandleCommunities:
@@ -626,8 +647,34 @@ class TestHandleCommunities:
 
     def test_community_not_found(self, mock_storage):
         mock_storage.execute_raw.return_value = []
-        result = handle_communities(mock_storage, community="nonexistent")
-        assert "not found" in result.lower()
+        result = handle_communities(mock_storage, community='nonexistent')
+        assert 'not found' in result.lower()
+
+    def test_queries_use_code_relation(self, mock_storage):
+        """Community queries use CodeRelation with rel_type, not bare table names."""
+        mock_storage.execute_raw.side_effect = [
+            [['ingestion+storage', 0.72, '{"symbol_count": 23}']],
+            [],
+        ]
+        handle_communities(mock_storage)
+
+        all_queries = [
+            str(call.args[0])
+            for call in mock_storage.execute_raw.call_args_list
+        ]
+        rel_queries = [
+            q
+            for q in all_queries
+            if 'member_of' in q or 'step_in_process' in q
+        ]
+        assert rel_queries, (
+            'Expected queries referencing member_of or step_in_process'
+        )
+        for q in rel_queries:
+            assert 'CodeRelation' in q
+            assert 'rel_type' in q
+        assert not any('[:MEMBER_OF]' in q for q in all_queries)
+        assert not any('[:STEP_IN_PROCESS]' in q for q in all_queries)
 
 
 class TestHandleExplain:
@@ -690,8 +737,45 @@ class TestHandleExplain:
         mock_storage.get_callees_with_confidence.return_value = []
         mock_storage.execute_raw.side_effect = [[], []]
 
-        result = handle_explain(mock_storage, "old_func")
-        assert "dead code" in result.lower() or "Dead code" in result
+        result = handle_explain(mock_storage, 'old_func')
+        assert 'dead code' in result.lower() or 'Dead code' in result
+
+    def test_queries_use_code_relation(self, mock_storage):
+        """Explain queries use CodeRelation with rel_type, not bare table names."""
+        mock_storage.get_node.return_value = GraphNode(
+            id='function:src/pipeline.py:run_pipeline',
+            label=NodeLabel.FUNCTION,
+            name='run_pipeline',
+            file_path='src/pipeline.py',
+            start_line=45,
+            end_line=120,
+        )
+        mock_storage.get_callers_with_confidence.return_value = []
+        mock_storage.get_callees_with_confidence.return_value = []
+        mock_storage.execute_raw.side_effect = [
+            [['ingestion+storage']],
+            [['run -> walk', 1]],
+        ]
+
+        handle_explain(mock_storage, 'run_pipeline')
+
+        all_queries = [
+            str(call.args[0])
+            for call in mock_storage.execute_raw.call_args_list
+        ]
+        rel_queries = [
+            q
+            for q in all_queries
+            if 'member_of' in q or 'step_in_process' in q
+        ]
+        assert rel_queries, (
+            'Expected queries referencing member_of or step_in_process'
+        )
+        for q in rel_queries:
+            assert 'CodeRelation' in q
+            assert 'rel_type' in q
+        assert not any('[:MEMBER_OF]' in q for q in all_queries)
+        assert not any('[:STEP_IN_PROCESS]' in q for q in all_queries)
 
 
 class TestHandleReviewRisk:
@@ -751,7 +835,57 @@ class TestHandleReviewRisk:
             [],  # No coupling
         ]
         result = handle_review_risk(mock_storage, SAMPLE_DIFF)
-        assert "No indexed symbols" in result or "LOW" in result
+        assert 'No indexed symbols' in result or 'LOW' in result
+
+    def test_queries_use_code_relation(self, mock_storage):
+        """Review risk queries use CodeRelation with rel_type, not bare table names."""
+        mock_storage.execute_raw.side_effect = [
+            [
+                [
+                    'function:src/auth.py:validate',
+                    'validate',
+                    'src/auth.py',
+                    10,
+                    30,
+                ]
+            ],
+            [['src/tests/test_auth.py', 0.82]],
+            [['auth+security']],
+        ]
+        mock_storage.get_node.return_value = GraphNode(
+            id='function:src/auth.py:validate',
+            label=NodeLabel.FUNCTION,
+            name='validate',
+            file_path='src/auth.py',
+            start_line=10,
+            end_line=30,
+        )
+        mock_storage.traverse_with_depth.return_value = []
+
+        handle_review_risk(mock_storage, SAMPLE_DIFF)
+
+        all_queries = [
+            str(call.args[0])
+            for call in mock_storage.execute_raw.call_args_list
+        ]
+        coupling_queries = [q for q in all_queries if 'coupled_with' in q]
+        assert coupling_queries, (
+            'Expected at least one query referencing coupled_with'
+        )
+        for q in coupling_queries:
+            assert 'CodeRelation' in q
+            assert 'rel_type' in q
+
+        member_of_queries = [q for q in all_queries if 'member_of' in q]
+        assert member_of_queries, (
+            'Expected at least one query referencing member_of'
+        )
+        for q in member_of_queries:
+            assert 'CodeRelation' in q
+            assert 'rel_type' in q
+
+        assert not any('[:COUPLED_WITH]' in q for q in all_queries)
+        assert not any('[:MEMBER_OF]' in q for q in all_queries)
 
 
 class TestHandleCallPath:
@@ -877,8 +1011,34 @@ class TestHandleFileContext:
         assert "old_func" in result
 
     def test_empty_file_path(self, mock_storage):
-        result = handle_file_context(mock_storage, "")
-        assert "required" in result.lower()
+        result = handle_file_context(mock_storage, '')
+        assert 'required' in result.lower()
+
+    def test_queries_use_code_relation(self, mock_storage):
+        """File context queries use CodeRelation with rel_type, not bare table names."""
+        mock_storage.execute_raw.side_effect = [
+            [['handle_query', 'Function', 170, False, True, False]],
+            [['src/storage/base.py']],
+            [['src/mcp/server.py']],
+            [['tests/mcp/test_tools.py', 0.85, 12]],
+            [],
+            [['mcp+server', 2]],
+        ]
+
+        handle_file_context(mock_storage, 'src/mcp/tools.py')
+
+        all_queries = [
+            str(call.args[0])
+            for call in mock_storage.execute_raw.call_args_list
+        ]
+        coupling_queries = [q for q in all_queries if 'coupled_with' in q]
+        assert coupling_queries, (
+            'Expected at least one query referencing coupled_with'
+        )
+        for q in coupling_queries:
+            assert 'CodeRelation' in q
+            assert 'rel_type' in q
+        assert not any('[:COUPLED_WITH]' in q for q in all_queries)
 
 
 class TestHandleTestImpact:
