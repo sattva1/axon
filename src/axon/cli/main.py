@@ -32,7 +32,9 @@ from axon import __version__
 from axon.core.diff import diff_branches, format_diff
 from axon.core.embeddings.embedder import (
     _DEFAULT_MODEL,
+    configure_coreml,
     configure_cuda,
+    validate_coreml,
     validate_cuda,
 )
 from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
@@ -40,8 +42,7 @@ from axon.core.ingestion.watcher import ensure_current_embeddings, watch_repo
 from axon.core.storage.base import EMBEDDING_DIMENSIONS
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp import tools as mcp_tools
-from axon.mcp.server import main as mcp_main
-from axon.mcp.server import set_db_path, set_lock, set_storage
+from axon.mcp.server import main as mcp_main, set_db_path, set_lock, set_storage
 from axon.runtime import AxonRuntime
 from axon.web import app as web_app_module
 
@@ -626,12 +627,22 @@ def _run_background_embeddings(
         bg_storage.close()
 
 
-def _configure_and_validate_cuda(cuda_flag: bool) -> None:
-    """Configure CUDA from --cuda flag and validate before pipeline runs."""
+def _configure_and_validate_accelerator(
+    cuda_flag: bool, coreml_flag: bool
+) -> None:
+    """Configure GPU accelerator from CLI flags and validate before pipeline runs."""
+    if cuda_flag and coreml_flag:
+        console.print(
+            "[red]Error:[/red] Cannot use --cuda and --coreml simultaneously"
+        )
+        raise typer.Exit(code=1)
     if cuda_flag:
         configure_cuda(True)
+    if coreml_flag:
+        configure_coreml(True)
     try:
         validate_cuda()
+        validate_coreml()
     except RuntimeError as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=1)
@@ -649,7 +660,14 @@ def analyze(
         help="Generate embeddings synchronously instead of in the background.",
     ),
     cuda: bool = typer.Option(
-        False, "--cuda", help="Use CUDA GPU acceleration for embedding generation."
+        False,
+        "--cuda",
+        help="Use CUDA GPU acceleration for embedding generation.",
+    ),
+    coreml: bool = typer.Option(
+        False,
+        "--coreml",
+        help="Use CoreML GPU acceleration for embedding generation (Apple Silicon).",
     ),
 ) -> None:
     """Index a repository into a knowledge graph."""
@@ -669,7 +687,7 @@ def analyze(
 
     # Run pipeline: skip embeddings here if we'll do them in the background.
     run_embeddings_inline = foreground_embeddings and not no_embeddings
-    _configure_and_validate_cuda(cuda)
+    _configure_and_validate_accelerator(cuda, coreml)
 
     result: PipelineResult | None = None
     with Progress(
@@ -883,7 +901,14 @@ def setup(
 def watch(
     path: Path = typer.Argument(Path("."), help="Path to the repository to watch."),
     cuda: bool = typer.Option(
-        False, "--cuda", help="Use CUDA GPU acceleration for embedding generation."
+        False,
+        "--cuda",
+        help="Use CUDA GPU acceleration for embedding generation.",
+    ),
+    coreml: bool = typer.Option(
+        False,
+        "--coreml",
+        help="Use CoreML GPU acceleration for embedding generation (Apple Silicon).",
     ),
 ) -> None:
     """Watch mode — re-index on file changes."""
@@ -891,7 +916,7 @@ def watch(
     if not repo_path.is_dir():
         console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
         raise typer.Exit(code=1)
-    _configure_and_validate_cuda(cuda)
+    _configure_and_validate_accelerator(cuda, coreml)
     storage, axon_dir, db_path = _initialize_writable_storage(repo_path)
     console.print(f"[bold]Watching[/bold] {repo_path} for changes (Ctrl+C to stop)")
     try:
@@ -948,7 +973,14 @@ def host(
     dev: bool = typer.Option(False, "--dev", help="Proxy to Vite dev server for HMR."),
     managed: bool = typer.Option(False, "--managed", hidden=True),
     cuda: bool = typer.Option(
-        False, "--cuda", help="Use CUDA GPU acceleration for embedding generation."
+        False,
+        "--cuda",
+        help="Use CUDA GPU acceleration for embedding generation.",
+    ),
+    coreml: bool = typer.Option(
+        False,
+        "--coreml",
+        help="Use CoreML GPU acceleration for embedding generation (Apple Silicon).",
     ),
 ) -> None:
     """Run the shared Axon host for UI and multi-session HTTP MCP clients."""
@@ -956,7 +988,7 @@ def host(
     if not repo_path.is_dir():
         console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
         raise typer.Exit(code=1)
-    _configure_and_validate_cuda(cuda)
+    _configure_and_validate_accelerator(cuda, coreml)
     _run_shared_host(
         repo_path=repo_path,
         port=port,
@@ -980,7 +1012,14 @@ def serve(
         False, "--watch", "-w", help="Enable file watching with auto-reindex."
     ),
     cuda: bool = typer.Option(
-        False, "--cuda", help="Use CUDA GPU acceleration for embedding generation."
+        False,
+        "--cuda",
+        help="Use CUDA GPU acceleration for embedding generation.",
+    ),
+    coreml: bool = typer.Option(
+        False,
+        "--coreml",
+        help="Use CoreML GPU acceleration for embedding generation (Apple Silicon).",
     ),
 ) -> None:
     """Start MCP server, optionally with live file watching."""
@@ -988,7 +1027,7 @@ def serve(
     if not repo_path.is_dir():
         console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
         raise typer.Exit(code=1)
-    _configure_and_validate_cuda(cuda)
+    _configure_and_validate_accelerator(cuda, coreml)
     set_db_path(repo_path / ".axon" / "kuzu")
     if not watch:
         asyncio.run(mcp_main())

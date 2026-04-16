@@ -27,15 +27,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_model_cache: dict[tuple[str, bool], "TextEmbedding"] = {}
+_model_cache: dict[tuple[str, bool, bool], "TextEmbedding"] = {}
 _model_lock = threading.Lock()
 _cuda_enabled: bool = False
+_coreml_enabled: bool = False
 
 
 def configure_cuda(enabled: bool) -> None:
     """Enable or disable CUDA for all embedding operations."""
     global _cuda_enabled
     _cuda_enabled = enabled
+
+
+def configure_coreml(enabled: bool) -> None:
+    """Enable or disable CoreML for all embedding operations."""
+    global _coreml_enabled
+    _coreml_enabled = enabled
 
 
 def _resolve_cuda() -> bool:
@@ -45,9 +52,19 @@ def _resolve_cuda() -> bool:
     ).strip() in ("1", "true", "yes")
 
 
+def _resolve_coreml() -> bool:
+    """Return True if CoreML is enabled via configure_coreml() or AXON_COREML env var."""
+    return _coreml_enabled or os.environ.get(
+        "AXON_COREML", ""
+    ).strip() in ("1", "true", "yes")
+
+
 def _get_model(model_name: str) -> "TextEmbedding":
     cuda = _resolve_cuda()
-    cache_key = (model_name, cuda)
+    coreml = _resolve_coreml()
+    if cuda and coreml:
+        raise RuntimeError("--cuda and --coreml are mutually exclusive")
+    cache_key = (model_name, cuda, coreml)
     cached = _model_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -81,6 +98,24 @@ def _get_model(model_name: str) -> "TextEmbedding":
                         "See https://onnxruntime.ai/docs/execution-providers"
                         "/CUDA-ExecutionProvider.html"
                     )
+        elif coreml:
+            try:
+                model = TextEmbedding(
+                    model_name=model_name,
+                    threads=max_threads,
+                    providers=[
+                        "CoreMLExecutionProvider",
+                        "CPUExecutionProvider",
+                    ],
+                )
+            except ValueError:
+                raise RuntimeError(
+                    "--coreml / AXON_COREML requested but "
+                    "CoreMLExecutionProvider is not available.\n"
+                    "Install onnxruntime with CoreML support:\n"
+                    "  pip install onnxruntime\n"
+                    "(CoreML EP is included by default on macOS ARM builds)"
+                )
         else:
             # Explicitly disable CUDA to override fastembed's Device.AUTO
             # default, which would auto-detect and use GPU when
@@ -108,6 +143,17 @@ def validate_cuda() -> None:
     failed to initialize.
     """
     if not _resolve_cuda():
+        return
+    _get_model(_DEFAULT_MODEL)
+
+
+def validate_coreml() -> None:
+    """Eagerly initialize the default model to validate CoreML configuration.
+
+    Raises RuntimeError if CoreML was requested but CoreMLExecutionProvider
+    is not available.
+    """
+    if not _resolve_coreml():
         return
     _get_model(_DEFAULT_MODEL)
 

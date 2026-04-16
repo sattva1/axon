@@ -347,6 +347,11 @@ class TestMcp:
 
 
 class TestServe:
+    def test_coreml_flag_accepted(self) -> None:
+        result = runner.invoke(app, ['serve', '--help'])
+        assert result.exit_code == 0
+        assert '--coreml' in result.output
+
     def test_serve_command_exists(self) -> None:
         result = runner.invoke(app, ["serve", "--help"])
         assert result.exit_code == 0
@@ -393,6 +398,11 @@ class TestServe:
 
 
 class TestHost:
+    def test_coreml_flag_accepted(self) -> None:
+        result = runner.invoke(app, ['host', '--help'])
+        assert result.exit_code == 0
+        assert '--coreml' in result.output
+
     def test_host_command_exists(self) -> None:
         result = runner.invoke(app, ["host", "--help"])
         assert result.exit_code == 0
@@ -480,6 +490,11 @@ class TestWritableStorageInitialization:
 
 
 class TestWatch:
+    def test_coreml_flag_accepted(self) -> None:
+        result = runner.invoke(app, ['watch', '--help'])
+        assert result.exit_code == 0
+        assert '--coreml' in result.output
+
     def test_watch_command_exists(self) -> None:
         result = runner.invoke(app, ["watch", "--help"])
         assert result.exit_code == 0
@@ -626,3 +641,15 @@ class TestStartHostBackground:
             _start_host_background(tmp_path, port=8420)
         cmd = mock_popen.call_args[0][0]
         assert cmd[-1] == str(tmp_path)
+
+
+class TestAnalyze:
+    def test_coreml_flag_accepted(self) -> None:
+        result = runner.invoke(app, ['analyze', '--help'])
+        assert result.exit_code == 0
+        assert '--coreml' in result.output
+
+    def test_cuda_and_coreml_mutually_exclusive(self) -> None:
+        result = runner.invoke(app, ['analyze', '--cuda', '--coreml', '.'])
+        assert result.exit_code == 1
+        assert 'simultaneously' in result.output

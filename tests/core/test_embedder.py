@@ -12,15 +12,24 @@ from axon.core.embeddings.embedder import (
     _DEFAULT_DIMENSIONS,
     _DEFAULT_MODEL,
     _get_model,
+    _resolve_coreml,
+    _resolve_cuda,
+    configure_coreml,
     configure_cuda,
     embed_graph,
     embed_nodes,
     embed_query,
+    validate_coreml,
     validate_cuda,
 )
-from axon.core.embeddings.embedder import _resolve_cuda
 from axon.core.graph.graph import KnowledgeGraph
-from axon.core.graph.model import GraphNode, GraphRelationship, NodeLabel, RelType, generate_id
+from axon.core.graph.model import (
+    GraphNode,
+    GraphRelationship,
+    NodeLabel,
+    RelType,
+    generate_id,
+)
 from axon.core.storage.base import EMBEDDING_DIMENSIONS, NodeEmbedding
 
 
@@ -37,7 +46,9 @@ def _clear_model_cache(monkeypatch):
     """Reset embedding state before each test so mocks work."""
     _get_model.cache_clear()
     configure_cuda(False)
-    monkeypatch.delenv("AXON_CUDA", raising=False)
+    configure_coreml(False)
+    monkeypatch.delenv('AXON_CUDA', raising=False)
+    monkeypatch.delenv('AXON_COREML', raising=False)
     yield
     _get_model.cache_clear()
 
@@ -770,3 +781,152 @@ class TestCudaSupport:
                 validate_cuda()
         finally:
             configure_cuda(False)
+
+
+class TestCoreMLSupport:
+    """CoreML support flag and model initialization tests."""
+
+    def test_coreml_disabled_by_default(self) -> None:
+        """_resolve_coreml returns False with no flag set and no env var."""
+        assert _resolve_coreml() is False
+
+    def test_configure_coreml_sets_flag(self) -> None:
+        """configure_coreml(True) causes _resolve_coreml to return True."""
+        try:
+            configure_coreml(True)
+            assert _resolve_coreml() is True
+        finally:
+            configure_coreml(False)
+
+    def test_axon_coreml_env_var(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AXON_COREML=1 env var enables CoreML without calling configure_coreml."""
+        monkeypatch.setenv('AXON_COREML', '1')
+        assert _resolve_coreml() is True
+
+    @pytest.mark.parametrize(
+        'value, expected',
+        [
+            ('1', True),
+            ('true', True),
+            ('yes', True),
+            ('0', False),
+            ('false', False),
+            ('', False),
+        ],
+    )
+    def test_axon_coreml_env_var_values(
+        self, monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
+    ) -> None:
+        """AXON_COREML env var is recognized only for truthy values."""
+        monkeypatch.setenv('AXON_COREML', value)
+        assert _resolve_coreml() is expected
+
+    @patch('fastembed.TextEmbedding')
+    def test_get_model_passes_providers_for_coreml(
+        self, mock_te_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TextEmbedding is instantiated with CoreML providers when AXON_COREML=1."""
+        monkeypatch.setenv('AXON_COREML', '1')
+        mock_te_cls.return_value = MagicMock()
+
+        _get_model('test-model')
+
+        _, kwargs = mock_te_cls.call_args
+        assert kwargs.get('providers') == [
+            'CoreMLExecutionProvider',
+            'CPUExecutionProvider',
+        ]
+        assert 'cuda' not in kwargs
+
+    @patch('fastembed.TextEmbedding')
+    def test_get_model_no_coreml_by_default(
+        self, mock_te_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TextEmbedding is NOT given providers kwarg when CoreML is disabled."""
+        monkeypatch.delenv('AXON_COREML', raising=False)
+        mock_te_cls.return_value = MagicMock()
+
+        _get_model('test-model')
+
+        _, kwargs = mock_te_cls.call_args
+        assert 'providers' not in kwargs
+
+    @patch('fastembed.TextEmbedding')
+    def test_coreml_cache_key_separation(
+        self, mock_te_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CUDA, CoreML, and CPU models are cached under separate keys."""
+        monkeypatch.delenv('AXON_CUDA', raising=False)
+        monkeypatch.delenv('AXON_COREML', raising=False)
+        mock_te_cls.return_value = MagicMock()
+
+        _get_model('test-model')
+        try:
+            configure_cuda(True)
+            _get_model('test-model')
+        finally:
+            configure_cuda(False)
+        try:
+            configure_coreml(True)
+            _get_model('test-model')
+        finally:
+            configure_coreml(False)
+
+        assert mock_te_cls.call_count == 3
+
+    @patch('fastembed.TextEmbedding')
+    def test_coreml_provider_unavailable_raises_runtime_error(
+        self, mock_te_cls: MagicMock
+    ) -> None:
+        """ValueError from unavailable provider is re-raised as RuntimeError."""
+        mock_te_cls.side_effect = ValueError(
+            'Provider CoreMLExecutionProvider is not available'
+        )
+        try:
+            configure_coreml(True)
+            with pytest.raises(RuntimeError, match='CoreMLExecutionProvider'):
+                _get_model('test-model')
+        finally:
+            configure_coreml(False)
+
+    @patch('fastembed.TextEmbedding')
+    def test_validate_coreml_noop_when_disabled(
+        self, mock_te_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """validate_coreml does not load the model when CoreML is disabled."""
+        monkeypatch.delenv('AXON_COREML', raising=False)
+
+        validate_coreml()
+
+        mock_te_cls.assert_not_called()
+
+    @patch('fastembed.TextEmbedding')
+    def test_validate_coreml_raises_on_unavailable(
+        self, mock_te_cls: MagicMock
+    ) -> None:
+        """validate_coreml propagates RuntimeError when provider is unavailable."""
+        mock_te_cls.side_effect = ValueError(
+            'Provider CoreMLExecutionProvider is not available'
+        )
+        try:
+            configure_coreml(True)
+            with pytest.raises(RuntimeError, match='CoreMLExecutionProvider'):
+                validate_coreml()
+        finally:
+            configure_coreml(False)
+
+    @patch('fastembed.TextEmbedding')
+    def test_cuda_and_coreml_mutually_exclusive(
+        self, mock_te_cls: MagicMock
+    ) -> None:
+        """Enabling both CUDA and CoreML raises RuntimeError on _get_model."""
+        try:
+            configure_cuda(True)
+            configure_coreml(True)
+            with pytest.raises(RuntimeError, match='mutually exclusive'):
+                _get_model('test-model')
+        finally:
+            configure_cuda(False)
+            configure_coreml(False)
