@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import warnings
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from axon.core.embeddings.text import build_class_method_index, generate_text
@@ -204,22 +205,30 @@ def _embed_node_list(
     model_name: str,
     batch_size: int,
     dimensions: int,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[NodeEmbedding]:
     """Embed a list of nodes with their corresponding texts."""
     if not texts:
         return []
 
     model = _get_model(model_name)
-    vectors = list(model.passage_embed(texts, batch_size=batch_size))
-
+    total = len(texts)
     results: list[NodeEmbedding] = []
-    for node, vector in zip(nodes, vectors):
+
+    for i, (node, vector) in enumerate(
+        zip(nodes, model.passage_embed(texts, batch_size=batch_size))
+    ):
         results.append(
             NodeEmbedding(
                 node_id=node.id,
                 embedding=vector[:dimensions].tolist(),
             )
         )
+        if progress_callback and (i + 1) % batch_size == 0:
+            progress_callback(i + 1, total)
+
+    if progress_callback:
+        progress_callback(total, total)
 
     return results
 
@@ -229,6 +238,7 @@ def embed_graph(
     model_name: str = _DEFAULT_MODEL,
     batch_size: int = _DEFAULT_BATCH_SIZE,
     dimensions: int = _DEFAULT_DIMENSIONS,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[NodeEmbedding]:
     """Generate embeddings for all embeddable nodes in the graph.
 
@@ -238,11 +248,13 @@ def embed_graph(
 
     Args:
         graph: The knowledge graph whose nodes should be embedded.
-        model_name: The fastembed model identifier.  Defaults to
+        model_name: The fastembed model identifier. Defaults to
             ``"nomic-ai/nomic-embed-text-v1.5"``.
-        batch_size: Number of texts to encode per batch.  Defaults to 128.
+        batch_size: Number of texts to encode per batch. Defaults to 128.
         dimensions: Number of dimensions for Matryoshka truncation.
             Defaults to 384.
+        progress_callback: Optional callback receiving (done, total) item
+            counts as embedding progresses.
 
     Returns:
         A list of :class:`NodeEmbedding` instances, one per embeddable node,
@@ -266,7 +278,14 @@ def embed_graph(
     if not texts:
         return []
 
-    return _embed_node_list(nodes, texts, model_name, batch_size, dimensions)
+    return _embed_node_list(
+        nodes,
+        texts,
+        model_name,
+        batch_size,
+        dimensions,
+        progress_callback=progress_callback,
+    )
 
 
 def embed_nodes(
@@ -275,6 +294,7 @@ def embed_nodes(
     model_name: str = _DEFAULT_MODEL,
     batch_size: int = _DEFAULT_BATCH_SIZE,
     dimensions: int = _DEFAULT_DIMENSIONS,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[NodeEmbedding]:
     """Like :func:`embed_graph`, but only for the given *node_ids*."""
     if not node_ids:
@@ -297,4 +317,11 @@ def embed_nodes(
     if not texts:
         return []
 
-    return _embed_node_list(valid_nodes, texts, model_name, batch_size, dimensions)
+    return _embed_node_list(
+        valid_nodes,
+        texts,
+        model_name,
+        batch_size,
+        dimensions,
+        progress_callback=progress_callback,
+    )

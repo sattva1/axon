@@ -259,13 +259,15 @@ class TestRunPipelineProgressIncludesNewPhases:
         assert "Analyzing git history" in phase_names
 
         # Storage loading (always present).
-        assert "Loading to storage" in phase_names
+        assert 'Loading to storage' in phase_names
 
-        # Every phase reports both start (0.0) and end (1.0).
-        for phase_name in phase_names:
-            phase_pcts = {pct for name, pct in calls if name == phase_name}
-            assert 0.0 in phase_pcts, f"{phase_name} missing 0.0 progress"
-            assert 1.0 in phase_pcts, f"{phase_name} missing 1.0 progress"
+        # Progress values should be monotonically non-decreasing.
+        pcts = [pct for _, pct in calls]
+        assert all(a <= b + 1e-9 for a, b in zip(pcts, pcts[1:]))
+        # Overall progress should reach near 1.0.
+        assert pcts[-1] >= 0.95
+        # All values in [0, 1].
+        assert all(0.0 <= p <= 1.0 + 1e-9 for p in pcts)
 
 
 class TestRunPipelineEmbeddings:

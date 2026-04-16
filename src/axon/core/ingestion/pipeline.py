@@ -95,8 +95,12 @@ def _run_embedding_phase(
     report: Callable[[str, float], None],
 ) -> None:
     """Generate and store embeddings synchronously."""
+
     try:
-        node_embeddings = embed_graph(graph)
+        def _embed_progress(done: int, total: int) -> None:
+            report("Generating embeddings", done / total if total else 1.0)
+
+        node_embeddings = embed_graph(graph, progress_callback=_embed_progress)
         storage.store_embeddings(node_embeddings)
         result.embeddings = len(node_embeddings)
         report("Generating embeddings", 1.0)
@@ -145,13 +149,19 @@ def run_pipeline(
 
     phase_times: dict[str, float] = {}
 
-    def report(phase: str, pct: float) -> None:
+    # Count phases: 11 base + 1 optional embedding
+    _phase_count = 12 if (storage is not None and embeddings) else 11
+    _phase_idx = 0
+
+    def report(phase: str, intra_pct: float) -> None:
         if progress_callback is not None:
-            progress_callback(phase, pct)
+            overall = (_phase_idx + intra_pct) / _phase_count
+            progress_callback(phase, overall)
 
     @contextmanager
     def _timed(phase_name: str):
         """Context manager that logs and records phase wall-clock time."""
+        nonlocal _phase_idx
         report(phase_name, 0.0)
         t0 = time.monotonic()
         try:
@@ -161,6 +171,7 @@ def run_pipeline(
             phase_times[phase_name] = elapsed
             log.info("Phase %-30s  %.2fs", phase_name, elapsed)
             report(phase_name, 1.0)
+            _phase_idx += 1
 
     with _timed("Walking files"):
         gitignore = load_gitignore(repo_path)
@@ -173,7 +184,13 @@ def run_pipeline(
         process_structure(files, graph)
 
     with _timed("Parsing code"):
-        parse_data = process_parsing(files, graph)
+
+        def _parsing_progress(done: int, total: int) -> None:
+            report("Parsing code", done / total if total else 1.0)
+
+        parse_data = process_parsing(
+            files, graph, progress_callback=_parsing_progress
+        )
 
     with _timed("Resolving imports"):
         process_imports(parse_data, graph, parallel=True)

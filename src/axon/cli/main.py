@@ -26,7 +26,15 @@ import uvicorn
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.stdio import stdio_server
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 from axon import __version__
 from axon.core.diff import diff_branches, format_diff
@@ -692,14 +700,22 @@ def analyze(
     result: PipelineResult | None = None
     with Progress(
         SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        "•",
+        TimeElapsedColumn(),
+        "•",
+        TimeRemainingColumn(),
+        TextColumn("[bold blue]{task.description}"),
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task("Starting...", total=None)
+        task = progress.add_task("Starting...", total=100)
 
-        def on_progress(phase: str, pct: float) -> None:
-            progress.update(task, description=f"{phase} ({pct:.0%})")
+        def on_progress(phase: str, overall_pct: float) -> None:
+            progress.update(
+                task, description=phase, completed=overall_pct * 100
+            )
 
         graph, result = run_pipeline(
             repo_path=repo_path,

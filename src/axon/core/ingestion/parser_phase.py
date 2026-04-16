@@ -120,11 +120,12 @@ def process_parsing(
     files: list[FileEntry],
     graph: KnowledgeGraph,
     max_workers: int = 8,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[FileParseData]:
     """Parse every file and populate the knowledge graph with symbol nodes.
 
     Parsing is done in parallel using a thread pool (tree-sitter releases
-    the GIL during C parsing).  Graph mutation remains sequential since
+    the GIL during C parsing). Graph mutation remains sequential since
     :class:`KnowledgeGraph` is not thread-safe.
 
     For each symbol discovered during parsing a graph node is created with
@@ -133,9 +134,11 @@ def process_parsing(
 
     Args:
         files: File entries produced by the walker phase.
-        graph: The knowledge graph to populate.  File nodes are expected to
+        graph: The knowledge graph to populate. File nodes are expected to
             already exist (created by the structure phase).
         max_workers: Maximum number of threads for parallel parsing.
+        progress_callback: Optional callback receiving (done, total) file
+            counts as graph population progresses.
 
     Returns:
         A list of :class:`FileParseData` objects that carry the full parse
@@ -149,7 +152,8 @@ def process_parsing(
             )
         )
 
-    for file_entry, parse_data in zip(files, all_parse_data):
+    total_files = len(files)
+    for i, (file_entry, parse_data) in enumerate(zip(files, all_parse_data)):
         file_id = generate_id(NodeLabel.FILE, file_entry.path)
         exported_names: set[str] = set(parse_data.parse_result.exports)
 
@@ -211,5 +215,8 @@ def process_parsing(
                     target=symbol_id,
                 )
             )
+
+        if progress_callback:
+            progress_callback(i + 1, total_files)
 
     return all_parse_data
