@@ -19,6 +19,7 @@ from axon.mcp.server import (
     _ServerState,
     _resolve_db_path,
     _with_storage,
+    call_tool,
     set_db_path,
     set_lock,
     set_storage,
@@ -95,3 +96,34 @@ class TestSetDbPath:
         """_resolve_db_path returns cwd/.axon/kuzu when no path was injected."""
         expected = Path.cwd() / '.axon' / 'kuzu'
         assert _resolve_db_path() == expected
+
+
+class TestCallToolSanitization:
+    """call_tool catch-all must not leak internal exception details."""
+
+    async def test_call_tool_sanitizes_unhandled_exception(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Exception detail is replaced with a ref-linked generic message."""
+        mock_storage = MagicMock()
+        mock_storage.fts_search.side_effect = RuntimeError(
+            '/etc/secret/internal-path'
+        )
+        set_storage(mock_storage)
+
+        with caplog.at_level('ERROR'):
+            result = await call_tool('axon_query', {'query': 'x'})
+
+        text = result[0].text
+        assert '/etc/secret/internal-path' not in text
+        assert 'Internal error' in text
+        assert 'ref ' in text
+
+        ref = text.split('ref ')[1].split(')')[0]
+        matching = [
+            r
+            for r in caplog.records
+            if r.exc_info and '/etc/secret/internal-path' in str(r.exc_info[1])
+        ]
+        assert matching, 'Full exception must appear in a log record'
+        assert matching[0].ref == ref

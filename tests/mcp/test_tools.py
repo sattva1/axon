@@ -10,6 +10,8 @@ from axon.core.graph.model import GraphNode, GraphRelationship, NodeLabel, RelTy
 from axon.core.storage.base import SearchResult
 from axon.mcp.resources import get_dead_code_list, get_overview, get_schema
 from axon.mcp.tools import (
+    MAX_CYPHER_LENGTH,
+    MAX_DIFF_LENGTH,
     _confidence_tag,
     _format_query_results,
     _group_by_process,
@@ -346,14 +348,25 @@ class TestHandleCypher:
         assert "src/api.py" in result
 
     def test_no_results(self, mock_storage):
-        result = handle_cypher(mock_storage, "MATCH (n:Nonexistent) RETURN n")
-        assert "no results" in result.lower()
+        result = handle_cypher(mock_storage, 'MATCH (n:Nonexistent) RETURN n')
+        assert 'no results' in result.lower()
 
-    def test_query_error(self, mock_storage):
-        mock_storage.execute_raw.side_effect = RuntimeError("Syntax error")
-        result = handle_cypher(mock_storage, "INVALID QUERY")
-        assert "failed" in result.lower()
-        assert "Syntax error" in result
+    def test_query_error(self, mock_storage, caplog):
+        """Exception detail is not exposed to the caller; ref id links log."""
+        mock_storage.execute_raw.side_effect = RuntimeError('Syntax error')
+        with caplog.at_level('ERROR'):
+            result = handle_cypher(mock_storage, 'INVALID QUERY')
+        assert 'Syntax error' not in result
+        assert 'failed' in result.lower()
+        assert 'ref ' in result
+        ref = result.split('ref ')[1].split(')')[0]
+        matching = [
+            r
+            for r in caplog.records
+            if r.exc_info and 'Syntax error' in str(r.exc_info[1])
+        ]
+        assert matching, 'Exception text must appear in a log record'
+        assert matching[0].ref == ref
 
     def test_handle_cypher_rejects_write(self, mock_storage):
         result = handle_cypher(mock_storage, "DELETE (n)")
@@ -902,8 +915,20 @@ class TestHandleCallPath:
         mock_storage.get_callees.return_value = [_callee]
         # Need separate fts_search results for from and to symbols
         mock_storage.fts_search.side_effect = [
-            [SearchResult(node_id="function:src/auth.py:validate", score=1.0, node_name="validate")],
-            [SearchResult(node_id="function:src/perms.py:check_perms", score=1.0, node_name="check_perms")],
+            [
+                SearchResult(
+                    node_id='function:src/auth.py:validate',
+                    score=1.0,
+                    node_name='validate',
+                )
+            ],
+            [
+                SearchResult(
+                    node_id='function:src/perms.py:check_perms',
+                    score=1.0,
+                    node_name='check_perms',
+                )
+            ],
         ]
         mock_storage.get_node.side_effect = [
             GraphNode(id="function:src/auth.py:validate", label=NodeLabel.FUNCTION,
@@ -1183,15 +1208,67 @@ class TestHandleCycles:
         mock_storage.load_graph.return_value = kg
 
         result = handle_cycles(mock_storage)
-        assert "CRITICAL" in result
+        assert 'CRITICAL' in result
 
-    def test_load_graph_error(self, mock_storage):
-        mock_storage.load_graph.side_effect = RuntimeError("DB error")
-        result = handle_cycles(mock_storage)
-        assert "Error loading graph" in result
+    def test_load_graph_error(self, mock_storage, caplog):
+        """Exception detail is not exposed to the caller; ref id links log."""
+        mock_storage.load_graph.side_effect = RuntimeError('DB error')
+        with caplog.at_level('ERROR'):
+            result = handle_cycles(mock_storage)
+        assert 'DB error' not in result
+        assert 'ref ' in result
+        ref = result.split('ref ')[1].split(')')[0]
+        matching = [
+            r
+            for r in caplog.records
+            if r.exc_info and 'DB error' in str(r.exc_info[1])
+        ]
+        assert matching, 'Exception text must appear in a log record'
+        assert matching[0].ref == ref
 
     def test_empty_graph(self, mock_storage):
         kg = KnowledgeGraph()
         mock_storage.load_graph.return_value = kg
         result = handle_cycles(mock_storage)
-        assert "No symbols" in result
+        assert 'No symbols' in result
+
+
+class TestInputCaps:
+    """Input length cap enforcement across tool handlers."""
+
+    def test_cypher_over_max_length_rejected(self, mock_storage):
+        """Query exceeding MAX_CYPHER_LENGTH is rejected without executing."""
+        query = 'MATCH ' + 'x' * (MAX_CYPHER_LENGTH + 1)
+        result = handle_cypher(mock_storage, query)
+        assert '100,000' in result
+        mock_storage.execute_raw.assert_not_called()
+
+    def test_cypher_at_max_length_allowed(self, mock_storage):
+        """Query of exactly MAX_CYPHER_LENGTH characters proceeds to execute."""
+        base = 'MATCH (n) RETURN n'
+        query = base + 'x' * (MAX_CYPHER_LENGTH - len(base))
+        assert len(query) == MAX_CYPHER_LENGTH
+        mock_storage.execute_raw.return_value = []
+        handle_cypher(mock_storage, query)
+        mock_storage.execute_raw.assert_called_once()
+
+    def test_diff_over_max_length_rejected_detect_changes(self, mock_storage):
+        """Diff exceeding MAX_DIFF_LENGTH is rejected in handle_detect_changes."""
+        diff = 'a' * (MAX_DIFF_LENGTH + 1)
+        result = handle_detect_changes(mock_storage, diff)
+        assert '100,000' in result
+        mock_storage.execute_raw.assert_not_called()
+
+    def test_diff_over_max_length_rejected_review_risk(self, mock_storage):
+        """Diff exceeding MAX_DIFF_LENGTH is rejected in handle_review_risk."""
+        diff = 'a' * (MAX_DIFF_LENGTH + 1)
+        result = handle_review_risk(mock_storage, diff)
+        assert '100,000' in result
+        mock_storage.execute_raw.assert_not_called()
+
+    def test_diff_over_max_length_rejected_test_impact(self, mock_storage):
+        """Diff exceeding MAX_DIFF_LENGTH is rejected in handle_test_impact."""
+        diff = 'a' * (MAX_DIFF_LENGTH + 1)
+        result = handle_test_impact(mock_storage, diff=diff, symbols=None)
+        assert '100,000' in result
+        mock_storage.execute_raw.assert_not_called()

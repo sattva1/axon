@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -26,8 +27,20 @@ from axon.mcp.resources import get_dead_code_list
 logger = logging.getLogger(__name__)
 
 MAX_TRAVERSE_DEPTH = 10
+MAX_CYPHER_LENGTH = 100_000  # Cap on raw Cypher query length (characters).
+MAX_DIFF_LENGTH = 100_000  # Cap on raw diff input length (characters).
 
-_SAFE_PATH = re.compile(r"^[a-zA-Z0-9._/\-\s]+$")
+_SAFE_PATH = re.compile(r'^[a-zA-Z0-9._/\-\s]+$')
+
+
+def _new_ref_id() -> str:
+    """Generate an 8-hex-char correlation id for log/client pairing.
+
+    32 bits of entropy; birthday-collision probability ~50% at ~65k concurrent
+    entries - acceptable for log correlation at expected MCP traffic. If error
+    volume ever exceeds that, bump to 12 chars (48 bits).
+    """
+    return uuid.uuid4().hex[:8]
 
 
 def _confidence_tag(confidence: float) -> str:
@@ -413,7 +426,13 @@ def handle_detect_changes(storage: StorageBackend, diff: str) -> str:
         Formatted list of affected symbols per changed file.
     """
     if not diff.strip():
-        return "Empty diff provided."
+        return 'Empty diff provided.'
+
+    if len(diff) > MAX_DIFF_LENGTH:
+        return (
+            f'Diff rejected: exceeds maximum length of {MAX_DIFF_LENGTH:,} '
+            f'characters (got {len(diff):,}).'
+        )
 
     changed_files = _parse_diff_files(diff)
 
@@ -477,6 +496,12 @@ def handle_cypher(storage: StorageBackend, query: str) -> str:
     Returns:
         Formatted query results, or an error message if execution fails.
     """
+    if len(query) > MAX_CYPHER_LENGTH:
+        return (
+            f'Query rejected: exceeds maximum length of {MAX_CYPHER_LENGTH:,} '
+            f'characters (got {len(query):,}).'
+        )
+
     # Strip comments so write keywords hidden inside comment blocks are detected.
     cleaned_query = sanitize_cypher(query)
     if WRITE_KEYWORDS.search(cleaned_query):
@@ -487,8 +512,12 @@ def handle_cypher(storage: StorageBackend, query: str) -> str:
 
     try:
         rows = storage.execute_raw(query)
-    except Exception as exc:
-        return f"Cypher query failed: {exc}"
+    except Exception:
+        ref = _new_ref_id()
+        logger.exception(
+            'handle_cypher execute_raw failed', extra={'ref': ref}
+        )
+        return f'Cypher query failed (ref {ref}); see server logs.'
 
     if not rows:
         return "Query returned no results."
@@ -815,7 +844,13 @@ def handle_explain(storage: StorageBackend, symbol: str) -> str:
 def handle_review_risk(storage: StorageBackend, diff: str) -> str:
     """Assess PR risk by synthesizing multiple graph signals."""
     if not diff.strip():
-        return "Empty diff provided."
+        return 'Empty diff provided.'
+
+    if len(diff) > MAX_DIFF_LENGTH:
+        return (
+            f'Diff rejected: exceeds maximum length of {MAX_DIFF_LENGTH:,} '
+            f'characters (got {len(diff):,}).'
+        )
 
     changed_files = _parse_diff_files(diff)
     if not changed_files:
@@ -866,7 +901,8 @@ def handle_review_risk(storage: StorageBackend, diff: str) -> str:
         coupling_rows = (
             storage.execute_raw(
                 f'MATCH (a:File)-[r:CodeRelation]-(b:File) '
-                f"WHERE a.file_path = '{escaped}' AND r.rel_type = 'coupled_with' AND r.strength >= 0.5 "
+                f"WHERE a.file_path = '{escaped}' "
+                f"AND r.rel_type = 'coupled_with' AND r.strength >= 0.5 "
                 f'RETURN b.file_path, r.strength'
             )
             or []
@@ -1065,8 +1101,10 @@ def handle_cycles(storage: StorageBackend, min_size: int = 2) -> str:
 
     try:
         graph = storage.load_graph()
-    except Exception as exc:
-        return f"Error loading graph: {exc}"
+    except Exception:
+        ref = _new_ref_id()
+        logger.exception('handle_cycles load_graph failed', extra={'ref': ref})
+        return f'Error loading graph (ref {ref}); see server logs.'
 
     ig_graph, index_to_node_id = export_to_igraph(graph)
 
@@ -1116,6 +1154,11 @@ def handle_test_impact(
     changed_symbol_ids: list[tuple[str, str]] = []
 
     if diff and diff.strip():
+        if len(diff) > MAX_DIFF_LENGTH:
+            return (
+                f'Diff rejected: exceeds maximum length of {MAX_DIFF_LENGTH:,} '
+                f'characters (got {len(diff):,}).'
+            )
         changed_files = _parse_diff_files(diff)
         for file_path, ranges in changed_files.items():
             if not _SAFE_PATH.match(file_path):

@@ -34,6 +34,7 @@ from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.resources import get_dead_code_list, get_overview, get_schema
 from axon.mcp.tools import (
     MAX_TRAVERSE_DEPTH,
+    _new_ref_id,
     handle_call_path,
     handle_communities,
     handle_context,
@@ -131,270 +132,268 @@ async def _with_storage(fn: Callable[[KuzuBackend], str]) -> str:
 
 TOOLS: list[Tool] = [
     Tool(
-        name="axon_list_repos",
-        description="List all indexed repositories with their stats.",
-        inputSchema={
-            "type": "object",
-            "properties": {},
-        },
+        name='axon_list_repos',
+        description='List all indexed repositories with their stats.',
+        inputSchema={'type': 'object', 'properties': {}},
     ),
     Tool(
-        name="axon_query",
+        name='axon_query',
         description=(
-            "Search the knowledge graph using hybrid (keyword + vector) search. "
-            "Returns ranked symbols matching the query."
+            'Search the knowledge graph using hybrid (keyword + vector) search. '
+            'Returns ranked symbols matching the query.'
         ),
         inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query text.",
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'Search query text.',
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of results (default 20).",
-                    "default": 20,
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Maximum number of results (default 20).',
+                    'default': 20,
                 },
             },
-            "required": ["query"],
+            'required': ['query'],
         },
     ),
     Tool(
-        name="axon_context",
+        name='axon_context',
         description=(
-            "Get a 360-degree view of a symbol: callers, callees, type references, "
-            "and community membership."
+            'Get a 360-degree view of a symbol: callers, callees, type references, '
+            'and community membership.'
         ),
         inputSchema={
-            "type": "object",
-            "properties": {
-                "symbol": {
-                    "type": "string",
-                    "description": "Name of the symbol to look up.",
-                },
+            'type': 'object',
+            'properties': {
+                'symbol': {
+                    'type': 'string',
+                    'description': 'Name of the symbol to look up.',
+                }
             },
-            "required": ["symbol"],
+            'required': ['symbol'],
         },
     ),
     Tool(
-        name="axon_impact",
+        name='axon_impact',
         description=(
-            "Blast radius analysis: find all symbols affected by changing a given symbol."
+            'Blast radius analysis: find all symbols affected by changing a given symbol.'
         ),
         inputSchema={
-            "type": "object",
-            "properties": {
-                "symbol": {
-                    "type": "string",
-                    "description": "Name of the symbol to analyse.",
+            'type': 'object',
+            'properties': {
+                'symbol': {
+                    'type': 'string',
+                    'description': 'Name of the symbol to analyse.',
                 },
-                "depth": {
-                    "type": "integer",
-                    "description": (
-                        f"Maximum traversal depth (default 3, max {MAX_TRAVERSE_DEPTH})."
+                'depth': {
+                    'type': 'integer',
+                    'description': (
+                        f'Maximum traversal depth (default 3, max {MAX_TRAVERSE_DEPTH}).'
                     ),
-                    "default": 3,
-                    "minimum": 1,
-                    "maximum": MAX_TRAVERSE_DEPTH,
+                    'default': 3,
+                    'minimum': 1,
+                    'maximum': MAX_TRAVERSE_DEPTH,
                 },
             },
-            "required": ["symbol"],
+            'required': ['symbol'],
         },
     ),
     Tool(
-        name="axon_dead_code",
-        description="List all symbols detected as dead (unreachable) code.",
-        inputSchema={
-            "type": "object",
-            "properties": {},
-        },
+        name='axon_dead_code',
+        description='List all symbols detected as dead (unreachable) code.',
+        inputSchema={'type': 'object', 'properties': {}},
     ),
     Tool(
-        name="axon_detect_changes",
+        name='axon_detect_changes',
         description=(
-            "Parse a git diff and map changed files/lines to affected symbols "
-            "in the knowledge graph."
+            'Parse a git diff and map changed files/lines to affected symbols '
+            'in the knowledge graph.'
         ),
         inputSchema={
-            "type": "object",
-            "properties": {
-                "diff": {
-                    "type": "string",
-                    "description": "Raw git diff output.",
-                },
+            'type': 'object',
+            'properties': {
+                'diff': {
+                    'type': 'string',
+                    'description': 'Raw git diff output.',
+                    'maxLength': 100000,
+                }
             },
-            "required": ["diff"],
+            'required': ['diff'],
         },
     ),
     Tool(
-        name="axon_cypher",
-        description="Execute a raw Cypher query against the knowledge graph.",
+        name='axon_cypher',
+        description='Execute a raw Cypher query against the knowledge graph.',
         inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Cypher query string.",
-                },
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'Cypher query string.',
+                    'maxLength': 100000,
+                }
             },
-            "required": ["query"],
+            'required': ['query'],
         },
     ),
     Tool(
-        name="axon_coupling",
+        name='axon_coupling',
         description=(
-            "Show files temporally coupled with a given file. "
-            "Reveals hidden dependencies from git co-change patterns."
+            'Show files temporally coupled with a given file. '
+            'Reveals hidden dependencies from git co-change patterns.'
         ),
         inputSchema={
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file to analyze coupling for.",
+            'type': 'object',
+            'properties': {
+                'file_path': {
+                    'type': 'string',
+                    'description': 'Path to the file to analyze coupling for.',
                 },
-                "min_strength": {
-                    "type": "number",
-                    "description": "Minimum coupling strength threshold (default 0.3).",
-                    "default": 0.3,
+                'min_strength': {
+                    'type': 'number',
+                    'description': 'Minimum coupling strength threshold (default 0.3).',
+                    'default': 0.3,
                 },
             },
-            "required": ["file_path"],
+            'required': ['file_path'],
         },
     ),
     Tool(
-        name="axon_communities",
+        name='axon_communities',
         description=(
-            "List detected code communities (Leiden clusters) or drill into "
-            "a specific community to see its members."
+            'List detected code communities (Leiden clusters) or drill into '
+            'a specific community to see its members.'
         ),
         inputSchema={
-            "type": "object",
-            "properties": {
-                "community": {
-                    "type": "string",
-                    "description": "Optional community name to drill into. Omit to list all.",
-                },
-            },
-        },
-    ),
-    Tool(
-        name="axon_explain",
-        description=(
-            "Get a narrative explanation of a symbol: its role, community, "
-            "process flows, and relationships summarized for onboarding."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "symbol": {
-                    "type": "string",
-                    "description": "Name of the symbol to explain.",
-                },
-            },
-            "required": ["symbol"],
-        },
-    ),
-    Tool(
-        name="axon_review_risk",
-        description=(
-            "PR risk assessment: analyzes a git diff to find affected symbols, "
-            "missing co-change files, community boundary crossings, and "
-            "downstream blast radius. Returns a risk score."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "diff": {
-                    "type": "string",
-                    "description": "Raw git diff output.",
-                },
-            },
-            "required": ["diff"],
-        },
-    ),
-    Tool(
-        name="axon_call_path",
-        description=(
-            "Find the shortest call chain between two symbols. "
-            "Uses BFS over CALLS edges."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "from_symbol": {
-                    "type": "string",
-                    "description": "Name of the source symbol.",
-                },
-                "to_symbol": {
-                    "type": "string",
-                    "description": "Name of the target symbol.",
-                },
-                "max_depth": {
-                    "type": "integer",
-                    "description": f"Maximum hops (default 10, max {MAX_TRAVERSE_DEPTH}).",
-                    "default": 10,
-                    "minimum": 1,
-                    "maximum": MAX_TRAVERSE_DEPTH,
-                },
-            },
-            "required": ["from_symbol", "to_symbol"],
-        },
-    ),
-    Tool(
-        name="axon_file_context",
-        description=(
-            "Get comprehensive context for a file: symbols, imports, "
-            "coupling, dead code, and community membership in one call."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file to analyze.",
-                },
-            },
-            "required": ["file_path"],
-        },
-    ),
-    Tool(
-        name="axon_test_impact",
-        description=(
-            "Find tests likely affected by code changes. Accepts a git diff "
-            "or symbol names, traces callers to find test files."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "diff": {
-                    "type": "string",
-                    "description": "Raw git diff output.",
-                },
-                "symbols": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of symbol names to check.",
-                },
+            'type': 'object',
+            'properties': {
+                'community': {
+                    'type': 'string',
+                    'description': 'Optional community name to drill into. Omit to list all.',
+                }
             },
         },
     ),
     Tool(
-        name="axon_cycles",
+        name='axon_explain',
         description=(
-            "Detect circular dependencies using strongly connected "
-            "component analysis. Returns cycle groups sorted by size."
+            'Get a narrative explanation of a symbol: its role, community, '
+            'process flows, and relationships summarized for onboarding.'
         ),
         inputSchema={
-            "type": "object",
-            "properties": {
-                "min_size": {
-                    "type": "integer",
-                    "description": "Minimum cycle size to report (default 2).",
-                    "default": 2,
-                    "minimum": 2,
+            'type': 'object',
+            'properties': {
+                'symbol': {
+                    'type': 'string',
+                    'description': 'Name of the symbol to explain.',
+                }
+            },
+            'required': ['symbol'],
+        },
+    ),
+    Tool(
+        name='axon_review_risk',
+        description=(
+            'PR risk assessment: analyzes a git diff to find affected symbols, '
+            'missing co-change files, community boundary crossings, and '
+            'downstream blast radius. Returns a risk score.'
+        ),
+        inputSchema={
+            'type': 'object',
+            'properties': {
+                'diff': {
+                    'type': 'string',
+                    'description': 'Raw git diff output.',
+                    'maxLength': 100000,
+                }
+            },
+            'required': ['diff'],
+        },
+    ),
+    Tool(
+        name='axon_call_path',
+        description=(
+            'Find the shortest call chain between two symbols. '
+            'Uses BFS over CALLS edges.'
+        ),
+        inputSchema={
+            'type': 'object',
+            'properties': {
+                'from_symbol': {
+                    'type': 'string',
+                    'description': 'Name of the source symbol.',
                 },
+                'to_symbol': {
+                    'type': 'string',
+                    'description': 'Name of the target symbol.',
+                },
+                'max_depth': {
+                    'type': 'integer',
+                    'description': f'Maximum hops (default 10, max {MAX_TRAVERSE_DEPTH}).',
+                    'default': 10,
+                    'minimum': 1,
+                    'maximum': MAX_TRAVERSE_DEPTH,
+                },
+            },
+            'required': ['from_symbol', 'to_symbol'],
+        },
+    ),
+    Tool(
+        name='axon_file_context',
+        description=(
+            'Get comprehensive context for a file: symbols, imports, '
+            'coupling, dead code, and community membership in one call.'
+        ),
+        inputSchema={
+            'type': 'object',
+            'properties': {
+                'file_path': {
+                    'type': 'string',
+                    'description': 'Path to the file to analyze.',
+                }
+            },
+            'required': ['file_path'],
+        },
+    ),
+    Tool(
+        name='axon_test_impact',
+        description=(
+            'Find tests likely affected by code changes. Accepts a git diff '
+            'or symbol names, traces callers to find test files.'
+        ),
+        inputSchema={
+            'type': 'object',
+            'properties': {
+                'diff': {
+                    'type': 'string',
+                    'description': 'Raw git diff output.',
+                    'maxLength': 100000,
+                },
+                'symbols': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'List of symbol names to check.',
+                },
+            },
+        },
+    ),
+    Tool(
+        name='axon_cycles',
+        description=(
+            'Detect circular dependencies using strongly connected '
+            'component analysis. Returns cycle groups sorted by size.'
+        ),
+        inputSchema={
+            'type': 'object',
+            'properties': {
+                'min_size': {
+                    'type': 'integer',
+                    'description': 'Minimum cycle size to report (default 2).',
+                    'default': 2,
+                    'minimum': 2,
+                }
             },
         },
     ),
@@ -460,12 +459,17 @@ def _dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Dispatch a tool call to the appropriate handler."""
     try:
-        result = await _with_storage(lambda st: _dispatch_tool(name, arguments, st))
-    except Exception as exc:
-        logger.exception("Tool %s raised an unhandled exception", name)
-        result = f"Internal error: {exc}"
+        result = await _with_storage(
+            lambda st: _dispatch_tool(name, arguments, st)
+        )
+    except Exception:
+        ref = _new_ref_id()
+        logger.exception(
+            'Tool %s raised an unhandled exception', name, extra={'ref': ref}
+        )
+        result = f'Internal error (ref {ref}); see server logs.'
 
-    return [TextContent(type="text", text=result)]
+    return [TextContent(type='text', text=result)]
 
 
 @server.list_resources()
