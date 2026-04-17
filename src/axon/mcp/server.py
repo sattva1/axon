@@ -20,6 +20,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -52,31 +53,33 @@ from axon.mcp.tools import (
 
 logger = logging.getLogger(__name__)
 
-server = Server("axon")
+server = Server('axon')
 
-_storage: KuzuBackend | None = None
-_lock: asyncio.Lock | None = None
 
-_db_path: Path | None = None
+@dataclass(slots=True)
+class _ServerState:
+    storage: KuzuBackend | None = None
+    lock: asyncio.Lock | None = None
+    db_path: Path | None = None
+
+
+_state = _ServerState()
 
 
 def _resolve_db_path() -> Path:
-    global _db_path  # noqa: PLW0603
-    if _db_path is None:
-        _db_path = Path.cwd() / ".axon" / "kuzu"
-    return _db_path
+    if _state.db_path is None:
+        _state.db_path = Path.cwd() / '.axon' / 'kuzu'
+    return _state.db_path
 
 
 def set_storage(storage: KuzuBackend) -> None:
     """Inject a pre-initialised storage backend (e.g. from ``axon serve --watch``)."""
-    global _storage  # noqa: PLW0603
-    _storage = storage
+    _state.storage = storage
 
 
 def set_lock(lock: asyncio.Lock) -> None:
     """Inject a shared lock for coordinating storage access with the file watcher."""
-    global _lock  # noqa: PLW0603
-    _lock = lock
+    _state.lock = lock
 
 
 def set_db_path(path: Path) -> None:
@@ -85,8 +88,7 @@ def set_db_path(path: Path) -> None:
     Must be called before the server handles any tool requests (i.e., before
     entering the event loop in ``main()``).
     """
-    global _db_path  # noqa: PLW0603
-    _db_path = path
+    _state.db_path = path
 
 
 @contextmanager
@@ -114,11 +116,11 @@ async def _with_storage(fn: Callable[[KuzuBackend], str]) -> str:
     Uses the injected persistent backend when available (with optional
     async lock), otherwise opens a short-lived read-only connection.
     """
-    if _storage is not None:
-        if _lock is not None:
-            async with _lock:
-                return await asyncio.to_thread(fn, _storage)
-        return await asyncio.to_thread(fn, _storage)
+    if _state.storage is not None:
+        if _state.lock is not None:
+            async with _state.lock:
+                return await asyncio.to_thread(fn, _state.storage)
+        return await asyncio.to_thread(fn, _state.storage)
 
     def _run() -> str:
         with _open_storage() as st:

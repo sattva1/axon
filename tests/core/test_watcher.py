@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from watchfiles import Change
 
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import GraphNode, GraphRelationship, NodeLabel, RelType
@@ -246,7 +247,9 @@ class TestWatcherReindexFiles:
             encoding="utf-8",
         )
 
-        count, paths = _reindex_files([app_path], tmp_repo, storage)
+        count, paths = _reindex_files(
+            [(Change.modified, app_path)], tmp_repo, storage
+        )
 
         assert count == 1
         node = storage.get_node("function:src/app.py:hello")
@@ -259,12 +262,14 @@ class TestWatcherReindexFiles:
         run_pipeline(tmp_repo, storage)
 
         # Create a file in an ignored directory.
-        cache_dir = tmp_repo / "__pycache__"
+        cache_dir = tmp_repo / '__pycache__'
         cache_dir.mkdir()
-        cached = cache_dir / "module.cpython-311.pyc"
-        cached.write_bytes(b"\x00")
+        cached = cache_dir / 'module.cpython-311.pyc'
+        cached.write_bytes(b'\x00')
 
-        count, _paths = _reindex_files([cached], tmp_repo, storage)
+        count, _paths = _reindex_files(
+            [(Change.modified, cached)], tmp_repo, storage
+        )
 
         assert count == 0
 
@@ -273,10 +278,12 @@ class TestWatcherReindexFiles:
     ) -> None:
         run_pipeline(tmp_repo, storage)
 
-        readme = tmp_repo / "README.md"
-        readme.write_text("# hello", encoding="utf-8")
+        readme = tmp_repo / 'README.md'
+        readme.write_text('# hello', encoding='utf-8')
 
-        count, _paths = _reindex_files([readme], tmp_repo, storage)
+        count, _paths = _reindex_files(
+            [(Change.modified, readme)], tmp_repo, storage
+        )
 
         assert count == 0
 
@@ -291,7 +298,10 @@ class TestWatcherReindexFiles:
 
         deleted_path.unlink()
 
-        count, _paths = _reindex_files([deleted_path], tmp_repo, storage)
+        # Use Change.deleted to correctly signal a deletion.
+        count, _paths = _reindex_files(
+            [(Change.deleted, deleted_path)], tmp_repo, storage
+        )
 
         # Returns 1: the deleted file was processed (nodes removed from storage).
         assert count == 1
@@ -312,7 +322,10 @@ class TestWatcherReindexFiles:
         )
 
         count, _paths = _reindex_files(
-            [tmp_repo / "src" / "app.py", tmp_repo / "src" / "utils.py"],
+            [
+                (Change.modified, tmp_repo / 'src' / 'app.py'),
+                (Change.modified, tmp_repo / 'src' / 'utils.py'),
+            ],
             tmp_repo,
             storage,
         )
@@ -352,7 +365,7 @@ class TestReindexFilesReturnType:
     ) -> None:
         run_pipeline(tmp_repo, storage, embeddings=False)
 
-        changed = [tmp_repo / "src" / "app.py"]
+        changed = [(Change.modified, tmp_repo / 'src' / 'app.py')]
         count, paths = _reindex_files(changed, tmp_repo, storage)
         assert count == 1
         assert "src/app.py" in paths
@@ -435,3 +448,87 @@ class TestRunIncrementalGlobalPhases:
 
         # Community count should be stable, not doubled.
         assert comm_count_2 == comm_count_1
+
+
+class TestReindexFilesChangeAware:
+    """Tests that verify Change-type-aware routing in _reindex_files."""
+
+    def test_change_deleted_with_missing_file_removes_nodes(
+        self, tmp_repo: Path, storage: KuzuBackend
+    ) -> None:
+        """Change.deleted on a genuinely absent file removes nodes from storage."""
+        run_pipeline(tmp_repo, storage)
+        assert storage.get_node('file:src/app.py:') is not None
+
+        deleted_path = tmp_repo / 'src' / 'app.py'
+        deleted_path.unlink()
+
+        count, reindexed_paths = _reindex_files(
+            [(Change.deleted, deleted_path)], tmp_repo, storage
+        )
+
+        assert count == 1
+        assert 'src/app.py' in reindexed_paths
+        # All nodes for the deleted file must be gone.
+        assert storage.get_node('file:src/app.py:') is None
+        assert storage.get_node('function:src/app.py:hello') is None
+
+    def test_change_deleted_with_existing_file_reindexes(
+        self, tmp_repo: Path, storage: KuzuBackend
+    ) -> None:
+        """Change.deleted when the file still exists treats it as a modification."""
+        run_pipeline(tmp_repo, storage)
+
+        # File is present on disk (rare race: re-created before handler runs).
+        app_path = tmp_repo / 'src' / 'app.py'
+        app_path.write_text(
+            "def hello():\n    return 'race_reindexed'\n", encoding='utf-8'
+        )
+
+        count, _paths = _reindex_files(
+            [(Change.deleted, app_path)], tmp_repo, storage
+        )
+
+        # File was present so it gets indexed, not removed.
+        assert count == 1
+        node = storage.get_node('function:src/app.py:hello')
+        assert node is not None
+        assert 'race_reindexed' in node.content
+
+    def test_change_modified_with_missing_file_skips_silently(
+        self, tmp_repo: Path, storage: KuzuBackend
+    ) -> None:
+        """Change.modified on a temporarily absent file is silently skipped."""
+        run_pipeline(tmp_repo, storage)
+
+        absent_path = tmp_repo / 'src' / 'app.py'
+        absent_path.unlink()
+
+        count, reindexed_paths = _reindex_files(
+            [(Change.modified, absent_path)], tmp_repo, storage
+        )
+
+        # No removal and no reindex: path not in reindexed set.
+        assert count == 0
+        assert 'src/app.py' not in reindexed_paths
+
+    def test_change_modified_with_existing_file_reindexes(
+        self, tmp_repo: Path, storage: KuzuBackend
+    ) -> None:
+        """Change.modified on an existing file updates content normally."""
+        run_pipeline(tmp_repo, storage)
+
+        app_path = tmp_repo / 'src' / 'app.py'
+        app_path.write_text(
+            "def hello():\n    return 'new_content'\n", encoding='utf-8'
+        )
+
+        count, reindexed_paths = _reindex_files(
+            [(Change.modified, app_path)], tmp_repo, storage
+        )
+
+        assert count == 1
+        assert 'src/app.py' in reindexed_paths
+        node = storage.get_node('function:src/app.py:hello')
+        assert node is not None
+        assert 'new_content' in node.content

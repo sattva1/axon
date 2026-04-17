@@ -130,7 +130,12 @@ def create_app(
     app.include_router(events_router, prefix="/api")
 
     if streamable_http_app is not None:
-        app.router.routes.append(Route("/mcp", endpoint=streamable_http_app))
+        # Lazy import: avoids loading rate_limit when MCP is not mounted.
+
+        from axon.web.rate_limit import build_rate_limited_app  # noqa: PLC0415
+        app.router.routes.append(
+            Route('/mcp', endpoint=build_rate_limited_app(streamable_http_app))
+        )
 
     if mount_frontend and not dev and FRONTEND_DIR.is_dir():
         app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

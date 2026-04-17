@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import watchfiles
+from watchfiles import Change
 
 from axon.config.ignore import load_gitignore, should_ignore
 from axon.config.languages import is_supported
@@ -115,7 +116,7 @@ def _get_head_sha(repo_path: Path) -> str | None:
 
 
 def _reindex_files(
-    changed_paths: list[Path],
+    changes: list[tuple[Change, Path]],
     repo_path: Path,
     storage: StorageBackend,
     gitignore_patterns: list[str] | None = None,
@@ -127,14 +128,20 @@ def _reindex_files(
     entries: list[FileEntry] = []
     reindexed_paths: set[str] = set()
 
-    for abs_path in changed_paths:
-        if not abs_path.is_file():
+    for change_type, abs_path in changes:
+        if change_type == Change.deleted and not abs_path.is_file():
             try:
                 relative = str(abs_path.relative_to(repo_path))
                 storage.remove_nodes_by_file(relative)
                 reindexed_paths.add(relative)
             except (ValueError, OSError):
                 pass
+            continue
+
+        if not abs_path.is_file():
+            # Transient atomic-save window: path temporarily absent for
+            # non-deletion events. The next watchfiles cycle resolves it.
+            logger.debug('Skipping temporarily absent path: %s', abs_path)
             continue
 
         try:
@@ -288,16 +295,17 @@ async def watch_repo(
         yield_on_timeout=True,
         stop_event=stop_event,
     ):
-        changed_paths: list[Path] = []
-        seen: set[str] = set()
-        for _change_type, path_str in changes:
-            if path_str not in seen:
-                seen.add(path_str)
-                changed_paths.append(Path(path_str))
+        # Dedup by path string; last event type for a given path wins.
+        path_to_change: dict[str, Change] = {}
+        for change_type, path_str in changes:
+            path_to_change[path_str] = change_type
+        changed: list[tuple[Change, Path]] = [
+            (ct, Path(ps)) for ps, ct in path_to_change.items()
+        ]
 
-        if changed_paths:
+        if changed:
             count, reindexed = await _run_sync(
-                _reindex_files, changed_paths, repo_path, storage, gitignore,
+                _reindex_files, changed, repo_path, storage, gitignore
             )
             if reindexed:
                 dirty_files |= reindexed
@@ -307,11 +315,16 @@ async def watch_repo(
                 logger.info("Reindexed %d file(s), %d paths dirty", count, len(reindexed))
 
         now = time.monotonic()
-        quiet_elapsed = last_change_time > 0 and (now - last_change_time) >= QUIET_PERIOD
-        starvation = first_dirty_time > 0 and (now - first_dirty_time) >= MAX_DIRTY_AGE
+        quiet_elapsed = (
+            last_change_time > 0 and (now - last_change_time) >= QUIET_PERIOD
+        )
+        starvation = (
+            first_dirty_time > 0 and (now - first_dirty_time) >= MAX_DIRTY_AGE
+        )
+        # global_lock.locked() is safe here: single event loop, no await between check and acquire.
         if (
             dirty_files
-            and not global_lock.locked()  # Safe: single async event loop, no await between check and acquire.
+            and not global_lock.locked()
             and (quiet_elapsed or starvation)
         ):
             snapshot = dirty_files.copy()
