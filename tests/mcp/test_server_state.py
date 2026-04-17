@@ -8,6 +8,7 @@ autouse reset fixture touches _state directly, for isolation purposes.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -15,6 +16,8 @@ from unittest.mock import MagicMock
 import pytest
 
 import axon.mcp.server as server_module
+import axon.mcp.tools as tools_module
+from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.server import (
     _ServerState,
     _resolve_db_path,
@@ -127,3 +130,63 @@ class TestCallToolSanitization:
         ]
         assert matching, 'Full exception must appear in a log record'
         assert matching[0].ref == ref
+
+
+class TestCypherReadOnlyEnforcement:
+    """axon_cypher is routed through a fresh read-only KuzuDB connection.
+
+    Even when WRITE_KEYWORDS is bypassed, the DB layer rejects writes because
+    the connection is opened with read_only=True regardless of any injected
+    read-write storage backend.
+    """
+
+    async def test_db_layer_rejects_write_even_if_rw_storage_injected(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DB-layer read-only blocks writes even when rw storage is injected."""
+        # Arrange: initialize a real KuzuDB with schema so _open_storage can
+        # open a read-only connection against it. Do NOT pre-create the
+        # directory - KuzuDB creates its own DB files at the given path.
+        db_path = tmp_path / '.axon' / 'kuzu'
+        (tmp_path / '.axon').mkdir(parents=True)
+        rw_storage = KuzuBackend()
+        rw_storage.initialize(db_path, read_only=False)
+
+        # Inject the rw storage and point _open_storage at the same path.
+        set_storage(rw_storage)
+        set_db_path(db_path)
+
+        # Bypass the user-friendly WRITE_KEYWORDS regex denylist so the query
+        # reaches the DB layer. The DB layer is the definitive enforcement point.
+        # Patch on tools_module because tools.py imports WRITE_KEYWORDS by name.
+        monkeypatch.setattr(tools_module, 'WRITE_KEYWORDS', re.compile('$^'))
+
+        # Act: submit a write query via the public call_tool interface.
+        with caplog.at_level('ERROR'):
+            result = await call_tool(
+                'axon_cypher',
+                {'query': "CREATE (n:Function {id: 'should_not_write'})"},
+            )
+        text = result[0].text
+
+        # Assert: write was rejected - the error is surfaced as a sanitized
+        # message with a ref id (either from handle_cypher or the catch-all).
+        assert 'should_not_write' not in text
+        assert 'Cypher query failed' in text or 'Internal error' in text
+        assert 'ref ' in text
+
+        # Verify the node was never persisted - re-open a fresh read-only
+        # connection and confirm no matching node exists.
+        check_storage = KuzuBackend()
+        check_storage.initialize(db_path, read_only=True)
+        try:
+            rows = check_storage.execute_raw(
+                "MATCH (n:Function {id: 'should_not_write'}) RETURN n.id"
+            )
+            assert rows == []
+        finally:
+            check_storage.close()
+            rw_storage.close()

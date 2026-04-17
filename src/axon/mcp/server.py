@@ -111,6 +111,22 @@ def _open_storage() -> Iterator[KuzuBackend]:
         storage.close()
 
 
+async def _with_readonly_storage(fn: Callable[[KuzuBackend], str]) -> str:
+    """Run *fn* against a fresh read-only storage connection.
+
+    Used for user-submitted Cypher. Enforces read-only at the DB layer,
+    regardless of whether a read-write backend is injected via set_storage().
+
+
+
+    """
+    def _run() -> str:
+        with _open_storage() as st:
+            return fn(st)
+
+    return await asyncio.to_thread(_run)
+
+
 async def _with_storage(fn: Callable[[KuzuBackend], str]) -> str:
     """Run *fn* against the appropriate storage backend.
 
@@ -459,9 +475,14 @@ def _dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Dispatch a tool call to the appropriate handler."""
     try:
-        result = await _with_storage(
-            lambda st: _dispatch_tool(name, arguments, st)
-        )
+        if name == 'axon_cypher':
+            result = await _with_readonly_storage(
+                lambda st: _dispatch_tool(name, arguments, st)
+            )
+        else:
+            result = await _with_storage(
+                lambda st: _dispatch_tool(name, arguments, st)
+            )
     except Exception:
         ref = _new_ref_id()
         logger.exception(

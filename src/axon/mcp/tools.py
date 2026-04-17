@@ -486,11 +486,16 @@ def handle_detect_changes(storage: StorageBackend, diff: str) -> str:
 def handle_cypher(storage: StorageBackend, query: str) -> str:
     """Execute a raw Cypher query and return formatted results.
 
-    Only read-only queries are allowed.  Queries containing write keywords
+    Only read-only queries are allowed. Queries containing write keywords
     (DELETE, DROP, CREATE, SET, etc.) are rejected.
 
+    The caller is expected to pass a storage backend opened in read-only
+    mode (see server._with_readonly_storage). The WRITE_KEYWORDS regex
+    check here remains as defense-in-depth and to return a friendlier
+    error message than a raw KuzuDB read-only violation.
+
     Args:
-        storage: The storage backend.
+        storage: The storage backend, expected to be opened read-only.
         query: The Cypher query string.
 
     Returns:
