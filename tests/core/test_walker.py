@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from axon.core.ingestion.walker import discover_files, walk_repo
+from axon.core.ingestion.walker import (
+    MAX_FILE_SIZE,
+    discover_files,
+    read_file,
+    walk_repo,
+)
 
 
 @pytest.fixture()
@@ -170,5 +177,55 @@ class TestWalkRepoSkipsBinary:
         entries = walk_repo(tmp_path)
         paths = {e.path for e in entries}
 
-        assert "binary.py" not in paths
-        assert "valid.py" in paths
+        assert 'binary.py' not in paths
+        assert 'valid.py' in paths
+
+
+class TestReadFileOversizedSkipped:
+    def test_skipped_when_oversized(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Files exceeding MAX_FILE_SIZE are skipped."""
+        file_path = tmp_path / 'big.py'
+        file_path.write_text('def hello(): pass\n', encoding='utf-8')
+
+        fake_stat = MagicMock()
+        fake_stat.st_size = MAX_FILE_SIZE + 1
+        monkeypatch.setattr(Path, 'stat', lambda self: fake_stat)
+
+        assert read_file(tmp_path, file_path) is None
+
+
+class TestReadFileExactlyMaxSize:
+    def test_read_at_exact_max_size(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Files of exactly MAX_FILE_SIZE bytes are read successfully."""
+        content = 'def hello(): pass\n'
+        file_path = tmp_path / 'exact.py'
+        file_path.write_text(content, encoding='utf-8')
+
+        fake_stat = MagicMock()
+        fake_stat.st_size = MAX_FILE_SIZE
+        monkeypatch.setattr(Path, 'stat', lambda self: fake_stat)
+
+        result = read_file(tmp_path, file_path)
+
+        assert result is not None
+        assert result.content == content
+
+
+class TestReadFileStatOSError:
+    def test_none_on_stat_oserror(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """OSError raised by stat() causes read_file to return None."""
+        file_path = tmp_path / 'unreadable.py'
+        file_path.write_text('x = 1', encoding='utf-8')
+
+        def raise_oserror(self: Path) -> os.stat_result:
+            raise OSError('permission denied')
+
+        monkeypatch.setattr(Path, 'stat', raise_oserror)
+
+        assert read_file(tmp_path, file_path) is None

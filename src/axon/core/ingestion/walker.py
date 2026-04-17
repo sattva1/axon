@@ -12,13 +12,34 @@ from axon.config.ignore import DEFAULT_IGNORE_PATTERNS, should_ignore
 from axon.config.languages import get_language, is_supported
 
 _PRUNE_DIRS: frozenset[str] = frozenset(
-    p for p in DEFAULT_IGNORE_PATTERNS
-    if ("*" not in p and "." not in p) or p.startswith(".")
-) | frozenset({
-    ".git", "node_modules", "__pycache__", ".venv", "venv", ".env",
-    "dist", "build", ".idea", ".vscode", ".mypy_cache", ".pytest_cache",
-    ".ruff_cache", ".tox", ".eggs", ".axon",
-})
+    p
+    for p in DEFAULT_IGNORE_PATTERNS
+    if ('*' not in p and '.' not in p) or p.startswith('.')
+) | frozenset(
+    {
+        '.git',
+        'node_modules',
+        '__pycache__',
+        '.venv',
+        'venv',
+        '.env',
+        'dist',
+        'build',
+        '.idea',
+        '.vscode',
+        '.mypy_cache',
+        '.pytest_cache',
+        '.ruff_cache',
+        '.tox',
+        '.eggs',
+        '.axon',
+    }
+)
+
+MAX_FILE_SIZE = (
+    5 * 1024 * 1024
+)  # 5 MB - legitimate source files rarely exceed this.
+
 
 @dataclass
 class FileEntry:
@@ -93,7 +114,14 @@ def read_file(repo_path: Path, file_path: Path) -> FileEntry | None:
     relative = file_path.relative_to(repo_path)
 
     try:
-        content = file_path.read_text(encoding="utf-8")
+        size = file_path.stat().st_size
+    except OSError:
+        return None
+    if size > MAX_FILE_SIZE:
+        return None
+
+    try:
+        content = file_path.read_text(encoding='utf-8')
     except (UnicodeDecodeError, ValueError, OSError):
         return None
 
