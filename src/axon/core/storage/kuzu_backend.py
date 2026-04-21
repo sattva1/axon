@@ -9,7 +9,6 @@ covers all source-to-target combinations.
 from __future__ import annotations
 
 import csv
-import json
 import hashlib
 import json
 import logging
@@ -61,23 +60,49 @@ _NODE_PROPERTIES = (
     "PRIMARY KEY (id)"
 )
 
-_DEDICATED_PROPS = frozenset({"cohesion"})
+_DEDICATED_NODE_PROPS = frozenset({'cohesion'})
 
-_REL_PROPERTIES = (
-    "rel_type STRING, "
-    "confidence DOUBLE, "
-    "role STRING, "
-    "step_number INT64, "
-    "strength DOUBLE, "
-    "co_changes INT64, "
-    "symbols STRING"
+_DEDICATED_REL_PROPS = frozenset(
+    {'confidence', 'role', 'step_number', 'strength', 'co_changes', 'symbols'}
 )
 
-def _serialize_extra_props(props: dict[str, Any] | None) -> str:
+_REL_PROPERTIES = (
+    'rel_type STRING, '
+    'confidence DOUBLE, '
+    'role STRING, '
+    'step_number INT64, '
+    'strength DOUBLE, '
+    'co_changes INT64, '
+    'symbols STRING, '
+    "metadata_json STRING DEFAULT ''"
+)
+
+# Single source of truth for rel CSV column order. Consumed by both
+# _bulk_load_rels_csv (positional CSV rows) and _insert_relationship
+# (named Cypher params). The property columns start at index 3.
+_REL_CSV_COLUMNS: tuple[str, ...] = (
+    'source_id',
+    'target_id',
+    'rel_type',
+    'confidence',
+    'role',
+    'step_number',
+    'strength',
+    'co_changes',
+    'symbols',
+    'metadata_json',
+)
+
+_SCHEMA_VERSION = 2
+
+
+def _serialize_extra_props(
+    props: dict[str, Any] | None, dedicated: frozenset[str]
+) -> str:
     if not props:
-        return ""
-    extra = {k: v for k, v in props.items() if k not in _DEDICATED_PROPS}
-    return json.dumps(extra) if extra else ""
+        return ''
+    extra = {k: v for k, v in props.items() if k not in dedicated}
+    return json.dumps(extra, sort_keys=True) if extra else ''
 
 
 def escape_cypher(value: str) -> str:
@@ -97,7 +122,9 @@ def _table_for_id(node_id: str) -> str | None:
     prefix = node_id.split(":", 1)[0]
     return _LABEL_TO_TABLE.get(prefix)
 
-_EMBEDDING_PROPERTIES = "node_id STRING, vec FLOAT[384], PRIMARY KEY(node_id)"
+
+_EMBEDDING_PROPERTIES = 'node_id STRING, vec FLOAT[384], PRIMARY KEY(node_id)'
+
 
 class KuzuBackend:
     """StorageBackend implementation backed by KuzuDB.
@@ -141,6 +168,8 @@ class KuzuBackend:
                 self._conn = kuzu.Connection(self._db)
                 if not read_only:
                     self._create_schema()
+                else:
+                    self._check_schema_version(path)
                 return
             except RuntimeError as e:
                 if "lock" in str(e).lower() and attempt < max_retries:
@@ -209,12 +238,13 @@ class KuzuBackend:
         try:
             with self._lock:
                 result = conn.execute(
-                    "MATCH (caller)-[r:CodeRelation]->(n) "
-                    "WHERE n.file_path = $fp AND caller.file_path <> $fp "
-                    "RETURN caller.id, caller.file_path, n.id, "
-                    "r.rel_type, r.confidence, r.role, "
-                    "r.step_number, r.strength, r.co_changes, r.symbols",
-                    parameters={"fp": file_path},
+                    'MATCH (caller)-[r:CodeRelation]->(n) '
+                    'WHERE n.file_path = $fp AND caller.file_path <> $fp '
+                    'RETURN caller.id, caller.file_path, n.id, '
+                    'r.rel_type, r.confidence, r.role, '
+                    'r.step_number, r.strength, r.co_changes, r.symbols, '
+                    'r.metadata_json',
+                    parameters={'fp': file_path},
                 )
             while result.has_next():
                 row = result.get_next()
@@ -229,23 +259,34 @@ class KuzuBackend:
                     continue
                 props: dict[str, Any] = {}
                 if row[4] is not None:
-                    props["confidence"] = float(row[4])
-                if row[5] is not None and row[5] != "":
-                    props["role"] = str(row[5])
+                    props['confidence'] = float(row[4])
+                if row[5] is not None and row[5] != '':
+                    props['role'] = str(row[5])
                 if row[6] is not None and row[6] != 0:
-                    props["step_number"] = int(row[6])
+                    props['step_number'] = int(row[6])
                 if row[7] is not None and row[7] != 0.0:
-                    props["strength"] = float(row[7])
+                    props['strength'] = float(row[7])
                 if row[8] is not None and row[8] != 0:
-                    props["co_changes"] = int(row[8])
-                if row[9] is not None and row[9] != "":
-                    props["symbols"] = str(row[9])
-                rel_id = f"{rel_type_str}:{src_id}->{tgt_id}"
-                edges.append(GraphRelationship(
-                    id=rel_id, type=rel_type,
-                    source=src_id, target=tgt_id,
-                    properties=props,
-                ))
+                    props['co_changes'] = int(row[8])
+                if row[9] is not None and row[9] != '':
+                    props['symbols'] = str(row[9])
+                if row[10]:
+                    try:
+                        extra = json.loads(row[10])
+                        if isinstance(extra, dict):
+                            props.update(extra)
+                    except (ValueError, TypeError):
+                        pass
+                rel_id = f'{rel_type_str}:{src_id}->{tgt_id}'
+                edges.append(
+                    GraphRelationship(
+                        id=rel_id,
+                        type=rel_type,
+                        source=src_id,
+                        target=tgt_id,
+                        properties=props,
+                    )
+                )
         except Exception:
             logger.warning(
                 "Failed to query inbound cross-file edges for %s",
@@ -752,9 +793,10 @@ class KuzuBackend:
         try:
             with self._lock:
                 result = conn.execute(
-                    "MATCH (a)-[r:CodeRelation]->(b) "
-                    "RETURN a.id, b.id, r.rel_type, r.confidence, r.role, "
-                    "r.step_number, r.strength, r.co_changes, r.symbols"
+                    'MATCH (a)-[r:CodeRelation]->(b) '
+                    'RETURN a.id, b.id, r.rel_type, r.confidence, r.role, '
+                    'r.step_number, r.strength, r.co_changes, r.symbols, '
+                    'r.metadata_json'
                 )
             while result.has_next():
                 row = result.get_next()
@@ -770,17 +812,24 @@ class KuzuBackend:
 
                 props: dict[str, Any] = {}
                 if row[3] is not None:
-                    props["confidence"] = float(row[3])
-                if row[4] is not None and row[4] != "":
-                    props["role"] = str(row[4])
+                    props['confidence'] = float(row[3])
+                if row[4] is not None and row[4] != '':
+                    props['role'] = str(row[4])
                 if row[5] is not None and row[5] != 0:
-                    props["step_number"] = int(row[5])
+                    props['step_number'] = int(row[5])
                 if row[6] is not None and row[6] != 0.0:
-                    props["strength"] = float(row[6])
+                    props['strength'] = float(row[6])
                 if row[7] is not None and row[7] != 0:
-                    props["co_changes"] = int(row[7])
-                if row[8] is not None and row[8] != "":
-                    props["symbols"] = str(row[8])
+                    props['co_changes'] = int(row[7])
+                if row[8] is not None and row[8] != '':
+                    props['symbols'] = str(row[8])
+                if row[9]:
+                    try:
+                        extra = json.loads(row[9])
+                        if isinstance(extra, dict):
+                            props.update(extra)
+                    except (ValueError, TypeError):
+                        pass
 
                 graph.add_relationship(
                     GraphRelationship(
@@ -946,14 +995,30 @@ class KuzuBackend:
 
         try:
             for table, nodes in by_table.items():
-                self._csv_copy(table, [
-                    [node.id, node.name, node.file_path, node.start_line,
-                     node.end_line, node.content, node.signature, node.language,
-                     node.class_name, node.is_dead, node.is_entry_point,
-                     node.is_exported, (node.properties or {}).get("cohesion"),
-                     _serialize_extra_props(node.properties)]
-                    for node in nodes
-                ])
+                self._csv_copy(
+                    table,
+                    [
+                        [
+                            node.id,
+                            node.name,
+                            node.file_path,
+                            node.start_line,
+                            node.end_line,
+                            node.content,
+                            node.signature,
+                            node.language,
+                            node.class_name,
+                            node.is_dead,
+                            node.is_entry_point,
+                            node.is_exported,
+                            (node.properties or {}).get('cohesion'),
+                            _serialize_extra_props(
+                                node.properties, _DEDICATED_NODE_PROPS
+                            ),
+                        ]
+                        for node in nodes
+                    ],
+                )
             return True
         except Exception:
             logger.debug("CSV bulk_load_nodes failed, falling back", exc_info=True)
@@ -979,16 +1044,28 @@ class KuzuBackend:
 
         try:
             for (src_table, dst_table), rels in by_pair.items():
-                self._csv_copy(f"CodeRelation_{src_table}_{dst_table}", [
-                    [rel.source, rel.target, rel.type.value,
-                     float((rel.properties or {}).get("confidence", 1.0)),
-                     str((rel.properties or {}).get("role", "")),
-                     int((rel.properties or {}).get("step_number", 0)),
-                     float((rel.properties or {}).get("strength", 0.0)),
-                     int((rel.properties or {}).get("co_changes", 0)),
-                     str((rel.properties or {}).get("symbols", ""))]
-                    for rel in rels
-                ])
+                self._csv_copy(
+                    f'CodeRelation_{src_table}_{dst_table}',
+                    [
+                        [
+                            rel.source,
+                            rel.target,
+                            rel.type.value,
+                            float(
+                                (rel.properties or {}).get('confidence', 1.0)
+                            ),
+                            str((rel.properties or {}).get('role', '')),
+                            int((rel.properties or {}).get('step_number', 0)),
+                            float((rel.properties or {}).get('strength', 0.0)),
+                            int((rel.properties or {}).get('co_changes', 0)),
+                            str((rel.properties or {}).get('symbols', '')),
+                            _serialize_extra_props(
+                                rel.properties, _DEDICATED_REL_PROPS
+                            ),
+                        ]
+                        for rel in rels
+                    ],
+                )
             return True
         except Exception:
             logger.debug("CSV bulk_load_rels failed, falling back", exc_info=True)
@@ -1024,6 +1101,34 @@ class KuzuBackend:
             logger.debug("CSV bulk_store_embeddings failed, falling back", exc_info=True)
             return False
 
+    def _check_schema_version(self, path: Path) -> None:
+        """Verify the stored schema version matches the code expectation.
+
+        Called only for read-only opens. Raises RuntimeError when the stored
+        version is absent or older than _SCHEMA_VERSION so the caller gets a
+        clear migration instruction instead of a cryptic column-not-found error.
+        """
+        conn = self._require_conn()
+        stored: int = 1  # pre-Phase-1 DBs have no _Metadata table
+        try:
+            result = conn.execute(
+                "MATCH (m:_Metadata) WHERE m.key = 'schema_version' RETURN m.value"
+            )
+            if result.has_next():
+                row = result.get_next()
+                stored = int(row[0]) if row[0] is not None else 1
+        except Exception:
+            # _Metadata table absent - treat as version 1
+            pass
+
+        if stored < _SCHEMA_VERSION:
+            raise RuntimeError(
+                f'Kuzu DB at {path} is on schema version {stored} but this '
+                f'code expects version {_SCHEMA_VERSION}. Run `axon index` '
+                f'(or let the watcher run) to migrate, then restart the MCP '
+                f'server.'
+            )
+
     def _create_schema(self) -> None:
         """Create node/rel/embedding tables and the FTS extension."""
         conn = self._require_conn()
@@ -1038,12 +1143,21 @@ class KuzuBackend:
             stmt = f"CREATE NODE TABLE IF NOT EXISTS {table}({_NODE_PROPERTIES})"
             conn.execute(stmt)
             try:
-                conn.execute(f"ALTER TABLE {table} ADD properties_json STRING DEFAULT ''")
+                conn.execute(
+                    f"ALTER TABLE {table} ADD properties_json STRING DEFAULT ''"
+                )
             except Exception:
                 pass
 
         conn.execute(
             f"CREATE NODE TABLE IF NOT EXISTS Embedding({_EMBEDDING_PROPERTIES})"
+        )
+
+        # _Metadata table must be created before the ALTER so that read-mode
+        # opens after a migration always find it for the schema-version probe.
+        conn.execute(
+            'CREATE NODE TABLE IF NOT EXISTS _Metadata('
+            'key STRING, value STRING, PRIMARY KEY(key))'
         )
 
         from_to_pairs: list[str] = []
@@ -1059,7 +1173,27 @@ class KuzuBackend:
         try:
             conn.execute(rel_stmt)
         except Exception:
-            logger.debug("REL TABLE GROUP creation skipped", exc_info=True)
+            logger.debug('REL TABLE GROUP creation skipped', exc_info=True)
+
+        try:
+            conn.execute(
+                "ALTER TABLE CodeRelation ADD metadata_json STRING DEFAULT ''"
+            )
+        except Exception:
+            logger.debug(
+                'metadata_json column already present on CodeRelation',
+                exc_info=True,
+            )
+
+        # Upsert schema version so read-mode opens can verify compatibility.
+        try:
+            conn.execute(
+                "MERGE (_m:_Metadata {key: 'schema_version'}) "
+                'SET _m.value = $v',
+                parameters={'v': str(_SCHEMA_VERSION)},
+            )
+        except Exception:
+            logger.debug('Failed to upsert schema_version', exc_info=True)
 
         self._create_fts_indexes()
 
@@ -1096,20 +1230,22 @@ class KuzuBackend:
         )
         props = node.properties or {}
         params = {
-            "id": node.id,
-            "name": node.name,
-            "file_path": node.file_path,
-            "start_line": node.start_line,
-            "end_line": node.end_line,
-            "content": node.content,
-            "signature": node.signature,
-            "language": node.language,
-            "class_name": node.class_name,
-            "is_dead": node.is_dead,
-            "is_entry_point": node.is_entry_point,
-            "is_exported": node.is_exported,
-            "cohesion": props.get("cohesion"),
-            "properties_json": _serialize_extra_props(props),
+            'id': node.id,
+            'name': node.name,
+            'file_path': node.file_path,
+            'start_line': node.start_line,
+            'end_line': node.end_line,
+            'content': node.content,
+            'signature': node.signature,
+            'language': node.language,
+            'class_name': node.class_name,
+            'is_dead': node.is_dead,
+            'is_entry_point': node.is_entry_point,
+            'is_exported': node.is_exported,
+            'cohesion': props.get('cohesion'),
+            'properties_json': _serialize_extra_props(
+                props, _DEDICATED_NODE_PROPS
+            ),
         }
         try:
             conn.execute(query, parameters=params)
@@ -1130,29 +1266,28 @@ class KuzuBackend:
 
         props = rel.properties or {}
 
+        # Build param names from _REL_CSV_COLUMNS[2:] so the Cypher column
+        # list and params dict cannot drift from the constant definition.
+        rel_prop_keys = _REL_CSV_COLUMNS[2:]
+        prop_clause = ', '.join(f'{k}: ${k}' for k in rel_prop_keys)
         query = (
-            f"MATCH (a:{src_table}), (b:{tgt_table}) "
-            f"WHERE a.id = $src AND b.id = $tgt "
-            f"CREATE (a)-[:CodeRelation {{"
-            f"rel_type: $rel_type, "
-            f"confidence: $confidence, "
-            f"role: $role, "
-            f"step_number: $step_number, "
-            f"strength: $strength, "
-            f"co_changes: $co_changes, "
-            f"symbols: $symbols"
-            f"}}]->(b)"
+            f'MATCH (a:{src_table}), (b:{tgt_table}) '
+            f'WHERE a.id = $src AND b.id = $tgt '
+            f'CREATE (a)-[:CodeRelation {{{prop_clause}}}]->(b)'
         )
-        params = {
-            "src": rel.source,
-            "tgt": rel.target,
-            "rel_type": rel.type.value,
-            "confidence": float(props.get("confidence", 1.0)),
-            "role": str(props.get("role", "")),
-            "step_number": int(props.get("step_number", 0)),
-            "strength": float(props.get("strength", 0.0)),
-            "co_changes": int(props.get("co_changes", 0)),
-            "symbols": str(props.get("symbols", "")),
+        params: dict[str, Any] = {
+            'src': rel.source,
+            'tgt': rel.target,
+            'rel_type': rel.type.value,
+            'confidence': float(props.get('confidence', 1.0)),
+            'role': str(props.get('role', '')),
+            'step_number': int(props.get('step_number', 0)),
+            'strength': float(props.get('strength', 0.0)),
+            'co_changes': int(props.get('co_changes', 0)),
+            'symbols': str(props.get('symbols', '')),
+            'metadata_json': _serialize_extra_props(
+                props, _DEDICATED_REL_PROPS
+            ),
         }
         try:
             conn.execute(query, parameters=params)

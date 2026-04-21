@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import kuzu
 import pytest
 
 from axon.core.graph.graph import KnowledgeGraph
@@ -13,7 +15,14 @@ from axon.core.graph.model import (
     generate_id,
 )
 from axon.core.storage.base import NodeEmbedding
-from axon.core.storage.kuzu_backend import KuzuBackend
+from axon.core.storage.kuzu_backend import (
+    KuzuBackend,
+    _DEDICATED_REL_PROPS,
+    _REL_CSV_COLUMNS,
+    _REL_PROPERTIES,
+    _SCHEMA_VERSION,
+    _serialize_extra_props,
+)
 
 
 @pytest.fixture()
@@ -432,3 +441,260 @@ class TestRemoveRelationshipsByType:
         rel_types = [r.type for r in graph.iter_relationships()]
         assert RelType.CALLS in rel_types
         assert RelType.COUPLED_WITH not in rel_types
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 - metadata_json overflow column tests
+# ---------------------------------------------------------------------------
+
+
+class TestRelCsvColumnsSymmetry:
+    """T1 - _REL_CSV_COLUMNS and _REL_PROPERTIES must cover the same columns."""
+
+    def test_rel_properties_column_names_match_csv_columns(self) -> None:
+        """Column names parsed from _REL_PROPERTIES equal set(_REL_CSV_COLUMNS[2:])."""
+        # Parse the first whitespace-delimited token from each comma-separated
+        # column definition, e.g. "rel_type STRING" -> "rel_type".
+        prop_names = {
+            col.strip().split()[0]
+            for col in _REL_PROPERTIES.split(',')
+            if col.strip()
+        }
+        assert prop_names == set(_REL_CSV_COLUMNS[2:])
+
+
+class TestSerializeExtraProps:
+    """T2 - _serialize_extra_props semantics."""
+
+    def test_none_returns_empty_string(self) -> None:
+        """None input produces an empty string."""
+        assert _serialize_extra_props(None, _DEDICATED_REL_PROPS) == ''
+
+    def test_empty_dict_returns_empty_string(self) -> None:
+        """Empty dict produces an empty string."""
+        assert _serialize_extra_props({}, _DEDICATED_REL_PROPS) == ''
+
+    def test_only_dedicated_keys_returns_empty_string(self) -> None:
+        """Dict containing only dedicated keys (filtered out) produces empty string."""
+        assert (
+            _serialize_extra_props({'confidence': 0.5}, _DEDICATED_REL_PROPS)
+            == ''
+        )
+
+    def test_extra_key_serialized_to_json(self) -> None:
+        """Non-dedicated key is preserved in the JSON output."""
+        result = _serialize_extra_props(
+            {'dispatch_kind': 'asyncio.create_task'}, _DEDICATED_REL_PROPS
+        )
+        assert json.loads(result) == {'dispatch_kind': 'asyncio.create_task'}
+
+    def test_sort_keys_determinism(self) -> None:
+        """Two dicts with same data but different insertion order yield identical string."""
+        d1 = {'z_key': 1, 'a_key': 2}
+        d2 = {'a_key': 2, 'z_key': 1}
+        r1 = _serialize_extra_props(d1, _DEDICATED_REL_PROPS)
+        r2 = _serialize_extra_props(d2, _DEDICATED_REL_PROPS)
+        assert r1 == r2
+        assert r1 != ''
+
+
+class TestRelMetadataJson:
+    """T3/T4 - Round-trip tests for metadata_json via add_relationships."""
+
+    def test_load_graph_round_trips_extra_props(
+        self, backend: KuzuBackend
+    ) -> None:
+        """Extra props survive add_relationships -> load_graph round-trip."""
+        caller = _make_node(name='caller', file_path='src/a.py')
+        callee = _make_node(name='callee', file_path='src/a.py')
+        backend.add_nodes([caller, callee])
+
+        rel = GraphRelationship(
+            id=f'CALLS:{caller.id}->{callee.id}',
+            type=RelType.CALLS,
+            source=caller.id,
+            target=callee.id,
+            properties={
+                'confidence': 0.9,
+                'dispatch_kind': 'direct',
+                'scope_awaited': True,
+            },
+        )
+        backend.add_relationships([rel])
+
+        graph = backend.load_graph()
+        loaded_rel = next(
+            (
+                r
+                for r in graph.iter_relationships()
+                if r.source == caller.id and r.target == callee.id
+            ),
+            None,
+        )
+        assert loaded_rel is not None
+        props = loaded_rel.properties or {}
+        assert props['confidence'] == pytest.approx(0.9)
+        assert props['dispatch_kind'] == 'direct'
+        assert props['scope_awaited'] is True
+
+    def test_inbound_cross_file_edges_round_trips_extra_props(
+        self, backend: KuzuBackend
+    ) -> None:
+        """Extra props survive add_relationships -> get_inbound_cross_file_edges."""
+        node_a = _make_node(name='func_a', file_path='src/a.py')
+        node_b = _make_node(name='func_b', file_path='src/b.py')
+        backend.add_nodes([node_a, node_b])
+
+        rel = GraphRelationship(
+            id=f'CALLS:{node_a.id}->{node_b.id}',
+            type=RelType.CALLS,
+            source=node_a.id,
+            target=node_b.id,
+            properties={
+                'dispatch_kind': 'asyncio.create_task',
+                'symbols': 'Task',
+            },
+        )
+        backend.add_relationships([rel])
+
+        edges = backend.get_inbound_cross_file_edges('src/b.py')
+        assert len(edges) == 1
+        props = edges[0].properties or {}
+        assert props['dispatch_kind'] == 'asyncio.create_task'
+        assert props['symbols'] == 'Task'
+
+
+class TestSchemaVersion:
+    """T6/T7/T8 - Schema version detection and idempotency."""
+
+    def test_double_open_is_idempotent(self, tmp_path: Path) -> None:
+        """Opening the same DB twice (write mode) succeeds and metadata row is unique."""
+        db_path = tmp_path / 'idempotent_db'
+
+        b1 = KuzuBackend()
+        b1.initialize(db_path)
+        b1.close()
+
+        b2 = KuzuBackend()
+        b2.initialize(db_path)
+
+        rows = b2.execute_raw(
+            "MATCH (m:_Metadata) WHERE m.key = 'schema_version' RETURN m.value"
+        )
+        b2.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == str(_SCHEMA_VERSION)
+
+    def test_read_only_raises_on_absent_metadata_table(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only open of a pre-Phase-1 DB (no _Metadata table) raises RuntimeError."""
+        db_path = tmp_path / 'old_db'
+        # Build a minimal DB that has no _Metadata table (simulates pre-Phase-1).
+        db = kuzu.Database(str(db_path))
+        conn = kuzu.Connection(db)
+        conn.execute(
+            'CREATE NODE TABLE IF NOT EXISTS Function('
+            'id STRING, name STRING, file_path STRING, '
+            'start_line INT64, end_line INT64, content STRING, '
+            'signature STRING, language STRING, class_name STRING, '
+            'is_dead BOOL, is_entry_point BOOL, is_exported BOOL, '
+            'cohesion DOUBLE, properties_json STRING, '
+            'PRIMARY KEY (id))'
+        )
+        del conn
+        del db
+
+        backend = KuzuBackend()
+        with pytest.raises(RuntimeError, match=r'schema version'):
+            backend.initialize(db_path, read_only=True)
+        backend.close()
+
+    def test_read_only_succeeds_after_write_open(self, tmp_path: Path) -> None:
+        """Read-only open succeeds when the DB was already opened in write mode."""
+        db_path = tmp_path / 'migrated_db'
+
+        b_write = KuzuBackend()
+        b_write.initialize(db_path)
+        b_write.close()
+
+        b_read = KuzuBackend()
+        b_read.initialize(db_path, read_only=True)
+        b_read.close()
+
+
+class TestSchemaVersionMigration:
+    """T9 - Writer-mode open upgrades a pre-Phase-1 DB."""
+
+    def test_write_open_adds_metadata_json_and_metadata_row(
+        self, tmp_path: Path
+    ) -> None:
+        """Writer open of an old-schema DB adds metadata_json column and _Metadata row.
+
+        Simulates a pre-Phase-1 DB by creating only the old node/rel tables
+        without the _Metadata table or metadata_json column. A subsequent
+        writer-mode KuzuBackend.initialize() must add both.
+        """
+        db_path = tmp_path / 'pre_phase1_db'
+
+        # Build a minimal pre-Phase-1 DB: node tables + CodeRelation without
+        # metadata_json, and no _Metadata node table.
+        db = kuzu.Database(str(db_path))
+        conn = kuzu.Connection(db)
+        conn.execute(
+            'CREATE NODE TABLE IF NOT EXISTS Function('
+            'id STRING, name STRING, file_path STRING, '
+            'start_line INT64, end_line INT64, content STRING, '
+            'signature STRING, language STRING, class_name STRING, '
+            'is_dead BOOL, is_entry_point BOOL, is_exported BOOL, '
+            'cohesion DOUBLE, properties_json STRING, '
+            'PRIMARY KEY (id))'
+        )
+        conn.execute(
+            'CREATE REL TABLE IF NOT EXISTS OldRelation('
+            'FROM Function TO Function, '
+            'rel_type STRING)'
+        )
+        del conn
+        del db
+
+        # Writer-mode open should succeed and apply the migration.
+        backend = KuzuBackend()
+        backend.initialize(db_path)
+
+        # _Metadata row must now exist.
+        rows = backend.execute_raw(
+            "MATCH (m:_Metadata) WHERE m.key = 'schema_version' RETURN m.value"
+        )
+        assert len(rows) == 1
+        assert rows[0][0] == str(_SCHEMA_VERSION)
+
+        # Insert a rel with extra props to verify metadata_json column works.
+        node_a = _make_node(name='old_a', file_path='src/old_a.py')
+        node_b = _make_node(name='old_b', file_path='src/old_b.py')
+        backend.add_nodes([node_a, node_b])
+
+        rel = GraphRelationship(
+            id=f'CALLS:{node_a.id}->{node_b.id}',
+            type=RelType.CALLS,
+            source=node_a.id,
+            target=node_b.id,
+            properties={'custom_marker': 'phase1'},
+        )
+        backend.add_relationships([rel])
+
+        graph = backend.load_graph()
+        loaded = next(
+            (
+                r
+                for r in graph.iter_relationships()
+                if r.source == node_a.id and r.target == node_b.id
+            ),
+            None,
+        )
+        assert loaded is not None
+        props = loaded.properties or {}
+        assert props.get('custom_marker') == 'phase1'
+
+        backend.close()

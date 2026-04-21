@@ -5,7 +5,18 @@ from unittest.mock import patch
 
 import pytest
 
-from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
+from axon.core.graph.model import (
+    GraphRelationship,
+    NodeLabel,
+    RelType,
+    generate_id,
+)
+from axon.core.ingestion.pipeline import (
+    PipelineResult,
+    reindex_files,
+    run_pipeline,
+)
+from axon.core.ingestion.walker import FileEntry
 from axon.core.storage.kuzu_backend import KuzuBackend
 
 
@@ -304,8 +315,110 @@ class TestRunPipelineEmbeddings:
         def callback(phase: str, pct: float) -> None:
             calls.append((phase, pct))
 
-        _, result = run_pipeline(rich_repo, storage=None, progress_callback=callback)
+        _, result = run_pipeline(
+            rich_repo, storage=None, progress_callback=callback
+        )
 
         phase_names = {name for name, _ in calls}
-        assert "Generating embeddings" not in phase_names
+        assert 'Generating embeddings' not in phase_names
         assert result.embeddings == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 - reindex_files preserves metadata_json
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def two_file_repo(tmp_path: Path) -> Path:
+    """Two-file repo: file_a.py calls file_b.py."""
+    src = tmp_path / 'src'
+    src.mkdir()
+
+    (src / 'file_a.py').write_text(
+        'from .file_b import target\n\ndef caller():\n    target()\n',
+        encoding='utf-8',
+    )
+    (src / 'file_b.py').write_text(
+        'def target():\n    pass\n', encoding='utf-8'
+    )
+    return tmp_path
+
+
+@pytest.fixture()
+def two_file_storage(tmp_path: Path) -> KuzuBackend:
+    """Initialised KuzuBackend for two_file_repo tests."""
+    db_path = tmp_path / 'two_file_db'
+    backend = KuzuBackend()
+    backend.initialize(db_path)
+    yield backend
+    backend.close()
+
+
+class TestReindexFilesPreservesMetadataJson:
+    """T5 - reindex_files does not drop metadata_json on cross-file edges."""
+
+    def test_metadata_json_survives_reindex(
+        self, two_file_repo: Path, two_file_storage: KuzuBackend
+    ) -> None:
+        """Cross-file edge extra props survive a reindex of the target file.
+
+        Bulk-loads a graph with an A->B edge carrying dispatch_kind and
+        confidence. Re-indexes file B (simulating a content change). After
+        reindex, the A->B edge must still carry the original extra props,
+        because reindex_files saves inbound cross-file edges via
+        get_inbound_cross_file_edges before clearing the changed file, and
+        A->B is inbound to B with source A not in the changed set.
+        """
+        run_pipeline(two_file_repo, two_file_storage, embeddings=False)
+
+        # Locate the caller (in src/file_a.py) and target (in src/file_b.py).
+        caller_id = generate_id(NodeLabel.FUNCTION, 'src/file_a.py', 'caller')
+        target_id = generate_id(NodeLabel.FUNCTION, 'src/file_b.py', 'target')
+
+        assert two_file_storage.get_node(caller_id) is not None
+        assert two_file_storage.get_node(target_id) is not None
+
+        # Replace the pipeline-generated edge with one carrying extra metadata.
+        two_file_storage.execute_raw('MATCH ()-[r:CodeRelation]->() DELETE r')
+        meta_rel = GraphRelationship(
+            id=f'CALLS:{caller_id}->{target_id}',
+            type=RelType.CALLS,
+            source=caller_id,
+            target=target_id,
+            properties={'dispatch_kind': 'test_marker', 'confidence': 0.75},
+        )
+        two_file_storage.add_relationships([meta_rel])
+
+        # Modify file_b.py (add a comment) and reindex it. The A->B edge is
+        # inbound to B, so get_inbound_cross_file_edges('src/file_b.py',
+        # exclude={'src/file_b.py'}) will find it (source A is not excluded)
+        # and preserve its metadata across the reindex.
+        new_content = '# updated\ndef target():\n    pass\n'
+        (two_file_repo / 'src' / 'file_b.py').write_text(
+            new_content, encoding='utf-8'
+        )
+        entry = FileEntry(
+            path='src/file_b.py', content=new_content, language='python'
+        )
+        reindex_files(
+            [entry], two_file_repo, two_file_storage, rebuild_fts=False
+        )
+
+        # The A->B edge with metadata must still be present.
+        edges = two_file_storage.get_inbound_cross_file_edges('src/file_b.py')
+        assert edges, 'No cross-file edges found after reindex'
+
+        meta_edge = next(
+            (
+                e
+                for e in edges
+                if e.source == caller_id and e.target == target_id
+            ),
+            None,
+        )
+        assert meta_edge is not None, (
+            'Cross-file edge from caller to target not found after reindex'
+        )
+        props = meta_edge.properties or {}
+        assert props.get('dispatch_kind') == 'test_marker'
