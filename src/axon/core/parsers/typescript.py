@@ -46,6 +46,27 @@ _BUILTIN_TYPES: frozenset[str] = frozenset(
     }
 )
 
+
+class _TsScopeStack:
+    """Mutable scope counters for the TypeScript/JS call-extraction walk.
+
+    Phase 4a tracks try and await scopes only for the TS parser.
+    Depth counters are used instead of booleans so nested scopes compose.
+    """
+
+    def __init__(self) -> None:
+        self.try_depth = 0
+        self.awaited_depth = 0
+
+    def snapshot_in_try(self) -> bool:
+        """Return True when inside at least one try body."""
+        return self.try_depth > 0
+
+    def snapshot_awaited(self) -> bool:
+        """Return True when inside at least one await expression."""
+        return self.awaited_depth > 0
+
+
 class TypeScriptParser(LanguageParser):
     """Parse TypeScript, TSX, or JavaScript files via tree-sitter.
 
@@ -68,20 +89,28 @@ class TypeScriptParser(LanguageParser):
         tree = self._parser.parse(content.encode("utf-8"))
 
         result = ParseResult()
-        self._walk(tree.root_node, content, result)
+        stack = _TsScopeStack()
+        self._walk(tree.root_node, content, result, stack=stack)
         return result
 
     def _walk(
-        self, node: Node, source: str, result: ParseResult, visited: set[int] | None = None
+        self,
+        node: Node,
+        source: str,
+        result: ParseResult,
+        visited: set[int] | None = None,
+        stack: _TsScopeStack | None = None,
     ) -> None:
         """Walk the tree recursively, dispatching on node type.
 
-        Uses a *visited* set (keyed by node ``id``) to avoid processing
-        the same subtree twice — e.g. class bodies that are walked by both
-        ``_extract_class`` and the generic child recursion.
+        Uses a *visited* set (keyed by node id) to avoid processing
+        the same subtree twice - e.g. class bodies that are walked by both
+        _extract_class and the generic child recursion.
         """
         if visited is None:
             visited = set()
+        if stack is None:
+            stack = _TsScopeStack()
 
         node_key = node.id
         if node_key in visited:
@@ -102,19 +131,34 @@ class TypeScriptParser(LanguageParser):
             self._extract_interface(node, source, result)
         elif ntype == "type_alias_declaration":
             self._extract_type_alias(node, source, result)
-        elif ntype == "import_statement":
+        elif ntype == 'import_statement':
             self._extract_import(node, source, result)
-        elif ntype == "call_expression":
-            self._extract_call(node, source, result)
-        elif ntype == "new_expression":
+        elif ntype == 'call_expression':
+            self._extract_call(node, source, result, stack=stack)
+        elif ntype == 'new_expression':
             self._extract_new_expression(node, source, result)
-        elif ntype == "expression_statement":
+        elif ntype == 'expression_statement':
             self._maybe_extract_module_exports(node, source, result)
         elif ntype == "method_definition":
             self._extract_method(node, source, result)
 
+        # Scope bookkeeping for try_statement and await_expression.
+        if ntype == 'try_statement':
+            stack.try_depth += 1
+            for child in node.children:
+                self._walk(child, source, result, visited, stack)
+            stack.try_depth -= 1
+            return
+
+        if ntype == 'await_expression':
+            stack.awaited_depth += 1
+            for child in node.children:
+                self._walk(child, source, result, visited, stack)
+            stack.awaited_depth -= 1
+            return
+
         for child in node.children:
-            self._walk(child, source, result, visited)
+            self._walk(child, source, result, visited, stack)
 
     def _extract_export(
         self, node: Node, source: str, result: ParseResult
@@ -392,7 +436,9 @@ class TypeScriptParser(LanguageParser):
                     elif sub.type == "generic_type":
                         name_node = sub.child_by_field_name("name")
                         if name_node is not None:
-                            result.heritage.append((class_name, "implements", name_node.text.decode()))
+                            result.heritage.append(
+                                (class_name, "implements", name_node.text.decode())
+                            )
 
     def _extract_interface(self, node: Node, source: str, result: ParseResult) -> None:
         name_node = node.child_by_field_name("name")
@@ -494,32 +540,50 @@ class TypeScriptParser(LanguageParser):
             )
         )
 
-    def _extract_call(self, node: Node, source: str, result: ParseResult) -> None:
-        func_node = node.child_by_field_name("function")
+    def _extract_call(
+        self,
+        node: Node,
+        source: str,
+        result: ParseResult,
+        stack: _TsScopeStack | None = None,
+    ) -> None:
+        func_node = node.child_by_field_name('function')
         if func_node is None:
             return
 
         line = node.start_point[0] + 1
         arguments = self._extract_identifier_arguments(node)
+        in_try = stack.snapshot_in_try() if stack is not None else False
+        awaited = stack.snapshot_awaited() if stack is not None else False
 
-        if func_node.type == "member_expression":
-            obj_node = func_node.child_by_field_name("object")
-            prop_node = func_node.child_by_field_name("property")
+        if func_node.type == 'member_expression':
+            obj_node = func_node.child_by_field_name('object')
+            prop_node = func_node.child_by_field_name('property')
             if prop_node is not None:
-                receiver = obj_node.text.decode() if obj_node else ""
+                receiver = obj_node.text.decode() if obj_node else ''
                 result.calls.append(
                     CallInfo(
                         name=prop_node.text.decode(),
                         line=line,
                         receiver=receiver,
                         arguments=arguments,
+                        in_try=in_try,
+                        awaited=awaited,
                     )
                 )
         elif func_node.type == "identifier":
             name = func_node.text.decode()
             # Skip require() since it's handled as an import.
-            if name != "require":
-                result.calls.append(CallInfo(name=name, line=line, arguments=arguments))
+            if name != 'require':
+                result.calls.append(
+                    CallInfo(
+                        name=name,
+                        line=line,
+                        arguments=arguments,
+                        in_try=in_try,
+                        awaited=awaited,
+                    )
+                )
 
     def _extract_new_expression(
         self, node: Node, source: str, result: ParseResult

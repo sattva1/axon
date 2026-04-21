@@ -6,6 +6,8 @@ and inheritance relationships from Python source code.
 
 from __future__ import annotations
 
+from typing import Any
+
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
@@ -22,23 +24,205 @@ PY_LANGUAGE = Language(tspython.language())
 
 _BUILTIN_TYPES: frozenset[str] = frozenset(
     {
-        "str",
-        "int",
-        "float",
-        "bool",
-        "None",
-        "list",
-        "dict",
-        "set",
-        "tuple",
-        "Any",
-        "Optional",
-        "bytes",
-        "complex",
-        "object",
-        "type",
+        'str',
+        'int',
+        'float',
+        'bool',
+        'None',
+        'list',
+        'dict',
+        'set',
+        'tuple',
+        'Any',
+        'Optional',
+        'bytes',
+        'complex',
+        'object',
+        'type',
+    }
+
+)
+
+
+class _ScopeStack:
+    """Mutable scope counters threaded through the call-extraction walk.
+
+    A fresh instance is constructed per PythonParser.parse() call, so
+    state never crosses thread boundaries (parser instances are shared via
+    _PARSER_CACHE for the parallel ingestion path).
+
+    Depth counters are used instead of booleans so nested scopes compose
+    correctly. context_managers is a stack: outermost with-item first.
+    """
+
+    def __init__(self) -> None:
+        self.try_depth = 0
+        self.except_depth = 0
+        self.finally_depth = 0
+        self.loop_depth = 0
+        self.awaited_depth = 0
+        self.context_managers: list[str] = []
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a point-in-time snapshot of the current scope state."""
+        return {
+            'in_try': self.try_depth > 0,
+            'in_except': self.except_depth > 0,
+            'in_finally': self.finally_depth > 0,
+            'in_loop': self.loop_depth > 0,
+            'awaited': self.awaited_depth > 0,
+            'context_managers': tuple(self.context_managers),
+        }
+
+
+_DEFAULT_SCOPE_SNAPSHOT: dict[str, Any] = {
+    'in_try': False,
+    'in_except': False,
+    'in_finally': False,
+    'in_loop': False,
+    'awaited': False,
+    'context_managers': (),
+}
+
+
+def _classify_return_consumption(call_node: Node) -> str:
+    """Classify how a call's return value is used by walking up the parent.
+
+    Possible values:
+    - "awaited"          -- direct parent is await.
+    - "passed_through"   -- direct parent is return_statement.
+    - "stored"           -- direct parent is assignment (LHS takes value)
+                            or used as argument to a containing call
+                            (argument-position).
+    - "ignored"          -- the call stands alone as an expression statement.
+
+    Note: argument-position is classified as "stored" in Phase 4a; a
+    dedicated "argument" value may be added in a later phase.
+    """
+    parent = call_node.parent
+    if parent is None:
+        return 'stored'
+    if parent.type == 'await':
+        return 'awaited'
+    if parent.type == 'return_statement':
+        return 'passed_through'
+    if parent.type == 'expression_statement':
+        return 'ignored'
+    if parent.type == 'assignment':
+        return 'stored'
+    # argument_list (func(call())) or any other compound expression.
+    return 'stored'
+
+
+# Closed set of dispatch kinds recognised in Phase 4a:
+#   - "direct"            -- synchronous call (default).
+#   - "detached_task"     -- fire-and-forget asyncio task or callback.
+#   - "thread_executor"   -- submitted to a thread-pool executor.
+#   - "process_executor"  -- submitted to a process-pool executor.
+#   - "enqueued_job"      -- celery .apply_async / .delay on a task.
+#   - "callback_registry" -- reserved; NOT detected in Phase 4a.
+#
+# New patterns should be added here. The Celery path reads result.symbols,
+# which requires the two-pass invariant in PythonParser.parse(): _walk
+# runs before _extract_calls_recursive.
+
+_CELERY_DECORATORS: frozenset[str] = frozenset(
+    {
+        'shared_task',
+        'task',
+        'celery.task',
+        'celery.shared_task',
+        'app.task',
+        'app.shared_task',
     }
 )
+
+
+def _classify_dispatch_kind(call_node: Node, result: ParseResult) -> str:
+    """Classify the dispatch kind of a call node.
+
+    Returns one of the closed set documented above.
+    """
+    func = call_node.child_by_field_name('function')
+    if func is None:
+        return 'direct'
+
+    if func.type == 'attribute':
+        obj_node = func.children[0] if func.children else None
+        method = ''
+        for ch in reversed(func.children):
+            if ch.type == 'identifier':
+                method = ch.text.decode('utf8')
+                break
+        receiver_root = ''
+        if obj_node is not None:
+            if obj_node.type == 'identifier':
+                receiver_root = obj_node.text.decode('utf8')
+            elif obj_node.type == 'attribute':
+                cur = obj_node
+                while cur is not None and cur.type == 'attribute':
+                    cur = cur.children[0] if cur.children else None
+                if cur is not None and cur.type == 'identifier':
+                    receiver_root = cur.text.decode('utf8')
+
+        if receiver_root == 'asyncio' and method in {
+            'create_task',
+            'ensure_future',
+        }:
+            return 'detached_task'
+
+        if method == 'create_task':
+            return 'detached_task'
+
+        if method in {'call_soon', 'call_later', 'call_soon_threadsafe'}:
+            return 'detached_task'
+
+        if method == 'run_in_executor':
+            args_node = call_node.child_by_field_name('arguments')
+            first_arg_is_none = False
+            if args_node is not None:
+                for ch in args_node.children:
+                    if ch.is_named and ch.type not in {'keyword_argument'}:
+                        first_arg_is_none = ch.type == 'none' or (
+                            ch.type == 'identifier'
+                            and ch.text.decode('utf8') == 'None'
+                        )
+                        break
+            return 'detached_task' if first_arg_is_none else 'thread_executor'
+
+        if method == 'submit' and receiver_root:
+            name = receiver_root
+            if 'Process' in name or 'process' in name:
+                return 'process_executor'
+            if (
+                'Thread' in name
+                or 'thread' in name
+                or name.endswith('Executor')
+            ):
+                return 'thread_executor'
+
+        if method in {'apply_async', 'delay'} and receiver_root:
+            for sym in result.symbols:
+                if sym.name != receiver_root:
+                    continue
+                if any(dec in _CELERY_DECORATORS for dec in sym.decorators):
+                    return 'enqueued_job'
+                if any(
+                    dec.split('.')[-1] in {'task', 'shared_task'}
+                    and dec.split('.')[0] in {'celery', 'app'}
+                    for dec in sym.decorators
+                ):
+                    return 'enqueued_job'
+
+    if func.type == 'identifier':
+        name = func.text.decode('utf8')
+        if name in {'create_task', 'ensure_future'}:
+            # These bare names are flagged unconditionally; cross-checking
+            # imports requires more than a single pass.
+            return 'detached_task'
+
+    return 'direct'
+
 
 class PythonParser(LanguageParser):
     """Parses Python source code using tree-sitter."""
@@ -51,9 +235,12 @@ class PythonParser(LanguageParser):
         tree = self._parser.parse(bytes(content, "utf8"))
         result = ParseResult()
         root = tree.root_node
-        self._walk(root, content, result, class_name="")
-        # Extract module-level calls (e.g. ``setup()`` at the top of a script).
-        self._extract_calls_recursive(root, result)
+        # Two-pass invariant: _walk must populate result.symbols before
+        # _extract_calls_recursive runs, because _classify_dispatch_kind
+        # reads result.symbols to detect Celery-decorated tasks.
+        self._walk(root, content, result, class_name='')
+        stack = _ScopeStack()
+        self._extract_calls_recursive(root, result, stack)
         return result
 
     def _walk(
@@ -419,81 +606,204 @@ class PythonParser(LanguageParser):
                 if text:
                     result.exports.append(text)
 
-    def _extract_calls_recursive(self, node: Node, result: ParseResult) -> None:
-        """Recursively find and extract all call nodes and exception references."""
-        if node.type == "call":
-            self._extract_call(node, result)
+    def _extract_calls_recursive(
+        self, node: Node, result: ParseResult, stack: _ScopeStack
+    ) -> None:
+        """Recursively find and extract all call nodes and exception refs."""
+        t = node.type
+        if t == 'call':
+            self._extract_call(node, result, stack)
             for child in node.children:
-                self._extract_calls_recursive(child, result)
+                self._extract_calls_recursive(child, result, stack)
             return
 
-        # except SomeError: — reference to the exception class.
-        if node.type == "except_clause":
-            for child in node.children:
-                if child.type == "identifier":
-                    result.calls.append(
-                        CallInfo(
-                            name=child.text.decode("utf8"),
-                            line=child.start_point[0] + 1,
-                        )
-                    )
-                elif child.type == "tuple":
-                    # except (ErrorA, ErrorB): — extract each exception type.
-                    for elem in child.children:
-                        if elem.type == "identifier":
-                            result.calls.append(
-                                CallInfo(
-                                    name=elem.text.decode("utf8"),
-                                    line=elem.start_point[0] + 1,
-                                )
-                            )
-                elif child.type == "as_pattern":
-                    # except ErrorA as e  OR  except (ErrorA, ErrorB) as e
-                    for sub in child.children:
-                        if sub.type == "identifier":
-                            result.calls.append(
-                                CallInfo(
-                                    name=sub.text.decode("utf8"),
-                                    line=sub.start_point[0] + 1,
-                                )
-                            )
-                            break
-                        if sub.type == "tuple":
-                            for elem in sub.children:
-                                if elem.type == "identifier":
-                                    result.calls.append(
-                                        CallInfo(
-                                            name=elem.text.decode("utf8"),
-                                            line=elem.start_point[0] + 1,
-                                        )
-                                    )
-                            break
-            for child in node.children:
-                self._extract_calls_recursive(child, result)
-            return  # prevent fall-through to generic child recursion
+        if t == 'try_statement':
+            self._walk_try_statement(node, result, stack)
+            return
 
-        # raise SomeError (without parens) — reference to the exception class.
-        if node.type == "raise_statement":
+        if t in {'with_statement', 'async_with_statement'}:
+            cm_strings = self._extract_context_manager_strings(node)
+            stack.context_managers.extend(cm_strings)
+            try:
+                for child in node.children:
+                    self._extract_calls_recursive(child, result, stack)
+            finally:
+                for _ in cm_strings:
+                    stack.context_managers.pop()
+            return
+
+        if t in {'for_statement', 'while_statement'}:
+            stack.loop_depth += 1
+            try:
+                for child in node.children:
+                    self._extract_calls_recursive(child, result, stack)
+            finally:
+                stack.loop_depth -= 1
+            return
+
+        if t == 'await':
+            stack.awaited_depth += 1
+            try:
+                for child in node.children:
+                    self._extract_calls_recursive(child, result, stack)
+            finally:
+                stack.awaited_depth -= 1
+            return
+
+        # raise SomeError (without parens) - reference to the exception class.
+        if t == 'raise_statement':
             for child in node.children:
-                if child.type == "identifier":
+                if child.type == 'identifier':
                     result.calls.append(
-                        CallInfo(
-                            name=child.text.decode("utf8"),
+                        self._make_type_reference_callinfo(
+                            name=child.text.decode('utf8'),
                             line=child.start_point[0] + 1,
                         )
                     )
             for child in node.children:
-                self._extract_calls_recursive(child, result)
-            return  # prevent fall-through to generic child recursion
+                self._extract_calls_recursive(child, result, stack)
+            return
 
+        # Default: recurse. No special handling for if_statement,
+        # match_statement - branch constructs with no CallInfo field.
         for child in node.children:
-            self._extract_calls_recursive(child, result)
+            self._extract_calls_recursive(child, result, stack)
 
-    def _extract_call(self, call_node: Node, result: ParseResult) -> None:
+    def _walk_try_statement(
+        self, node: Node, result: ParseResult, stack: _ScopeStack
+    ) -> None:
+        """Walk a try_statement's children with correct scope bookkeeping.
+
+        Children layout (tree-sitter-python):
+          - "try" keyword, ":"
+          - "block"          -- the try body
+          - "except_clause"* -- zero or more
+          - "else_clause"?   -- optional
+          - "finally_clause"? -- optional
+
+        Each arm is walked with the appropriate depth counter incremented.
+        Nesting composes correctly because counters are incremented, not set.
+        """
+        for child in node.children:
+            if child.type == 'block':
+                stack.try_depth += 1
+                try:
+                    self._extract_calls_recursive(child, result, stack)
+                finally:
+                    stack.try_depth -= 1
+            elif child.type == 'except_clause':
+                # Emit exception-type identifier pseudo-CallInfos with zeroed
+                # scope fields (these are type references, not call-sites).
+                self._extract_except_type_references(child, result)
+                stack.except_depth += 1
+                try:
+                    for sub in child.children:
+                        if sub.type in {'identifier', 'tuple', 'as_pattern'}:
+                            continue
+                        self._extract_calls_recursive(sub, result, stack)
+                finally:
+                    stack.except_depth -= 1
+            elif child.type == 'finally_clause':
+                stack.finally_depth += 1
+                try:
+                    self._extract_calls_recursive(child, result, stack)
+                finally:
+                    stack.finally_depth -= 1
+            elif child.type == 'else_clause':
+                # else runs only if no exception; treat as outside try scope.
+                self._extract_calls_recursive(child, result, stack)
+
+    def _extract_except_type_references(
+        self, except_clause_node: Node, result: ParseResult
+    ) -> None:
+        """Emit exception type identifier CallInfos with zeroed scope fields."""
+        for child in except_clause_node.children:
+            if child.type == 'identifier':
+                result.calls.append(
+                    self._make_type_reference_callinfo(
+                        name=child.text.decode('utf8'),
+                        line=child.start_point[0] + 1,
+                    )
+                )
+            elif child.type == 'tuple':
+                # except (ErrorA, ErrorB):
+                for elem in child.children:
+                    if elem.type == 'identifier':
+                        result.calls.append(
+                            self._make_type_reference_callinfo(
+                                name=elem.text.decode('utf8'),
+                                line=elem.start_point[0] + 1,
+                            )
+                        )
+            elif child.type == 'as_pattern':
+                # except ErrorA as e  OR  except (ErrorA, ErrorB) as e
+                for sub in child.children:
+                    if sub.type == 'identifier':
+                        result.calls.append(
+                            self._make_type_reference_callinfo(
+                                name=sub.text.decode('utf8'),
+                                line=sub.start_point[0] + 1,
+                            )
+                        )
+                        break
+                    if sub.type == 'tuple':
+                        for elem in sub.children:
+                            if elem.type == 'identifier':
+                                result.calls.append(
+                                    self._make_type_reference_callinfo(
+                                        name=elem.text.decode('utf8'),
+                                        line=elem.start_point[0] + 1,
+                                    )
+                                )
+                        break
+
+    @staticmethod
+    def _make_type_reference_callinfo(name: str, line: int) -> CallInfo:
+        """Return a CallInfo for a type reference with zeroed scope fields."""
+        return CallInfo(
+            name=name,
+            line=line,
+            dispatch_kind='direct',
+            in_try=_DEFAULT_SCOPE_SNAPSHOT['in_try'],
+            in_except=_DEFAULT_SCOPE_SNAPSHOT['in_except'],
+            in_finally=_DEFAULT_SCOPE_SNAPSHOT['in_finally'],
+            in_loop=_DEFAULT_SCOPE_SNAPSHOT['in_loop'],
+            awaited=_DEFAULT_SCOPE_SNAPSHOT['awaited'],
+            context_managers=_DEFAULT_SCOPE_SNAPSHOT['context_managers'],
+            return_consumption='stored',
+        )
+
+    def _extract_context_manager_strings(self, with_node: Node) -> list[str]:
+        """Return managed-expression text of each with-item, outer-to-inner.
+
+        Truncates each expression at 80 chars. Skips the as alias target.
+        """
+        out: list[str] = []
+        for child in with_node.children:
+            if child.type != 'with_clause':
+                continue
+            for item in child.children:
+                if item.type != 'with_item':
+                    continue
+                value_node = item.child_by_field_name('value')
+                if value_node is None:
+                    for ch in item.children:
+                        if ch.is_named:
+                            value_node = ch
+                            break
+                if value_node is not None:
+                    text = value_node.text.decode('utf8')
+                    if len(text) > 80:
+                        text = text[:80]
+                    out.append(text)
+        return out
+
+    def _extract_call(
+        self, call_node: Node, result: ParseResult, stack: _ScopeStack
+    ) -> None:
         """Extract a single call node into a CallInfo."""
-        func_node = call_node.child_by_field_name("function")
+        func_node = call_node.child_by_field_name('function')
         if func_node is None:
-            # Fallback: first named child is the function.
             for child in call_node.children:
                 if child.is_named:
                     func_node = child
@@ -503,16 +813,27 @@ class PythonParser(LanguageParser):
 
         line = call_node.start_point[0] + 1
         arguments = self._extract_identifier_arguments(call_node)
+        snap = stack.snapshot()
+        dispatch_kind = _classify_dispatch_kind(call_node, result)
+        return_consumption = _classify_return_consumption(call_node)
 
-        if func_node.type == "identifier":
+        if func_node.type == 'identifier':
             result.calls.append(
                 CallInfo(
-                    name=func_node.text.decode("utf8"),
+                    name=func_node.text.decode('utf8'),
                     line=line,
                     arguments=arguments,
+                    dispatch_kind=dispatch_kind,
+                    in_try=snap['in_try'],
+                    in_except=snap['in_except'],
+                    in_finally=snap['in_finally'],
+                    in_loop=snap['in_loop'],
+                    awaited=snap['awaited'],
+                    context_managers=snap['context_managers'],
+                    return_consumption=return_consumption,
                 )
             )
-        elif func_node.type == "attribute":
+        elif func_node.type == 'attribute':
             name, receiver = self._extract_attribute_call(func_node)
             result.calls.append(
                 CallInfo(
@@ -520,6 +841,14 @@ class PythonParser(LanguageParser):
                     line=line,
                     receiver=receiver,
                     arguments=arguments,
+                    dispatch_kind=dispatch_kind,
+                    in_try=snap['in_try'],
+                    in_except=snap['in_except'],
+                    in_finally=snap['in_finally'],
+                    in_loop=snap['in_loop'],
+                    awaited=snap['awaited'],
+                    context_managers=snap['context_managers'],
+                    return_consumption=return_consumption,
                 )
             )
 

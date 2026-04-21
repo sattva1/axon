@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import (
@@ -84,6 +85,7 @@ _CALL_BLOCKLIST: frozenset[str] = frozenset({
     "useDebugValue", "useId", "useTransition", "useDeferredValue",
 })
 
+
 def resolve_call(
     call: CallInfo,
     file_path: str,
@@ -139,7 +141,9 @@ def resolve_call(
         if node is not None and node.file_path == file_path:
             return nid, 1.0
 
-    effective_cache = import_cache if import_cache is not None else _build_import_cache(file_path, graph)
+    effective_cache = (
+        import_cache if import_cache is not None else _build_import_cache(file_path, graph)
+    )
     imported_target = _resolve_via_imports(name, candidate_ids, graph, effective_cache)
     if imported_target is not None:
         return imported_target, 1.0
@@ -147,6 +151,7 @@ def resolve_call(
     if len(candidate_ids) > 5:
         return None, 0.0
     return _pick_closest(candidate_ids, graph, caller_file_path=file_path), 0.5
+
 
 def _resolve_self_method(
     method_name: str,
@@ -273,6 +278,7 @@ def _make_edge(
     target_id: str,
     confidence: float,
     seen: set[str],
+    extra: dict[str, Any] | None = None,
 ) -> ResolvedEdge | None:
     """Create a deduplicated ResolvedEdge, returning None if already seen."""
     rel_id = f"calls:{source_id}->{target_id}"
@@ -284,7 +290,7 @@ def _make_edge(
         rel_type=RelType.CALLS,
         source=source_id,
         target=target_id,
-        properties={"confidence": confidence},
+        properties={'confidence': confidence, **(extra or {})},
     )
 
 
@@ -375,7 +381,13 @@ def resolve_file_calls(
             import_cache=import_cache,
         )
         if target_id is not None:
-            edge = _make_edge(source_id, target_id, confidence, seen)
+            edge = _make_edge(
+                source_id,
+                target_id,
+                confidence,
+                seen,
+                extra=call.extra_props(),
+            )
             if edge is not None:
                 edges.append(edge)
 
