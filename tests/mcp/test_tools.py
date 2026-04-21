@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -1272,3 +1273,138 @@ class TestInputCaps:
         result = handle_test_impact(mock_storage, diff=diff, symbols=None)
         assert '100,000' in result
         mock_storage.execute_raw.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Diff constant reused across repo_path integration tests.
+# ---------------------------------------------------------------------------
+_PY_DIFF = """\
+diff --git a/src/foo.py b/src/foo.py
+index 0000000..1111111 100644
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -2,1 +2,1 @@ def bar():
+-    \"\"\"Old docstring.\"\"\"
++    \"\"\"New docstring.\"\"\"
+"""
+
+
+class TestHandleTestImpactRepoPath:
+    """Integration tests: handle_test_impact with repo_path wiring."""
+
+    def test_no_repo_path_no_exception_no_warnings(self, mock_storage) -> None:
+        """Existing callers without repo_path still work; no Warnings section."""
+        mock_storage.execute_raw.return_value = [
+            ['function:src/auth.py:validate', 'validate', 10, 30]
+        ]
+        mock_storage.traverse_with_depth.return_value = []
+        result = handle_test_impact(mock_storage, diff=SAMPLE_DIFF)
+        assert 'Warnings:' not in result
+        assert 'Error' not in result
+
+    def test_docstring_only_hunk_is_filtered(
+        self, mock_storage, tmp_path: Path
+    ) -> None:
+        """Hunk covering only a Python docstring is listed under warnings.
+
+        A diff that touches only a docstring line should cause the file to
+        appear under 'Warnings: Ignored (docstring/comment-only changes):'.
+        """
+        src = tmp_path / 'src'
+        src.mkdir()
+        (src / 'foo.py').write_text(
+            'def bar():\n    """Old docstring."""\n    pass\n'
+        )
+        mock_storage.execute_raw.return_value = []
+        mock_storage.traverse_with_depth.return_value = []
+        # Diff changes line 2 (the docstring) of src/foo.py.
+        result = handle_test_impact(
+            mock_storage, diff=_PY_DIFF, repo_path=tmp_path
+        )
+        assert 'Ignored (docstring/comment-only changes):' in result
+        assert 'src/foo.py' in result
+
+    def test_executable_hunk_not_in_warnings(
+        self, mock_storage, tmp_path: Path
+    ) -> None:
+        """Hunk covering an executable line does not appear in the warnings."""
+        src = tmp_path / 'src'
+        src.mkdir()
+        (src / 'foo.py').write_text('def bar():\n    x = 1\n    return x\n')
+        executable_diff = """\
+diff --git a/src/foo.py b/src/foo.py
+index 0000000..1111111 100644
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -2,1 +2,1 @@ def bar():
+-    x = 1
++    x = 2
+"""
+        mock_storage.execute_raw.return_value = [
+            ['function:src/foo.py:bar', 'bar', 1, 3]
+        ]
+        mock_storage.traverse_with_depth.return_value = []
+        result = handle_test_impact(
+            mock_storage, diff=executable_diff, repo_path=tmp_path
+        )
+        assert 'Ignored (docstring/comment-only changes):' not in result
+
+    def test_testpaths_excludes_out_of_scope_test_file(
+        self, mock_storage, tmp_path: Path
+    ) -> None:
+        """Test caller outside testpaths appears in config-excluded warnings."""
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.pytest.ini_options]\ntestpaths = ["tests/integration"]\n'
+        )
+        # Changed symbol in src.
+        mock_storage.execute_raw.return_value = [
+            ['function:src/auth.py:validate', 'validate', 10, 30]
+        ]
+        # Caller in tests/unit (outside testpaths).
+        _unit_test = GraphNode(
+            id='function:tests/unit/test_x.py:test_validate',
+            label=NodeLabel.FUNCTION,
+            name='test_validate',
+            file_path='tests/unit/test_x.py',
+            start_line=5,
+            end_line=15,
+        )
+        mock_storage.traverse_with_depth.return_value = [(_unit_test, 1)]
+
+        result = handle_test_impact(
+            mock_storage, diff=SAMPLE_DIFF, repo_path=tmp_path
+        )
+        # Should NOT appear in affected tests.
+        assert (
+            'Affected tests' not in result
+            or 'tests/unit/test_x.py' not in result
+        )
+        # Should appear in excluded-by-config warnings.
+        assert 'Excluded by pytest config' in result
+        assert 'tests/unit/test_x.py' in result
+
+    def test_testpaths_keeps_in_scope_test_file(
+        self, mock_storage, tmp_path: Path
+    ) -> None:
+        """Test caller inside testpaths appears in affected tests, not warnings."""
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.pytest.ini_options]\ntestpaths = ["tests/integration"]\n'
+        )
+        mock_storage.execute_raw.return_value = [
+            ['function:src/auth.py:validate', 'validate', 10, 30]
+        ]
+        _integ_test = GraphNode(
+            id='function:tests/integration/test_y.py:test_validate',
+            label=NodeLabel.FUNCTION,
+            name='test_validate',
+            file_path='tests/integration/test_y.py',
+            start_line=5,
+            end_line=15,
+        )
+        mock_storage.traverse_with_depth.return_value = [(_integ_test, 1)]
+
+        result = handle_test_impact(
+            mock_storage, diff=SAMPLE_DIFF, repo_path=tmp_path
+        )
+        assert 'tests/integration/test_y.py' in result
+        assert 'Excluded by pytest config' not in result

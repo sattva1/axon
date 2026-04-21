@@ -62,6 +62,7 @@ class _ServerState:
     storage: KuzuBackend | None = None
     lock: asyncio.Lock | None = None
     db_path: Path | None = None
+    repo_path: Path | None = None
 
 
 _state = _ServerState()
@@ -73,9 +74,17 @@ def _resolve_db_path() -> Path:
     return _state.db_path
 
 
-def set_storage(storage: KuzuBackend) -> None:
-    """Inject a pre-initialised storage backend (e.g. from ``axon serve --watch``)."""
+def set_storage(storage: KuzuBackend, repo_path: Path | None = None) -> None:
+    """Inject a pre-initialised storage backend (e.g. from ``axon serve --watch``).
+
+    Args:
+        storage: Initialised storage backend to inject.
+        repo_path: Absolute path to the repository root. When provided,
+            freshness checks and hunk-executable filtering are enabled.
+            Existing callers that omit this argument keep working unchanged.
+    """
     _state.storage = storage
+    _state.repo_path = repo_path
 
 
 def set_lock(lock: asyncio.Lock) -> None:
@@ -422,33 +431,49 @@ async def list_tools() -> list[Tool]:
     return TOOLS
 
 
-def _dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
-    if name == "axon_list_repos":
+def _dispatch_tool(
+    name: str,
+    arguments: dict,
+    storage: KuzuBackend,
+    repo_path: Path | None = None,
+) -> str:
+    if name == 'axon_list_repos':
         return handle_list_repos()
-    elif name == "axon_query":
-        return handle_query(storage, arguments.get("query", ""), limit=arguments.get("limit", 20))
-    elif name == "axon_context":
-        return handle_context(storage, arguments.get("symbol", ""))
-    elif name == "axon_impact":
-        return handle_impact(storage, arguments.get("symbol", ""), depth=arguments.get("depth", 3))
-    elif name == "axon_dead_code":
-        return handle_dead_code(storage)
-    elif name == "axon_detect_changes":
-        return handle_detect_changes(storage, arguments.get("diff", ""))
-    elif name == "axon_cypher":
-        return handle_cypher(storage, arguments.get("query", ""))
-    elif name == "axon_coupling":
-        return handle_coupling(
-            storage, arguments.get("file_path", ""),
-            min_strength=arguments.get("min_strength", 0.3),
+    elif name == 'axon_query':
+        return handle_query(
+            storage,
+            arguments.get('query', ''),
+            limit=arguments.get('limit', 20),
         )
-    elif name == "axon_communities":
-        return handle_communities(storage, community=arguments.get("community"))
-    elif name == "axon_explain":
-        return handle_explain(storage, arguments.get("symbol", ""))
-    elif name == "axon_review_risk":
-        return handle_review_risk(storage, arguments.get("diff", ""))
-    elif name == "axon_call_path":
+    elif name == 'axon_context':
+        return handle_context(storage, arguments.get('symbol', ''))
+    elif name == 'axon_impact':
+        return handle_impact(
+            storage,
+            arguments.get('symbol', ''),
+            depth=arguments.get('depth', 3),
+        )
+    elif name == 'axon_dead_code':
+        return handle_dead_code(storage)
+    elif name == 'axon_detect_changes':
+        return handle_detect_changes(storage, arguments.get('diff', ''))
+    elif name == 'axon_cypher':
+        return handle_cypher(storage, arguments.get('query', ''))
+    elif name == 'axon_coupling':
+        return handle_coupling(
+            storage,
+            arguments.get('file_path', ''),
+            min_strength=arguments.get('min_strength', 0.3),
+        )
+    elif name == 'axon_communities':
+        return handle_communities(
+            storage, community=arguments.get('community')
+        )
+    elif name == 'axon_explain':
+        return handle_explain(storage, arguments.get('symbol', ''))
+    elif name == 'axon_review_risk':
+        return handle_review_risk(storage, arguments.get('diff', ''))
+    elif name == 'axon_call_path':
         return handle_call_path(
             storage,
             arguments.get("from_symbol", ""),
@@ -460,28 +485,28 @@ def _dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
     elif name == "axon_test_impact":
         return handle_test_impact(
             storage,
-            diff=arguments.get("diff", ""),
-            symbols=arguments.get("symbols"),
+            diff=arguments.get('diff', ''),
+            symbols=arguments.get('symbols'),
+            repo_path=repo_path,
         )
-    elif name == "axon_cycles":
-        return handle_cycles(
-            storage, min_size=arguments.get("min_size", 2),
-        )
+    elif name == 'axon_cycles':
+        return handle_cycles(storage, min_size=arguments.get('min_size', 2))
     else:
-        return f"Unknown tool: {name}"
+        return f'Unknown tool: {name}'
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Dispatch a tool call to the appropriate handler."""
+    repo_path = _state.repo_path
     try:
         if name == 'axon_cypher':
             result = await _with_readonly_storage(
-                lambda st: _dispatch_tool(name, arguments, st)
+                lambda st: _dispatch_tool(name, arguments, st, repo_path)
             )
         else:
             result = await _with_storage(
-                lambda st: _dispatch_tool(name, arguments, st)
+                lambda st: _dispatch_tool(name, arguments, st, repo_path)
             )
     except Exception:
         ref = _new_ref_id()

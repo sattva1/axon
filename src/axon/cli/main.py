@@ -528,7 +528,7 @@ def _run_shared_host(
         mcp_url=mcp_url,
         owns_storage=True,
     )
-    set_storage(storage)
+    set_storage(storage, repo_path)
     set_lock(lock)
 
     web_app = web_app_module.create_app(

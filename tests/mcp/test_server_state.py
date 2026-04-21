@@ -11,7 +11,7 @@ import asyncio
 import re
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -20,6 +20,7 @@ import axon.mcp.tools as tools_module
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.server import (
     _ServerState,
+    _dispatch_tool,
     _resolve_db_path,
     _with_storage,
     call_tool,
@@ -190,3 +191,76 @@ class TestCypherReadOnlyEnforcement:
         finally:
             check_storage.close()
             rw_storage.close()
+
+
+class TestDispatchToolSignature:
+    """Regression tests for _dispatch_tool signature and repo_path plumbing."""
+
+    def test_list_repos_works_without_repo_path(self, tmp_path: Path) -> None:
+        """axon_list_repos dispatches correctly with only the default repo_path."""
+        mock_storage = MagicMock()
+        result = _dispatch_tool('axon_list_repos', {}, mock_storage)
+        assert isinstance(result, str)
+
+    def test_test_impact_receives_repo_path(self) -> None:
+        """axon_test_impact passes repo_path through to handle_test_impact."""
+        mock_storage = MagicMock()
+        mock_storage.execute_raw.return_value = []
+        repo = Path('/tmp/repo')
+        captured: list[Path | None] = []
+
+        # Patch in server_module because that's where the name is bound after
+        # the 'from axon.mcp.tools import handle_test_impact' import.
+        with patch.object(
+            server_module,
+            'handle_test_impact',
+            side_effect=lambda *a, **kw: (
+                captured.append(kw.get('repo_path')) or 'ok'
+            ),
+        ):
+            _dispatch_tool(
+                'axon_test_impact',
+                {'diff': 'diff --git a/x.py b/x.py\n'},
+                mock_storage,
+                repo_path=repo,
+            )
+
+        assert captured == [repo]
+
+    def test_test_impact_default_repo_path_is_none(self) -> None:
+        """axon_test_impact passes repo_path=None when not supplied."""
+        mock_storage = MagicMock()
+        mock_storage.execute_raw.return_value = []
+        captured: list[Path | None] = []
+
+        with patch.object(
+            server_module,
+            'handle_test_impact',
+            side_effect=lambda *a, **kw: (
+                captured.append(kw.get('repo_path')) or 'ok'
+            ),
+        ):
+            _dispatch_tool(
+                'axon_test_impact',
+                {'diff': 'diff --git a/x.py b/x.py\n'},
+                mock_storage,
+            )
+
+        assert captured == [None]
+
+
+class TestSetStorageRepoPath:
+    """set_storage repo_path plumbing into _ServerState."""
+
+    def test_set_storage_without_repo_path_defaults_none(self) -> None:
+        """Calling set_storage without repo_path leaves _state.repo_path as None."""
+        mock_storage = MagicMock()
+        set_storage(mock_storage)
+        assert server_module._state.repo_path is None
+
+    def test_set_storage_with_repo_path_stores_it(self) -> None:
+        """Calling set_storage with repo_path stores it on _state."""
+        mock_storage = MagicMock()
+        repo = Path('/some/repo')
+        set_storage(mock_storage, repo)
+        assert server_module._state.repo_path == repo

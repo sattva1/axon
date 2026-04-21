@@ -18,7 +18,12 @@ from typing import Any
 from axon.core.cypher_guard import WRITE_KEYWORDS, sanitize_cypher
 from axon.core.embeddings.embedder import embed_query
 from axon.core.ingestion.community import export_to_igraph
-from axon.core.ingestion.dead_code import _is_test_file
+from axon.core.ingestion.parser_phase import get_parser
+from axon.core.ingestion.test_classifier import (
+    PytestConfig,
+    is_test_file,
+    load_pytest_config,
+)
 from axon.core.search.hybrid import hybrid_search
 from axon.core.storage.base import StorageBackend
 from axon.core.storage.kuzu_backend import escape_cypher as _escape_cypher
@@ -1150,13 +1155,243 @@ def handle_cycles(storage: StorageBackend, min_size: int = 2) -> str:
     return "\n".join(lines)
 
 
+def _build_warnings(
+    non_executable_files: list[str], config_excluded_test_files: list[str]
+) -> str:
+    """Build the optional Warnings section for test impact output.
+
+    Returns an empty string when both lists are empty so the caller can
+    skip the section entirely (keeping existing output identical).
+
+    Args:
+        non_executable_files: Files skipped because all hunks are
+            comments or docstrings.
+        config_excluded_test_files: Test files excluded by pytest config
+            (testpaths, norecursedirs, or collect_ignore).
+
+    Returns:
+        Formatted warnings block, or empty string.
+    """
+    if not non_executable_files and not config_excluded_test_files:
+        return ''
+
+    parts: list[str] = ['Warnings:']
+
+    if non_executable_files:
+        parts.append('  Ignored (docstring/comment-only changes):')
+        for f in sorted(set(non_executable_files)):
+            parts.append(f'    - {f}')
+
+    if config_excluded_test_files:
+        parts.append(
+            '  Excluded by pytest config (testpaths/norecursedirs/collect_ignore):'
+        )
+        for f in sorted(set(config_excluded_test_files)):
+            parts.append(f'    - {f}')
+
+    return '\n'.join(parts)
+
+
+_HUNK_EXECUTABLE_LANGUAGES: frozenset[str] = frozenset(
+    {'python', 'typescript', 'tsx', 'javascript'}
+)
+
+_EXT_TO_LANGUAGE: dict[str, str] = {
+    '.py': 'python',
+    '.ts': 'typescript',
+    '.tsx': 'tsx',
+    '.js': 'javascript',
+    '.jsx': 'javascript',
+}
+
+_STATEMENT_CONTAINERS: frozenset[str] = frozenset(
+    {
+        'module',
+        'block',
+        'function_definition',
+        'class_definition',
+        'method_definition',
+    }
+)
+
+
+def _is_non_executable_statement(node: Any) -> bool:
+    """Return True when *node* contains no executable code.
+
+    Handles:
+    - comment nodes (Python # comments, JS // and block comments).
+    - expression_statement whose sole child is a string node (docstring).
+
+    Args:
+        node: A tree-sitter Node.
+
+    Returns:
+        True when the node is entirely non-executable.
+    """
+    if node.type == 'comment':
+        return True
+    # Docstring pattern: expression_statement -> single string child.
+    if (
+        node.type == 'expression_statement'
+        and len(node.children) == 1
+        and node.children[0].type == 'string'
+    ):
+        return True
+    return False
+
+
+def _is_container_node(node: Any) -> bool:
+    """Return True when *node* is a structural container for other statements.
+
+    Container nodes are recursed into rather than collected as leaf statements.
+    A compound statement (e.g. if_statement) that contains a block child is
+    also treated as a container so the inner statements are inspected directly.
+
+    Args:
+        node: A tree-sitter Node.
+
+    Returns:
+        True when the node should be recursed into.
+    """
+    if node.type in _STATEMENT_CONTAINERS:
+        return True
+    # Compound statements that wrap a block (if, for, while, try, with, ...)
+    # should be transparent so inner leaf statements are collected directly.
+    return any(c.type == 'block' for c in node.children)
+
+
+def _collect_statement_nodes_for_row(
+    node: Any, row: int, result: list[Any]
+) -> None:
+    """Collect leaf statement-level nodes that overlap *row* into *result*.
+
+    Recurses through container nodes (module, block, function/class definitions,
+    compound statements) and collects the innermost statement-level or comment
+    node that covers the row.
+
+    Args:
+        node: Current tree-sitter Node being visited.
+        row: 0-indexed row number to match.
+        result: Accumulator list; matching nodes are appended here.
+    """
+    if node.start_point[0] > row or node.end_point[0] < row:
+        return
+    if node.type == 'comment':
+        result.append(node)
+        return
+    if _is_container_node(node):
+        for child in node.children:
+            _collect_statement_nodes_for_row(child, row, result)
+        return
+    # Leaf statement node (expression_statement, return_statement, etc.)
+    if node.type.endswith('_statement'):
+        result.append(node)
+        return
+    # Recurse into anything else that might contain statements.
+    for child in node.children:
+        _collect_statement_nodes_for_row(child, row, result)
+
+
+def _is_hunk_executable(
+    file_content: str, hunk_ranges: list[tuple[int, int]], language: str
+) -> bool:
+    """Return False when every changed line is a comment, docstring, or blank.
+
+    Uses tree-sitter to walk the AST and inspect node types. Hunk ranges
+    are 1-indexed (as in git diff output); they are converted to 0-indexed
+    row numbers internally.
+
+    Only ``python``, ``typescript``, ``tsx``, and ``javascript`` are
+    inspected. Any other language returns True (conservative - treat as
+    executable). On any parser error also returns True.
+
+    Args:
+        file_content: Full source code of the file.
+        hunk_ranges: List of (start_line, end_line) ranges, 1-indexed inclusive.
+        language: Source language identifier.
+
+    Returns:
+        True if any changed line contains executable code, False if every
+        changed line is a comment, docstring, or blank.
+    """
+    if language not in _HUNK_EXECUTABLE_LANGUAGES:
+        return True
+
+    if not hunk_ranges:
+        return False
+
+    try:
+        lang_parser = get_parser(language)
+    except (ValueError, KeyError):
+        return True
+
+    try:
+        # Access the underlying tree-sitter Parser stored as _parser.
+        ts_parser = lang_parser._parser  # type: ignore[attr-defined]
+        tree = ts_parser.parse(file_content.encode('utf-8'))
+    except Exception:
+        return True
+
+    lines = file_content.splitlines()
+
+    # Convert 1-indexed ranges to 0-indexed row sets.
+    changed_rows: set[int] = set()
+    for start, end in hunk_ranges:
+        for row in range(start - 1, end):
+            changed_rows.add(row)
+
+    for row in changed_rows:
+        # Blank lines are non-executable; skip them.
+        if row < len(lines) and not lines[row].strip():
+            continue
+
+        # Collect all statement-level nodes overlapping this row.
+        overlapping: list[Any] = []
+        _collect_statement_nodes_for_row(tree.root_node, row, overlapping)
+
+        # If no statement node covers the row, treat conservatively as
+        # executable (e.g. parser error recovery nodes).
+        if not overlapping:
+            return True
+
+        # Row is executable if any overlapping statement is executable.
+        if not all(_is_non_executable_statement(n) for n in overlapping):
+            return True
+
+    return False
+
+
 def handle_test_impact(
     storage: StorageBackend,
-    diff: str = "",
+    diff: str = '',
     symbols: list[str] | None = None,
+    repo_path: Path | None = None,
 ) -> str:
-    """Find tests likely affected by code changes."""
+    """Find tests likely affected by code changes.
+
+    When *repo_path* is provided, the function also:
+    - loads pytest config to narrow test-file classification,
+    - skips changed files whose hunks are entirely docstrings or comments.
+
+    When *repo_path* is None the function operates in config-unaware mode:
+    default heuristic only, no hunk-executable filtering.
+
+    Args:
+        storage: Storage backend for graph queries.
+        diff: Raw git diff output.
+        symbols: List of symbol names to check instead of a diff.
+        repo_path: Absolute path to the repository root, or None.
+
+    Returns:
+        Formatted impact report string.
+    """
     changed_symbol_ids: list[tuple[str, str]] = []
+    non_executable_files: list[str] = []
+
+    # Load pytest config when the repo path is known.
+    pytest_config: PytestConfig | None = None
+    if repo_path is not None:
+        pytest_config = load_pytest_config(repo_path)
 
     if diff and diff.strip():
         if len(diff) > MAX_DIFF_LENGTH:
@@ -1168,18 +1403,42 @@ def handle_test_impact(
         for file_path, ranges in changed_files.items():
             if not _SAFE_PATH.match(file_path):
                 continue
+
+            # Skip files whose hunks are entirely non-executable.
+            if repo_path is not None:
+                ext = Path(file_path).suffix.lower()
+                language = _EXT_TO_LANGUAGE.get(ext, '')
+                if language in _HUNK_EXECUTABLE_LANGUAGES:
+                    abs_path = repo_path / file_path
+                    try:
+                        file_content = abs_path.read_text(encoding='utf-8')
+                    except OSError:
+                        file_content = None
+
+                    if file_content is not None and not _is_hunk_executable(
+                        file_content, ranges, language
+                    ):
+                        non_executable_files.append(file_path)
+                        continue
+
             escaped = _escape_cypher(file_path)
-            rows = storage.execute_raw(
-                f"MATCH (n) WHERE n.file_path = '{escaped}' "
-                f"AND n.start_line > 0 "
-                f"RETURN n.id, n.name, n.start_line, n.end_line"
-            ) or []
+            rows = (
+                storage.execute_raw(
+                    f"MATCH (n) WHERE n.file_path = '{escaped}' "
+                    f'AND n.start_line > 0 '
+                    f'RETURN n.id, n.name, n.start_line, n.end_line'
+                )
+                or []
+            )
             for row in rows:
-                node_id = row[0] or ""
-                name = row[1] or ""
+                node_id = row[0] or ''
+                name = row[1] or ''
                 start_line = row[2] or 0
                 end_line = row[3] or 0
-                hit = any(start_line <= end and end_line >= start for start, end in ranges)
+                hit = any(
+                    start_line <= end and end_line >= start
+                    for start, end in ranges
+                )
                 if hit:
                     changed_symbol_ids.append((node_id, name))
 
@@ -1195,27 +1454,51 @@ def handle_test_impact(
         return "Error: provide either 'diff' or 'symbols' parameter."
 
     if not changed_symbol_ids:
-        return "No changed symbols found."
+        if non_executable_files:
+            warning_lines = [
+                'No changed symbols found.',
+                '',
+                'Warnings:',
+                '  Ignored (docstring/comment-only changes):',
+            ]
+            for f in sorted(non_executable_files):
+                warning_lines.append(f'    - {f}')
+            return '\n'.join(warning_lines)
+        return 'No changed symbols found.'
 
     test_hits: dict[str, list[tuple[str, str, int]]] = {}
+    config_excluded_test_files: list[str] = []
 
     for sym_id, sym_name in changed_symbol_ids:
-        for caller, depth in storage.traverse_with_depth(sym_id, 4, direction="callers"):
-            if _is_test_file(caller.file_path):
+        for caller, depth in storage.traverse_with_depth(
+            sym_id, 4, direction='callers'
+        ):
+            if is_test_file(caller.file_path, pytest_config):
                 test_hits.setdefault(caller.file_path, []).append(
                     (caller.name, sym_name, depth)
                 )
+            elif pytest_config is not None and is_test_file(
+                caller.file_path, None
+            ):
+                # Default heuristic says test, but config excludes it.
+                config_excluded_test_files.append(caller.file_path)
 
     if not test_hits:
-        return (
-            f"No test files found in the call graph of {len(changed_symbol_ids)} "
-            f"changed symbol(s). Tests may not directly call these symbols."
+        msg = (
+            f'No test files found in the call graph of {len(changed_symbol_ids)} '
+            f'changed symbol(s). Tests may not directly call these symbols.'
         )
+        warnings = _build_warnings(
+            non_executable_files, config_excluded_test_files
+        )
+        if warnings:
+            return msg + '\n\n' + warnings
+        return msg
 
-    lines = ["Test Impact Analysis"]
-    lines.append("=" * 48)
-    lines.append(f"Changed symbols: {len(changed_symbol_ids)}")
-    lines.append("")
+    lines = ['Test Impact Analysis']
+    lines.append('=' * 48)
+    lines.append(f'Changed symbols: {len(changed_symbol_ids)}')
+    lines.append('')
 
     direct_files: dict[str, list[tuple[str, str, int]]] = {}
     transitive_files: dict[str, list[tuple[str, str, int]]] = {}
@@ -1223,17 +1506,21 @@ def handle_test_impact(
     for test_file, hits in sorted(test_hits.items()):
         for test_name, source_sym, depth in hits:
             if depth <= 2:
-                direct_files.setdefault(test_file, []).append((test_name, source_sym, depth))
+                direct_files.setdefault(test_file, []).append(
+                    (test_name, source_sym, depth)
+                )
             else:
-                transitive_files.setdefault(test_file, []).append((test_name, source_sym, depth))
+                transitive_files.setdefault(test_file, []).append(
+                    (test_name, source_sym, depth)
+                )
 
     total_tests = sum(len(v) for v in test_hits.values())
 
     if direct_files:
-        lines.append(f"Affected tests ({total_tests}):")
+        lines.append(f'Affected tests ({total_tests}):')
         for test_file, hits in sorted(direct_files.items()):
-            lines.append(f"  {test_file}:")
-            seen = set()
+            lines.append(f'  {test_file}:')
+            seen: set[tuple[str, str]] = set()
             for test_name, source_sym, depth in hits:
                 key = (test_name, source_sym)
                 if key not in seen:
@@ -1250,6 +1537,15 @@ def handle_test_impact(
                 key = (test_name, source_sym)
                 if key not in seen:
                     seen.add(key)
-                    lines.append(f"    - {test_name} (transitive via: {source_sym})")
+                    lines.append(
+                        f'    - {test_name} (transitive via: {source_sym})'
+                    )
 
-    return "\n".join(lines)
+    warnings = _build_warnings(
+        non_executable_files, config_excluded_test_files
+    )
+    if warnings:
+        lines.append('')
+        lines.append(warnings)
+
+    return '\n'.join(lines)
