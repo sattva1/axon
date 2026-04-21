@@ -1408,3 +1408,79 @@ index 0000000..1111111 100644
         )
         assert 'tests/integration/test_y.py' in result
         assert 'Excluded by pytest config' not in result
+
+
+class TestDottedPathIntegration:
+    """Integration tests: dotted-path symbol names flow through tool handlers."""
+
+    def test_handle_context_dotted_path(self, mock_storage) -> None:
+        """handle_context resolves 'Foo.bar' via exact_name_search."""
+        method_result = SearchResult(
+            node_id='method:src/a.py:bar',
+            score=2.0,
+            node_name='bar',
+            file_path='src/a.py',
+            label='method',
+            snippet='def bar(self): ...',
+        )
+        mock_storage.exact_name_search.return_value = [method_result]
+        mock_storage.get_node.return_value = GraphNode(
+            id='method:src/a.py:bar',
+            label=NodeLabel.METHOD,
+            name='bar',
+            file_path='src/a.py',
+            start_line=5,
+            end_line=15,
+        )
+
+        result = handle_context(mock_storage, 'Foo.bar')
+
+        mock_storage.exact_name_search.assert_called_once_with(
+            'Foo.bar', limit=1
+        )
+        assert 'bar' in result
+        assert 'src/a.py' in result
+
+    def test_handle_call_path_dotted_from_symbol(self, mock_storage) -> None:
+        """handle_call_path resolves 'Foo.bar' as the from-symbol via exact_name_search."""
+        from_result = SearchResult(
+            node_id='method:src/a.py:bar',
+            score=2.0,
+            node_name='bar',
+            file_path='src/a.py',
+            label='method',
+        )
+        to_result = SearchResult(
+            node_id='function:src/b.py:baz',
+            score=2.0,
+            node_name='baz',
+            file_path='src/b.py',
+            label='function',
+        )
+        _from_node = GraphNode(
+            id='method:src/a.py:bar',
+            label=NodeLabel.METHOD,
+            name='bar',
+            file_path='src/a.py',
+            start_line=5,
+            end_line=15,
+        )
+        _to_node = GraphNode(
+            id='function:src/b.py:baz',
+            label=NodeLabel.FUNCTION,
+            name='baz',
+            file_path='src/b.py',
+            start_line=1,
+            end_line=10,
+        )
+        # exact_name_search resolves 'Foo.bar'; fts_search resolves 'baz'.
+        mock_storage.exact_name_search.return_value = [from_result]
+        mock_storage.fts_search.return_value = [to_result]
+        mock_storage.get_node.side_effect = [_from_node, _to_node]
+        mock_storage.get_callees.return_value = []
+
+        result = handle_call_path(mock_storage, 'Foo.bar', 'baz')
+
+        mock_storage.exact_name_search.assert_any_call('Foo.bar', limit=1)
+        # Path not found (no call edge) but resolution succeeded.
+        assert 'not found' in result.lower() or 'bar' in result

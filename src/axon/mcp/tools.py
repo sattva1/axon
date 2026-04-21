@@ -219,7 +219,12 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
 
     Args:
         storage: The storage backend.
-        symbol: The symbol name to look up.
+        symbol: Plain name (``foo``) or dotted path (``Class.method``).
+            Multi-dot paths (e.g. ``module.Class.method``) fall back to
+            the last segment. When multiple symbols match (e.g., a class
+            named ``Foo`` exists in two different files), the best match
+            is chosen by score (source files over tests) then lexicographic
+            node ID.
 
     Returns:
         Formatted view including callers, callees, type refs, and guidance.
@@ -320,7 +325,12 @@ def handle_impact(storage: StorageBackend, symbol: str, depth: int = 3) -> str:
 
     Args:
         storage: The storage backend.
-        symbol: The symbol name to analyse.
+        symbol: Plain name (``foo``) or dotted path (``Class.method``).
+            Multi-dot paths (e.g. ``module.Class.method``) fall back to
+            the last segment. When multiple symbols match (e.g., a class
+            named ``Foo`` exists in two different files), the best match
+            is chosen by score (source files over tests) then lexicographic
+            node ID.
         depth: Maximum traversal depth (default 3).
 
     Returns:
@@ -600,11 +610,36 @@ def handle_coupling(
 
 
 def handle_call_path(
-    storage: StorageBackend, from_symbol: str, to_symbol: str, max_depth: int = 10
+    storage: StorageBackend,
+    from_symbol: str,
+    to_symbol: str,
+    max_depth: int = 10,
 ) -> str:
-    """Find the shortest call chain between two symbols via BFS."""
+    """Find the shortest call chain between two symbols via BFS.
+
+    Args:
+        storage: The storage backend.
+        from_symbol: Plain name (``foo``) or dotted path (``Class.method``).
+            Multi-dot paths (e.g. ``module.Class.method``) fall back to
+            the last segment. When multiple symbols match (e.g., a class
+            named ``Foo`` exists in two different files), the best match
+            is chosen by score (source files over tests) then lexicographic
+            node ID.
+        to_symbol: Plain name (``foo``) or dotted path (``Class.method``).
+            Multi-dot paths (e.g. ``module.Class.method``) fall back to
+            the last segment. When multiple symbols match (e.g., a class
+            named ``Foo`` exists in two different files), the best match
+            is chosen by score (source files over tests) then lexicographic
+            node ID.
+        max_depth: Maximum BFS depth (default 10).
+
+    Returns:
+        Formatted call chain or a message when no path exists.
+    """
     if not from_symbol or not from_symbol.strip():
-        return "Error: 'from_symbol' parameter is required and cannot be empty."
+        return (
+            "Error: 'from_symbol' parameter is required and cannot be empty."
+        )
     if not to_symbol or not to_symbol.strip():
         return "Error: 'to_symbol' parameter is required and cannot be empty."
 
@@ -769,7 +804,20 @@ def handle_communities(
 
 
 def handle_explain(storage: StorageBackend, symbol: str) -> str:
-    """Produce a narrative explanation of a symbol."""
+    """Produce a narrative explanation of a symbol.
+
+    Args:
+        storage: The storage backend.
+        symbol: Plain name (``foo``) or dotted path (``Class.method``).
+            Multi-dot paths (e.g. ``module.Class.method``) fall back to
+            the last segment. When multiple symbols match (e.g., a class
+            named ``Foo`` exists in two different files), the best match
+            is chosen by score (source files over tests) then lexicographic
+            node ID.
+
+    Returns:
+        Narrative explanation of the symbol's role and relationships.
+    """
     if not symbol or not symbol.strip():
         return "Error: 'symbol' parameter is required and cannot be empty."
 
@@ -1379,7 +1427,13 @@ def handle_test_impact(
     Args:
         storage: Storage backend for graph queries.
         diff: Raw git diff output.
-        symbols: List of symbol names to check instead of a diff.
+        symbols: List of symbol names to check instead of a diff. Each
+            item can be a plain name (``foo``) or a dotted path
+            (``Class.method``). Multi-dot paths (e.g.
+            ``module.Class.method``) fall back to the last segment. When
+            multiple symbols match (e.g., a class named ``Foo`` exists in
+            two different files), the best match is chosen by score
+            (source files over tests) then lexicographic node ID.
         repo_path: Absolute path to the repository root, or None.
 
     Returns:

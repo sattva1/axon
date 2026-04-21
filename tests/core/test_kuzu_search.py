@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ def backend(tmp_path: Path) -> KuzuBackend:
     yield b
     b.close()
 
+
 def _make_node(
     label: NodeLabel = NodeLabel.FUNCTION,
     file_path: str = "src/app.py",
@@ -34,6 +36,63 @@ def _make_node(
         content=content,
         signature=signature,
     )
+
+
+def _make_method(
+    file_path: str, name: str, class_name: str, content: str = ''
+) -> GraphNode:
+    """Build a METHOD GraphNode with class_name set.
+
+    Args:
+        file_path: Source file path for the method.
+        name: Method name.
+        class_name: Name of the enclosing class.
+        content: Optional body content.
+
+    Returns:
+        A GraphNode with label METHOD and class_name populated.
+    """
+    return GraphNode(
+        id=generate_id(NodeLabel.METHOD, file_path, name),
+        label=NodeLabel.METHOD,
+        name=name,
+        file_path=file_path,
+        class_name=class_name,
+        content=content,
+    )
+
+
+@pytest.fixture()
+def dotted_backend(tmp_path: Path) -> KuzuBackend:
+    """KuzuBackend seeded with a small class/method graph for dotted-path tests.
+
+    Seed graph:
+    - src/a.py: METHOD bar in class Foo (source file, score 2.0).
+    - src/b.py: METHOD bar in class Foo (source file, score 2.0).
+    - src/c.py: METHOD missing_method in class Foo (source file, score 2.0).
+    - src/c.py: FUNCTION bar, no class_name (source file, score 2.0).
+    - src/tests/test_a.py: METHOD bar in class Foo (test file, score 1.0).
+    """
+    db_path = tmp_path / 'dotted_test_db'
+    b = KuzuBackend()
+    b.initialize(db_path)
+
+    nodes = [
+        _make_method('src/a.py', 'bar', 'Foo', 'method body a'),
+        _make_method('src/b.py', 'bar', 'Foo', 'method body b'),
+        _make_method('src/c.py', 'missing_method', 'Foo', ''),
+        _make_node(
+            label=NodeLabel.FUNCTION,
+            file_path='src/c.py',
+            name='bar',
+            content='plain function',
+        ),
+        _make_method('src/tests/test_a.py', 'bar', 'Foo', 'test method body'),
+    ]
+    b.add_nodes(nodes)
+    yield b
+    b.close()
+
 
 class TestFtsSearch:
     def test_exact_name_match(self, backend: KuzuBackend) -> None:
@@ -144,6 +203,7 @@ class TestFtsSearch:
         assert results[0].node_id == node.id
         assert results[0].score > 0
 
+
 class TestEmbeddingsAndVectorSearch:
     def test_store_and_retrieve_by_vector(self, backend: KuzuBackend) -> None:
         # Insert a node so we can populate SearchResult fields.
@@ -219,6 +279,7 @@ class TestEmbeddingsAndVectorSearch:
         assert len(results) == 1
         assert results[0].score == pytest.approx(1.0, abs=1e-6)
 
+
 class TestFuzzySearch:
     def test_exact_name_returns_result(self, backend: KuzuBackend) -> None:
         node = _make_node(name="validate_user", content="validates user")
@@ -276,6 +337,129 @@ class TestFuzzySearch:
         results = backend.fuzzy_search("my_handler", limit=10)
         assert len(results) >= 1
         r = results[0]
-        assert r.node_name == "my_handler"
-        assert r.file_path == "src/handlers.py"
-        assert r.snippet != ""
+        assert r.node_name == 'my_handler'
+        assert r.file_path == 'src/handlers.py'
+        assert r.snippet != ''
+
+
+class TestExactNameSearchDottedPath:
+    """Dotted-path (Class.method) resolution via exact_name_search."""
+
+    def test_dotted_method_resolution(
+        self, dotted_backend: KuzuBackend
+    ) -> None:
+        """Foo.bar returns METHOD nodes from both source files and the test file."""
+        results = dotted_backend.exact_name_search('Foo.bar', limit=5)
+        node_ids = {r.node_id for r in results}
+        assert generate_id(NodeLabel.METHOD, 'src/a.py', 'bar') in node_ids
+        assert generate_id(NodeLabel.METHOD, 'src/b.py', 'bar') in node_ids
+        assert (
+            generate_id(NodeLabel.METHOD, 'src/tests/test_a.py', 'bar')
+            in node_ids
+        )
+        # Plain function from src/c.py must NOT appear (no class_name match).
+        assert (
+            generate_id(NodeLabel.FUNCTION, 'src/c.py', 'bar') not in node_ids
+        )
+
+    def test_dotted_no_plain_function_included(
+        self, dotted_backend: KuzuBackend
+    ) -> None:
+        """Dotted search excludes plain functions that have no class_name."""
+        results = dotted_backend.exact_name_search('Foo.bar', limit=5)
+        plain_fn_id = generate_id(NodeLabel.FUNCTION, 'src/c.py', 'bar')
+        assert all(r.node_id != plain_fn_id for r in results)
+
+    def test_unknown_member(self, dotted_backend: KuzuBackend) -> None:
+        """Foo.missing returns empty when no method named missing exists in Foo."""
+        results = dotted_backend.exact_name_search('Foo.missing', limit=5)
+        assert results == []
+
+    def test_unknown_class(self, dotted_backend: KuzuBackend) -> None:
+        """Missing.bar returns empty when no class named Missing exists."""
+        results = dotted_backend.exact_name_search('Missing.bar', limit=5)
+        assert results == []
+
+    def test_plain_name_unchanged(self, dotted_backend: KuzuBackend) -> None:
+        """Plain name 'bar' returns all nodes named bar regardless of class_name."""
+        results = dotted_backend.exact_name_search('bar', limit=10)
+        node_ids = {r.node_id for r in results}
+        assert generate_id(NodeLabel.METHOD, 'src/a.py', 'bar') in node_ids
+        assert generate_id(NodeLabel.METHOD, 'src/b.py', 'bar') in node_ids
+        assert (
+            generate_id(NodeLabel.METHOD, 'src/tests/test_a.py', 'bar')
+            in node_ids
+        )
+        # Plain function also returned by plain search.
+        assert generate_id(NodeLabel.FUNCTION, 'src/c.py', 'bar') in node_ids
+
+    def test_multi_dot_falls_back_to_last_segment(
+        self, dotted_backend: KuzuBackend
+    ) -> None:
+        """module.Foo.bar falls back to plain search on 'bar'."""
+        results_multi = dotted_backend.exact_name_search(
+            'module.Foo.bar', limit=10
+        )
+        results_plain = dotted_backend.exact_name_search('bar', limit=10)
+        assert {r.node_id for r in results_multi} == {
+            r.node_id for r in results_plain
+        }
+
+    def test_multi_dot_logged(
+        self, dotted_backend: KuzuBackend, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Multi-dot input triggers a debug log entry."""
+        with caplog.at_level(
+            logging.DEBUG, logger='axon.core.storage.kuzu_backend'
+        ):
+            dotted_backend.exact_name_search('module.Foo.bar', limit=5)
+        assert any('more than one dot' in r.message for r in caplog.records)
+
+    def test_empty_left_half_falls_through_to_plain(
+        self, dotted_backend: KuzuBackend
+    ) -> None:
+        """'.bar' is treated as a plain-name search on the literal string."""
+        results = dotted_backend.exact_name_search('.bar', limit=5)
+        # No node has name == ".bar", so result is empty.
+        assert results == []
+
+    def test_empty_right_half_falls_through_to_plain(
+        self, dotted_backend: KuzuBackend
+    ) -> None:
+        """'Foo.' is treated as a plain-name search on the literal string."""
+        results = dotted_backend.exact_name_search('Foo.', limit=5)
+        # No node has name == "Foo.", so result is empty.
+        assert results == []
+
+    def test_ordering_source_before_test(
+        self, dotted_backend: KuzuBackend
+    ) -> None:
+        """Source-file candidates (score 2.0) appear before test candidates (1.0)."""
+        results = dotted_backend.exact_name_search('Foo.bar', limit=5)
+        assert len(results) == 3
+
+        test_file_id = generate_id(
+            NodeLabel.METHOD, 'src/tests/test_a.py', 'bar'
+        )
+        # Last result must be the test-file candidate.
+        assert results[-1].node_id == test_file_id
+        # All preceding results must have higher scores.
+        assert all(r.score > results[-1].score for r in results[:-1])
+
+    def test_ordering_lexicographic_tiebreak(
+        self, dotted_backend: KuzuBackend
+    ) -> None:
+        """Among source-file candidates, node_id lexicographic order is applied."""
+        results = dotted_backend.exact_name_search('Foo.bar', limit=5)
+        src_results = [r for r in results if r.score == 2.0]
+        src_ids = [r.node_id for r in src_results]
+        assert src_ids == sorted(src_ids)
+
+    def test_limit_honored(self, dotted_backend: KuzuBackend) -> None:
+        """limit=1 returns exactly the single highest-ranked source candidate."""
+        results = dotted_backend.exact_name_search('Foo.bar', limit=1)
+        assert len(results) == 1
+        # The highest-ranked is the lexicographically first source-file method.
+        expected_id = generate_id(NodeLabel.METHOD, 'src/a.py', 'bar')
+        assert results[0].node_id == expected_id
+        assert results[0].score == 2.0

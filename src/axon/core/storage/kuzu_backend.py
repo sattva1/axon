@@ -469,13 +469,94 @@ class KuzuBackend:
     def exact_name_search(self, name: str, limit: int = 5) -> list[SearchResult]:
         """Search for nodes with an exact name match across all searchable tables.
 
-        Returns results sorted by label priority (functions/methods first),
-        preferring source files over test files.
+        Supports plain names and single-dot ``Class.method`` paths:
+
+        - Plain name (``foo``): matches any node whose ``name`` field equals
+          ``foo``. Back-compat with existing callers.
+        - Dotted path (``Foo.bar``): matches nodes where ``name = 'bar'`` AND
+          ``class_name = 'Foo'``. Only METHOD nodes populate ``class_name``,
+          so other node types naturally return zero rows - no special casing
+          needed.
+        - ``"Foo.missing"`` or ``"Missing.bar"``: returns empty results.
+        - Multi-dot path (``module.Foo.bar``): falls back to the last segment
+          (``bar``); module-qualified resolution is deferred.
+        - Degenerate dotted inputs with an empty half (e.g. ``".bar"`` or
+          ``"Foo."``): treated as a plain-name search on the full string.
+
+        Ordering: results are sorted by ``(-score, node_id)``. Score is 2.0
+        for source files and 1.0 for test files (path contains ``/tests/``).
+        When multiple classes named ``Foo`` exist in different files, all
+        matching ``Foo.bar`` candidates are returned, ranked by score then
+        lexicographic node ID.
         """
         conn = self._require_conn()
         limit = int(limit)
         candidates: list[SearchResult] = []
 
+        dot_count = name.count('.')
+        if dot_count == 1:
+            parent, member = name.split('.', 1)
+            if parent and member:
+                # Dotted-path mode: resolve Class.method via class_name field.
+                for table in _SEARCHABLE_TABLES:
+                    cypher = (
+                        f'MATCH (n:{table}) '
+                        f'WHERE n.name = $member AND n.class_name = $parent '
+                        f'RETURN n.id, n.name, n.file_path, '
+                        f'n.content, n.signature '
+                        f'LIMIT {limit}'
+                    )
+                    try:
+                        with self._lock:
+                            result = conn.execute(
+                                cypher,
+                                parameters={
+                                    'member': member,
+                                    'parent': parent,
+                                },
+                            )
+                        while result.has_next():
+                            row = result.get_next()
+                            node_id = row[0] or ''
+                            node_name = row[1] or ''
+                            file_path = row[2] or ''
+                            content = row[3] or ''
+                            signature = row[4] or ''
+                            label_prefix = (
+                                node_id.split(':', 1)[0] if node_id else ''
+                            )
+                            snippet = (
+                                content[:200] if content else signature[:200]
+                            )
+                            score = 2.0 if '/tests/' not in file_path else 1.0
+                            candidates.append(
+                                SearchResult(
+                                    node_id=node_id,
+                                    score=score,
+                                    node_name=node_name,
+                                    file_path=file_path,
+                                    label=label_prefix,
+                                    snippet=snippet,
+                                )
+                            )
+                    except Exception:
+                        logger.debug(
+                            'exact_name_search failed on table %s',
+                            table,
+                            exc_info=True,
+                        )
+                candidates.sort(key=lambda r: (-r.score, r.node_id))
+                return candidates[:limit]
+            # Empty half - fall through to plain-name search on full string.
+        elif dot_count > 1:
+            logger.debug(
+                'Dotted path %r has more than one dot; '
+                'falling back to last segment.',
+                name,
+            )
+            name = name.rsplit('.', 1)[-1]
+
+        # Single-segment (or degenerate dotted input) path.
         for table in _SEARCHABLE_TABLES:
             cypher = (
                 f"MATCH (n:{table}) WHERE n.name = $name "
@@ -506,7 +587,11 @@ class KuzuBackend:
                         )
                     )
             except Exception:
-                logger.debug("exact_name_search failed on table %s", table, exc_info=True)
+                logger.debug(
+                    'exact_name_search failed on table %s',
+                    table,
+                    exc_info=True,
+                )
 
         candidates.sort(key=lambda r: (-r.score, r.node_id))
         return candidates[:limit]
