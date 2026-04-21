@@ -31,19 +31,28 @@ class ImportInfo:
 
     Contract:
     - ``module``: the source module path (e.g. ``"os.path"``, ``"./utils"``).
-    - ``names``: the symbols being imported from *module* (e.g. ``["join", "exists"]``).
-      For ``import numpy as np``, ``names=["numpy"]`` (the last segment of the module),
-      NOT the alias.  For ``from os.path import join``, ``names=["join"]``.
-    - ``alias``: the local binding name when the import is aliased
+    - ``names``: the *original* symbol names imported from *module*
+      (e.g. ``["join", "exists"]``). For ``import numpy as np``,
+      ``names=["numpy"]`` (the last segment of the module), NOT the alias.
+      For ``from os.path import join as j``, ``names=["join"]`` (original),
+      NOT ``"j"``. Downstream consumers that need the local name must
+      consult ``aliases``.
+    - ``alias``: the local binding name when the whole import is aliased
       (e.g. ``"np"`` for ``import numpy as np``, ``""`` otherwise).
-      Import resolution uses ``module`` to locate the target file; ``alias`` is
-      only relevant for local-name lookups by callers.
+      Import resolution uses ``module`` to locate the target file; ``alias``
+      is only relevant for local-name lookups by callers.
+    - ``aliases``: per-name alias map for ``from X import Y as Z`` forms.
+      Maps local alias to original name: ``{"Z": "Y"}``. Empty when no
+      per-name aliases are present.
     """
 
     module: str  # the module path (e.g., "os.path", "./utils")
-    names: list[str] = field(default_factory=list)  # imported names (e.g., ["join", "exists"])
+    names: list[str] = field(default_factory=list)  # original imported names
     is_relative: bool = False
-    alias: str = ""  # local binding name when aliased (e.g. "np" for "import numpy as np")
+    alias: str = ''  # local binding name when aliased (e.g. "np" for "import numpy as np")
+    aliases: dict[str, str] = field(
+        default_factory=dict
+    )  # {local_alias: original_name}
 
 
 @dataclass
@@ -116,7 +125,41 @@ class ParseResult:
     heritage: list[tuple[str, str, str]] = field(
         default_factory=list
     )  # (class_name, kind, parent_name) where kind is "extends" or "implements"
-    exports: list[str] = field(default_factory=list)  # names from __all__ or export statements
+    exports: list[str] = field(
+        default_factory=list
+    )  # names from __all__ or export statements
+
+    def build_import_type_map(self) -> dict[str, str]:
+        """Map each locally-bound imported name to its canonical class name.
+
+        For ``from X import Y`` -> ``{"Y": "Y"}``.
+        For ``from X import Y as Z`` -> ``{"Z": "Y"}``.
+        For ``import X as Y`` -> ``{"Y": X_last_segment}``.
+
+        Module-aliased imports (``import a.b.c as cc``) map the alias
+        to the last dotted segment only. Attribute-call constructors
+        (``cc.Foo()``) are not captured by the binding tracker and fall
+        through to ``dispatch_kind="direct"`` as expected.
+
+        Called between pass 1 (_walk) and pass 2 (_extract_calls_recursive)
+        by PythonParser.parse(). Do not call from ingestion layer.
+        """
+        mapping: dict[str, str] = {}
+        for imp in self.imports:
+            if imp.alias:
+                # "import X[.Y] as Z" -- imp.names contains the last segment.
+                mapping[imp.alias] = imp.names[0] if imp.names else imp.alias
+            # aliased_originals: set of original names that have a local alias,
+            # so the original name is NOT a valid local binding.
+            aliased_originals = set(imp.aliases.values())
+            for original_name in imp.names:
+                if original_name not in aliased_originals:
+                    # Directly imported without aliasing -- locally bound as-is.
+                    mapping[original_name] = original_name
+            # Per-name aliases: local alias -> original class name.
+            for local_alias, original_name in imp.aliases.items():
+                mapping[local_alias] = original_name
+        return mapping
 
 
 class LanguageParser(ABC):

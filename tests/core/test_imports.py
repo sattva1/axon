@@ -32,6 +32,7 @@ _FILE_PATHS = [
     ("lib/models/index.ts", "typescript"),
 ]
 
+
 @pytest.fixture()
 def graph() -> KnowledgeGraph:
     """Return a KnowledgeGraph pre-populated with File nodes for testing."""
@@ -49,10 +50,34 @@ def graph() -> KnowledgeGraph:
         )
     return g
 
+
 @pytest.fixture()
 def file_index(graph: KnowledgeGraph) -> dict[str, str]:
     """Return the file index built from the fixture graph."""
     return build_file_index(graph)
+
+
+class TestFromImportAlias:
+    """ImportInfo.aliases field and ParseResult.build_import_type_map() for aliased imports."""
+
+    def test_from_import_as_populates_aliases_and_preserves_names(
+        self,
+    ) -> None:
+        """from X import Y as Z: names stores original, aliases maps Z->Y."""
+        from axon.core.parsers.python_lang import PythonParser
+
+        code = 'from concurrent.futures import ThreadPoolExecutor as TPE\n'
+        parser = PythonParser()
+        result = parser.parse(code, 'test.py')
+
+        assert result.imports, 'expected at least one import'
+        imp = result.imports[0]
+        assert imp.names == ['ThreadPoolExecutor']
+        assert imp.aliases == {'TPE': 'ThreadPoolExecutor'}
+
+        type_map = result.build_import_type_map()
+        assert type_map.get('TPE') == 'ThreadPoolExecutor'
+
 
 class TestBuildFileIndex:
     def test_build_file_index(self, graph: KnowledgeGraph) -> None:
@@ -91,6 +116,7 @@ class TestBuildFileIndex:
         assert len(index) == 1
         assert "src/app.py" in index
 
+
 class TestResolvePythonRelativeImport:
     def test_resolve_python_relative_import(
         self, file_index: dict[str, str]
@@ -100,6 +126,7 @@ class TestResolvePythonRelativeImport:
 
         expected_id = generate_id(NodeLabel.FILE, "src/auth/utils.py")
         assert result == expected_id
+
 
 class TestResolvePythonParentRelative:
     def test_resolve_python_parent_relative(
@@ -138,6 +165,7 @@ class TestResolvePythonParentRelative:
 
         expected_id = generate_id(NodeLabel.FILE, "src/models.py")
         assert result == expected_id
+
 
 class TestResolvePythonAbsoluteWithSourceRoot:
     def test_resolve_absolute_with_src_prefix(self) -> None:
@@ -203,6 +231,7 @@ class TestResolvePythonAbsoluteWithSourceRoot:
         roots = _detect_source_roots(index)
         assert "src" in roots
 
+
 class TestResolvePythonExternal:
     def test_resolve_python_external_import(
         self, file_index: dict[str, str]
@@ -218,6 +247,7 @@ class TestResolvePythonExternal:
         result = resolve_import_path("src/auth/validate.py", imp, file_index)
         assert result is None
 
+
 class TestResolveTsRelative:
     def test_resolve_ts_relative(self, file_index: dict[str, str]) -> None:
         imp = ImportInfo(module="./utils", names=["foo"], is_relative=False)
@@ -225,6 +255,7 @@ class TestResolveTsRelative:
 
         expected_id = generate_id(NodeLabel.FILE, "lib/utils.ts")
         assert result == expected_id
+
 
 class TestResolveTsDirectoryIndex:
     def test_resolve_ts_directory_index(
@@ -235,6 +266,7 @@ class TestResolveTsDirectoryIndex:
 
         expected_id = generate_id(NodeLabel.FILE, "lib/models/index.ts")
         assert result == expected_id
+
 
 class TestResolveTsExternal:
     def test_resolve_ts_external(self, file_index: dict[str, str]) -> None:
@@ -248,6 +280,7 @@ class TestResolveTsExternal:
         imp = ImportInfo(module="@types/node", names=[], is_relative=False)
         result = resolve_import_path("lib/index.ts", imp, file_index)
         assert result is None
+
 
 class TestProcessImportsCreatesRelationships:
     def test_process_imports_creates_relationships(
@@ -361,6 +394,7 @@ class TestProcessImportsCreatesRelationships:
 
         imports_rels = graph.get_relationships_by_type(RelType.IMPORTS)
         assert len(imports_rels) == 2
+
 
 class TestProcessImportsNoDuplicates:
     def test_process_imports_no_duplicates(

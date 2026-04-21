@@ -362,11 +362,15 @@ class TestDispatcherRecognisers:
     def test_generic_executor_submit_fallback(
         self, parser: PythonParser
     ) -> None:
-        """Receiver ending in 'Executor' .submit() -> thread_executor."""
+        """Unknown receiver ending in 'Executor' .submit() -> direct.
+
+        Substring heuristics were removed in Phase 4a-follow-up.
+        Unresolvable receiver types fall through to 'direct'.
+        """
         code = 'MyCustomExecutor.submit(fn)\n'
         calls = _calls_by_name(parser, code, 'submit')
         assert calls
-        assert calls[0].dispatch_kind == 'thread_executor'
+        assert calls[0].dispatch_kind == 'direct'
 
     def test_celery_shared_task_apply_async(
         self, parser: PythonParser
@@ -407,6 +411,32 @@ class TestDispatcherRecognisers:
         calls = _calls_by_name(parser, code, 'create_task')
         assert calls
         assert calls[0].dispatch_kind == 'detached_task'
+
+    def test_known_class_static_call_resolves(
+        self, parser: PythonParser
+    ) -> None:
+        """ThreadPoolExecutor.submit(fn) at module scope -> thread_executor.
+
+        No binding context; the fast path recognises the receiver as a known
+        class name via _DISPATCH_KNOWN_CLASSES.
+        """
+        code = 'ThreadPoolExecutor.submit(fn)\n'
+        calls = _calls_by_name(parser, code, 'submit')
+        assert calls
+        assert calls[0].dispatch_kind == 'thread_executor'
+
+    def test_unknown_class_static_call_is_direct(
+        self, parser: PythonParser
+    ) -> None:
+        """MyCustomThing.submit(fn) at module scope -> direct.
+
+        Only classes in _DISPATCH_KNOWN_CLASSES get the static-style fast
+        path. Unknown classes fall through to direct.
+        """
+        code = 'MyCustomThing.submit(fn)\n'
+        calls = _calls_by_name(parser, code, 'submit')
+        assert calls
+        assert calls[0].dispatch_kind == 'direct'
 
     def test_plain_call_direct(self, parser: PythonParser) -> None:
         """Ordinary function call -> direct."""
@@ -509,4 +539,18 @@ class TestAxonSourceMostlyDirect:
         assert ratio >= 0.95, (
             f'direct ratio {ratio:.3f} < 0.95 '
             f'(direct={direct_count}, total={total})'
+        )
+
+        thread_executor_submit_map = sum(
+            1
+            for py_file in py_files
+            for call in parser_inst.parse(
+                py_file.read_text(encoding='utf-8'), str(py_file)
+            ).calls
+            if call.dispatch_kind == 'thread_executor'
+            and call.name in {'submit', 'map'}
+        )
+        assert thread_executor_submit_map >= 7, (
+            f'expected >= 7 thread_executor submit/map calls in axon source, '
+            f'got {thread_executor_submit_map}'
         )
