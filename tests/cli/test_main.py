@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import socket
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -12,8 +12,10 @@ from typer.testing import CliRunner
 import axon.mcp.server as _mcp_server
 from axon import __version__
 from axon.cli.main import (
+    _ensure_host_running,
     _initialize_writable_storage,
     _register_in_global_registry,
+    _reserve_managed_port,
     _start_host_background,
     app,
 )
@@ -639,12 +641,92 @@ class TestSetDbPath:
 
 class TestStartHostBackground:
     def test_passes_repo_path_in_command(self, tmp_path: Path) -> None:
-        """_start_host_background() appends repo_path as the final CLI argument."""
-        with patch("subprocess.Popen") as mock_popen, \
-                patch("builtins.open", MagicMock()):
+        """_start_host_background() appends repo_path as the final CLI argument
+        and opens {repo_path}/.axon/host.log in binary-write mode."""
+        mock_open = MagicMock()
+        with (
+            patch('subprocess.Popen') as mock_popen,
+            patch('builtins.open', mock_open),
+        ):
             _start_host_background(tmp_path, port=8420)
         cmd = mock_popen.call_args[0][0]
         assert cmd[-1] == str(tmp_path)
+        open_calls = mock_open.call_args_list
+        log_calls = [
+            c for c in open_calls if str(c.args[0]).endswith('.axon/host.log')
+        ]
+        assert log_calls, (
+            'open() not called with a path ending in .axon/host.log'
+        )
+        assert log_calls[0].args[1] == 'wb'
+
+
+class TestReserveManagedPort:
+    """Port-reservation helper tests."""
+
+    def test_falls_back_when_preferred_is_busy(self) -> None:
+        """Returns a different ephemeral port when the preferred one is occupied."""
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            blocker.bind(('127.0.0.1', 0))
+            busy_port = blocker.getsockname()[1]
+            result = _reserve_managed_port(busy_port)
+            assert isinstance(result, int)
+            assert result > 1023
+            assert result != busy_port
+        finally:
+            blocker.close()
+
+    def test_prefers_requested_port_when_free(self) -> None:
+        """Returns the requested port when bind succeeds on first try."""
+        mock_sock = MagicMock()
+        mock_sock.getsockname.return_value = ('127.0.0.1', 8421)
+        with patch('axon.cli.main.socket.socket', return_value=mock_sock):
+            result = _reserve_managed_port(8421)
+        assert result == 8421
+        mock_sock.bind.assert_called_once_with(('127.0.0.1', 8421))
+
+
+class TestEnsureHostRunningTimeout:
+    """Timeout diagnostics in _ensure_host_running()."""
+
+    def test_timeout_emits_host_log_tail_to_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Timeout prints host.log tail to stderr and raises with the short message."""
+        axon_dir = tmp_path / '.axon'
+        axon_dir.mkdir()
+        (axon_dir / 'host.log').write_bytes(
+            b'line 1\nline 2\nERROR: bind failed\n'
+        )
+        with (
+            patch('axon.cli.main._start_host_background'),
+            patch('axon.cli.main._get_live_host_info', return_value=None),
+            patch('axon.cli.main._reserve_managed_port', return_value=8421),
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match='Timed out waiting for Axon host to start. '
+                'See stderr for host.log tail.',
+            ):
+                _ensure_host_running(tmp_path, timeout_seconds=0.3, port=8421)
+        captured = capsys.readouterr()
+        assert '--- host.log tail ---' in captured.err
+        assert 'ERROR: bind failed' in captured.err
+
+    def test_timeout_falls_back_when_host_log_missing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Timeout uses fallback message when host.log does not exist."""
+        with (
+            patch('axon.cli.main._start_host_background'),
+            patch('axon.cli.main._get_live_host_info', return_value=None),
+            patch('axon.cli.main._reserve_managed_port', return_value=8421),
+        ):
+            with pytest.raises(RuntimeError):
+                _ensure_host_running(tmp_path, timeout_seconds=0.3, port=8421)
+        captured = capsys.readouterr()
+        assert '(host.log not available or empty)' in captured.err
 
 
 class TestAnalyze:

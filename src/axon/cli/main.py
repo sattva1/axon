@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -336,6 +337,37 @@ def _is_host_alive(meta: dict, repo_path: Path) -> bool:
         return False
 
 
+def _reserve_managed_port(preferred: int) -> int:
+    """Reserve a free port, preferring ``preferred``.
+
+    Tries to bind ``127.0.0.1:preferred``. On ``OSError`` (port in use),
+    asks the OS for an ephemeral port instead. Returns the chosen port
+    after closing the probe socket.
+
+    Note: there is a TOCTOU window between closing the probe socket
+    and uvicorn's subsequent bind in the spawned child. The window
+    spans full child startup (subprocess fork + interpreter cold-start
+    + storage init + possible pipeline run + uvicorn startup), so it
+    can be seconds to minutes on fresh repos. Correctness of the
+    caller relies on the HTTP health probe in ``_ensure_host_running``,
+    which cannot return 200 until uvicorn has actually bound the port.
+    Concurrent-start races remain possible; they surface in ``host.log``
+    rather than silently timing out.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        try:
+            s.bind(('127.0.0.1', preferred))
+            return s.getsockname()[1]
+        except OSError:
+            s.close()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+    finally:
+        s.close()
+
+
 def _get_live_host_info(repo_path: Path) -> dict | None:
     meta = _read_host_meta(repo_path)
     if meta is None:
@@ -368,16 +400,19 @@ def _start_host_background(
     if watch:
         command.append("--watch")
     else:
-        command.append("--no-watch")
+        command.append('--no-watch')
     if managed:
-        command.append("--managed")
+        command.append('--managed')
     command.append(str(repo_path))  # Explicit path argument
-    with open(os.devnull, "wb") as devnull:
+    axon_dir = repo_path / '.axon'
+    axon_dir.mkdir(parents=True, exist_ok=True)
+    log_path = axon_dir / 'host.log'
+    with open(log_path, 'wb') as log_fh:
         subprocess.Popen(  # noqa: S603
             command,
             cwd=repo_path,
-            stdout=devnull,
-            stderr=devnull,
+            stdout=log_fh,
+            stderr=log_fh,
             start_new_session=True,
         )
 
@@ -396,14 +431,35 @@ def _ensure_host_running(
     if live_host is not None:
         return live_host
 
-    _start_host_background(repo_path, port=port, bind=bind, watch=watch, managed=managed)
+    port = _reserve_managed_port(port)
+    _start_host_background(
+        repo_path, port=port, bind=bind, watch=watch, managed=managed
+    )
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         live_host = _get_live_host_info(repo_path)
         if live_host is not None:
             return live_host
         time.sleep(0.2)
-    raise RuntimeError("Timed out waiting for Axon host to start.")
+
+    # Timeout: emit host.log tail to stderr for diagnosability, then raise.
+    log_path = repo_path / '.axon' / 'host.log'
+    try:
+        tail_lines = log_path.read_text(
+            encoding='utf-8', errors='replace'
+        ).splitlines()[-40:]
+        tail = (
+            '\n'.join(tail_lines)
+            if tail_lines
+            else '(host.log not available or empty)'
+        )
+    except (OSError, IOError):
+        tail = '(host.log not available or empty)'
+    print(f'--- host.log tail ---\n{tail}', file=sys.stderr, flush=True)
+    raise RuntimeError(
+        'Timed out waiting for Axon host to start. '
+        'See stderr for host.log tail.'
+    )
 
 
 app = typer.Typer(
