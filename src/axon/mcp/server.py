@@ -500,7 +500,7 @@ def _dispatch_tool(
             propagate_through=arguments.get('propagate_through'),
         )
     elif name == 'axon_dead_code':
-        return handle_dead_code(storage)
+        return handle_dead_code(storage, repo_path=repo_path)
     elif name == 'axon_detect_changes':
         return handle_detect_changes(storage, arguments.get('diff', ''))
     elif name == 'axon_cypher':
@@ -513,12 +513,14 @@ def _dispatch_tool(
         )
     elif name == 'axon_communities':
         return handle_communities(
-            storage, community=arguments.get('community')
+            storage, community=arguments.get('community'), repo_path=repo_path
         )
     elif name == 'axon_explain':
         return handle_explain(storage, arguments.get('symbol', ''))
     elif name == 'axon_review_risk':
-        return handle_review_risk(storage, arguments.get('diff', ''))
+        return handle_review_risk(
+            storage, arguments.get('diff', ''), repo_path=repo_path
+        )
     elif name == 'axon_call_path':
         return handle_call_path(
             storage,

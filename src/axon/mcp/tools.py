@@ -27,6 +27,10 @@ from axon.core.ingestion.test_classifier import (
 from axon.core.search.hybrid import hybrid_search
 from axon.core.storage.base import StorageBackend
 from axon.core.storage.kuzu_backend import escape_cypher as _escape_cypher
+from axon.mcp.freshness import (
+    render_with_communities_warning,
+    render_with_dead_code_warning,
+)
 from axon.mcp.resources import get_dead_code_list
 
 logger = logging.getLogger(__name__)
@@ -642,7 +646,9 @@ def handle_concurrent_with(
     return '\n'.join(lines)
 
 
-def handle_dead_code(storage: StorageBackend) -> str:
+def handle_dead_code(
+    storage: StorageBackend, repo_path: Path | None = None
+) -> str:
     """List all symbols marked as dead code.
 
     Delegates to :func:`~axon.mcp.resources.get_dead_code_list` for the
@@ -650,14 +656,19 @@ def handle_dead_code(storage: StorageBackend) -> str:
 
     Args:
         storage: The storage backend.
+        repo_path: Optional path to the repo root for staleness warning.
 
     Returns:
         Formatted list of dead code symbols grouped by file.
     """
-    return get_dead_code_list(storage)
+    body = get_dead_code_list(storage)
+    return render_with_dead_code_warning(repo_path, body)
 
-_DIFF_FILE_PATTERN = re.compile(r"^diff --git a/(.+?) b/(.+?)$", re.MULTILINE)
-_DIFF_HUNK_PATTERN = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
+
+_DIFF_FILE_PATTERN = re.compile(r'^diff --git a/(.+?) b/(.+?)$', re.MULTILINE)
+_DIFF_HUNK_PATTERN = re.compile(
+    r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', re.MULTILINE
+)
 
 
 def _parse_diff_files(diff: str) -> dict[str, list[tuple[int, int]]]:
@@ -998,10 +1009,10 @@ def handle_call_path(
     return header + '\n\n' + '\n'.join(lines)
 
 
-def handle_communities(
+def _build_communities(
     storage: StorageBackend, community: str | None = None
 ) -> str:
-    """List communities or drill into a specific one."""
+    """Build the communities output body without staleness warnings."""
     if community:
         escaped = _escape_cypher(community)
         rows = (
@@ -1083,6 +1094,16 @@ def handle_communities(
             lines.append(f"  - {proc_name} ({comm_str})")
 
     return "\n".join(lines)
+
+
+def handle_communities(
+    storage: StorageBackend,
+    community: str | None = None,
+    repo_path: Path | None = None,
+) -> str:
+    """List communities or drill into a specific one."""
+    body = _build_communities(storage, community)
+    return render_with_communities_warning(repo_path, body)
 
 
 def handle_explain(storage: StorageBackend, symbol: str) -> str:
@@ -1181,8 +1202,8 @@ def handle_explain(storage: StorageBackend, symbol: str) -> str:
     return "\n".join(lines)
 
 
-def handle_review_risk(storage: StorageBackend, diff: str) -> str:
-    """Assess PR risk by synthesizing multiple graph signals."""
+def _build_review_risk(storage: StorageBackend, diff: str) -> str:
+    """Build the PR risk assessment body without staleness warnings."""
     if not diff.strip():
         return 'Empty diff provided.'
 
@@ -1307,6 +1328,14 @@ def handle_review_risk(storage: StorageBackend, diff: str) -> str:
         lines.append(f"  Spans: {', '.join(sorted(communities_touched))}")
 
     return "\n".join(lines)
+
+
+def handle_review_risk(
+    storage: StorageBackend, diff: str, repo_path: Path | None = None
+) -> str:
+    """Assess PR risk by synthesizing multiple graph signals."""
+    body = _build_review_risk(storage, diff)
+    return render_with_dead_code_warning(repo_path, body)
 
 
 def handle_file_context(storage: StorageBackend, file_path: str) -> str:

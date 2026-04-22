@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -48,6 +49,7 @@ from axon.core.embeddings.embedder import (
 )
 from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
 from axon.core.ingestion.watcher import ensure_current_embeddings, watch_repo
+from axon.core.meta import load_meta, now_iso, update_meta
 from axon.core.storage.base import EMBEDDING_DIMENSIONS
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp import tools as mcp_tools
@@ -519,8 +521,13 @@ def _initialize_writable_storage(
         console.print("[bold]Running initial index...[/bold]")
         _, result = run_pipeline(repo_path, storage)
         meta = _build_meta(result, repo_path)
-        meta_path = axon_dir / "meta.json"
-        meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        update_meta(
+            repo_path,
+            **meta,
+            last_incremental_at=now_iso(),
+            dead_code_last_refreshed_at=now_iso(),
+            communities_last_refreshed_at=now_iso(),
+        )
         try:
             _register_in_global_registry(meta, repo_path)
         except Exception:
@@ -661,11 +668,10 @@ def _run_shared_host(
 
 
 def _run_background_embeddings(
-    graph: "KnowledgeGraph",
+    graph: 'KnowledgeGraph',
     db_path: Path,
-    meta_path: Path,
     repo_path: Path,
-    progress_callback: "Callable[[str, float], None] | None" = None,
+    progress_callback: 'Callable[[str, float], None] | None' = None,
 ) -> int:
     """Generate embeddings with a separate storage connection.
 
@@ -682,11 +688,12 @@ def _run_background_embeddings(
 
         # Update meta.json with embedding count.
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            meta["stats"]["embeddings"] = bg_result.embeddings
-            meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+            update_meta(repo_path, stats={'embeddings': bg_result.embeddings})
         except Exception:
-            logger.debug("Failed to update meta.json with embedding count", exc_info=True)
+            logger.debug(
+                'Failed to update meta.json with embedding count',
+                exc_info=True,
+            )
 
         return bg_result.embeddings
     except Exception:
@@ -786,8 +793,13 @@ def analyze(
         )
 
     meta = _build_meta(result, repo_path)
-    meta_path = axon_dir / "meta.json"
-    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    update_meta(
+        repo_path,
+        **meta,
+        last_incremental_at=now_iso(),
+        dead_code_last_refreshed_at=now_iso(),
+        communities_last_refreshed_at=now_iso(),
+    )
 
     try:
         _register_in_global_registry(meta, repo_path)
@@ -833,7 +845,7 @@ def analyze(
                 embed_progress.update(embed_task, completed=pct * 100)
 
             embed_count = _run_background_embeddings(
-                graph, db_path, meta_path, repo_path, on_embed_progress
+                graph, db_path, repo_path, on_embed_progress
             )
         if embed_count > 0:
             console.print(f"  Embeddings:     {embed_count}")
@@ -847,36 +859,36 @@ def analyze(
 def status() -> None:
     """Show index status for current repository."""
     repo_path = Path.cwd().resolve()
-    meta_path = repo_path / ".axon" / "meta.json"
+    axon_dir = repo_path / '.axon'
 
-    if not meta_path.exists():
+    if not (axon_dir / 'meta.json').exists():
         console.print(
-            "[red]Error:[/red] No index found. "
-            "Run [cyan]axon analyze .[/cyan] first to index this codebase."
+            '[red]Error:[/red] No index found. '
+            'Run [cyan]axon analyze .[/cyan] first to index this codebase.'
         )
         raise typer.Exit(code=1)
 
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    stats = meta.get("stats", {})
+    meta = load_meta(repo_path)
+    stats = meta.stats
 
-    console.print(f"[bold]Index status for[/bold] {repo_path}")
-    console.print(f"  Version:        {meta.get('version', '?')}")
-    console.print(f"  Last indexed:   {meta.get('last_indexed_at', '?')}")
-    console.print(f"  Files:          {stats.get('files', '?')}")
-    console.print(f"  Symbols:        {stats.get('symbols', '?')}")
-    console.print(f"  Relationships:  {stats.get('relationships', '?')}")
+    console.print(f'[bold]Index status for[/bold] {repo_path}')
+    console.print(f'  Version:        {meta.version or "?"}')
+    console.print(f'  Last indexed:   {meta.last_indexed_at or "?"}')
+    console.print(f'  Files:          {stats.get("files", "?")}')
+    console.print(f'  Symbols:        {stats.get("symbols", "?")}')
+    console.print(f'  Relationships:  {stats.get("relationships", "?")}')
 
-    if stats.get("clusters", 0) > 0:
-        console.print(f"  Clusters:       {stats['clusters']}")
-    if stats.get("flows", 0) > 0:
-        console.print(f"  Flows:          {stats['flows']}")
-    if stats.get("dead_code", 0) > 0:
-        console.print(f"  Dead code:      {stats['dead_code']}")
-    if stats.get("coupled_pairs", 0) > 0:
-        console.print(f"  Coupled pairs:  {stats['coupled_pairs']}")
+    if stats.get('clusters', 0) > 0:
+        console.print(f'  Clusters:       {stats["clusters"]}')
+    if stats.get('flows', 0) > 0:
+        console.print(f'  Flows:          {stats["flows"]}')
+    if stats.get('dead_code', 0) > 0:
+        console.print(f'  Dead code:      {stats["dead_code"]}')
+    if stats.get('coupled_pairs', 0) > 0:
+        console.print(f'  Coupled pairs:  {stats["coupled_pairs"]}')
 
 
-@app.command(name="list")
+@app.command(name='list')
 def list_repos() -> None:
     """List all indexed repositories."""
     result = mcp_tools.handle_list_repos()
@@ -946,7 +958,9 @@ def impact(
 def dead_code() -> None:
     """List all detected dead code."""
     storage = _load_storage()
-    result = mcp_tools.handle_dead_code(storage)
+    result = mcp_tools.handle_dead_code(
+        storage, repo_path=Path.cwd().resolve()
+    )
     console.print(result)
     storage.close()
 
@@ -988,6 +1002,21 @@ def setup(
     console.print("\n[dim]Then index your codebase with:[/dim] [cyan]axon analyze .[/cyan]")
 
 
+def _parse_duration_seconds(value: str) -> int:
+    """Parse '30s' / '5m' / '1h' into seconds.
+
+    Raises:
+        typer.BadParameter: On unrecognised format.
+    """
+    match = re.fullmatch(r'(\d+)([smh])', value.strip())
+    if match is None:
+        raise typer.BadParameter(
+            f"Invalid duration '{value}' — expected e.g. '30s', '5m', '1h'."
+        )
+    n, unit = int(match.group(1)), match.group(2)
+    return n * {'s': 1, 'm': 60, 'h': 3600}[unit]
+
+
 @app.command()
 def watch(
     path: Path = typer.Argument(Path("."), help="Path to the repository to watch."),
@@ -998,8 +1027,16 @@ def watch(
     ),
     coreml: bool = typer.Option(
         False,
-        "--coreml",
-        help="Use CoreML GPU acceleration for embedding generation (Apple Silicon).",
+        '--coreml',
+        help='Use CoreML GPU acceleration for embedding generation (Apple Silicon).',
+    ),
+    global_refresh_interval: str = typer.Option(
+        '',
+        '--global-refresh-interval',
+        help=(
+            "Periodic global-phase refresh interval (e.g., '30s', '5m', '1h'). "
+            'Default: off — warnings only.'
+        ),
     ),
 ) -> None:
     """Watch mode — re-index on file changes."""
@@ -1008,12 +1045,23 @@ def watch(
         console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
         raise typer.Exit(code=1)
     _configure_and_validate_accelerator(cuda, coreml)
+    interval_s = (
+        _parse_duration_seconds(global_refresh_interval)
+        if global_refresh_interval
+        else None
+    )
     storage, axon_dir, db_path = _initialize_writable_storage(repo_path)
-    console.print(f"[bold]Watching[/bold] {repo_path} for changes (Ctrl+C to stop)")
+    console.print(
+        f'[bold]Watching[/bold] {repo_path} for changes (Ctrl+C to stop)'
+    )
     try:
-        asyncio.run(watch_repo(repo_path, storage))
+        asyncio.run(
+            watch_repo(
+                repo_path, storage, global_refresh_interval_seconds=interval_s
+            )
+        )
     except KeyboardInterrupt:
-        console.print("\n[bold]Watch stopped.[/bold]")
+        console.print('\n[bold]Watch stopped.[/bold]')
     finally:
         storage.close()
 

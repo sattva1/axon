@@ -214,6 +214,8 @@ Watching /Users/you/project for changes...
 
 File-local phases (parse, imports, calls, types) run immediately on change. Global phases (communities, processes, dead code) batch every 30 seconds.
 
+By default, `axon watch` re-runs communities/processes/dead-code only when >= 3 files change in a burst. Smaller changes run only dead code, leaving community structure stale. MCP tools (`axon_dead_code`, `axon_communities`, `axon_review_risk`) and the CLI `axon dead-code` command flag this with a warning line. To auto-refresh on a fixed cadence instead, pass `--global-refresh-interval=5m`.
+
 ### Structural diff, not text diff
 
 **Branch Comparison**
