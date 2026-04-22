@@ -21,6 +21,7 @@ from axon.core.parsers.base import CallInfo, ParseResult
 
 _CALLABLE_LABELS = (NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.CLASS)
 
+
 def _add_file_node(graph: KnowledgeGraph, path: str) -> str:
     """Add a File node and return its ID."""
     node_id = generate_id(NodeLabel.FILE, path)
@@ -33,6 +34,7 @@ def _add_file_node(graph: KnowledgeGraph, path: str) -> str:
         )
     )
     return node_id
+
 
 def _add_symbol_node(
     graph: KnowledgeGraph,
@@ -70,6 +72,7 @@ def _add_symbol_node(
     )
     return node_id
 
+
 @pytest.fixture()
 def graph() -> KnowledgeGraph:
     """Build a graph matching the test fixture specification.
@@ -103,6 +106,7 @@ def graph() -> KnowledgeGraph:
 
     return g
 
+
 @pytest.fixture()
 def parse_data() -> list[FileParseData]:
     """Parse data with calls matching the fixture specification.
@@ -126,6 +130,8 @@ def parse_data() -> list[FileParseData]:
             ),
         ),
     ]
+
+
 class TestBuildCallIndex:
     def test_build_call_index(self, graph: KnowledgeGraph) -> None:
         index = build_name_index(graph, _CALLABLE_LABELS)
@@ -163,8 +169,10 @@ class TestBuildCallIndex:
         _add_symbol_node(g, NodeLabel.FUNCTION, "src/b.py", "init", 1, 5)
 
         index = build_name_index(g, _CALLABLE_LABELS)
-        assert "init" in index
-        assert len(index["init"]) == 2
+        assert 'init' in index
+        assert len(index['init']) == 2
+
+
 class TestResolveCallSameFile:
     def test_resolve_call_same_file(self, graph: KnowledgeGraph) -> None:
         index = build_name_index(graph, _CALLABLE_LABELS)
@@ -179,6 +187,8 @@ class TestResolveCallSameFile:
         )
         assert target_id == expected_id
         assert confidence == 1.0
+
+
 class TestResolveCallGlobal:
     def test_resolve_call_global(self, graph: KnowledgeGraph) -> None:
         index = build_name_index(graph, _CALLABLE_LABELS)
@@ -193,6 +203,8 @@ class TestResolveCallGlobal:
         )
         assert target_id == expected_id
         assert confidence == 0.5
+
+
 class TestResolveCallUnresolved:
     def test_resolve_call_unresolved(self, graph: KnowledgeGraph) -> None:
         index = build_name_index(graph, _CALLABLE_LABELS)
@@ -204,6 +216,8 @@ class TestResolveCallUnresolved:
 
         assert target_id is None
         assert confidence == 0.0
+
+
 class TestProcessCallsCreatesRelationships:
     def test_process_calls_creates_relationships(
         self,
@@ -230,6 +244,8 @@ class TestProcessCallsCreatesRelationships:
         assert (validate_id, hash_pw_id) in pairs
         # login -> validate (cross-file call at line 8 inside login)
         assert (login_id, validate_id) in pairs
+
+
 class TestProcessCallsConfidence:
     def test_process_calls_confidence(
         self,
@@ -254,10 +270,10 @@ class TestProcessCallsConfidence:
         assert confidences[(validate_id, hash_pw_id)] == 1.0
         # Cross-file global match: confidence 0.5
         assert confidences[(login_id, validate_id)] == 0.5
+
+
 class TestProcessCallsNoDuplicates:
-    def test_process_calls_no_duplicates(
-        self, graph: KnowledgeGraph
-    ) -> None:
+    def test_process_calls_no_duplicates(self, graph: KnowledgeGraph) -> None:
         # Two identical calls to hash_password inside validate.
         duplicate_parse_data = [
             FileParseData(
@@ -278,6 +294,8 @@ class TestProcessCallsNoDuplicates:
         # Both calls resolve to validate -> hash_password, but only one
         # relationship should exist.
         assert len(calls_rels) == 1
+
+
 class TestResolveMethodCallSelf:
     def test_resolve_method_call_self(self) -> None:
         g = KnowledgeGraph()
@@ -357,6 +375,8 @@ class TestResolveMethodCallSelf:
         )
         assert target_id == expected_id
         assert confidence == 1.0
+
+
 class TestResolveCallImportResolved:
     def test_resolve_call_import_resolved(self) -> None:
         g = KnowledgeGraph()
@@ -397,6 +417,8 @@ class TestResolveCallImportResolved:
         )
         assert target_id == expected_id
         assert confidence == 1.0
+
+
 class TestCallBlocklist:
     def test_blocklist_is_frozenset(self) -> None:
         assert isinstance(_CALL_BLOCKLIST, frozenset)
@@ -456,20 +478,107 @@ class TestCallBlocklist:
 
     def test_non_blocklisted_call_still_resolves(self) -> None:
         g = KnowledgeGraph()
-        _add_file_node(g, "src/main.py")
-        _add_symbol_node(g, NodeLabel.FUNCTION, "src/main.py", "caller", 1, 10)
-        _add_symbol_node(g, NodeLabel.FUNCTION, "src/main.py", "my_helper", 12, 20)
+        _add_file_node(g, 'src/main.py')
+        _add_symbol_node(g, NodeLabel.FUNCTION, 'src/main.py', 'caller', 1, 10)
+        _add_symbol_node(
+            g, NodeLabel.FUNCTION, 'src/main.py', 'my_helper', 12, 20
+        )
 
         parse_data = [
             FileParseData(
-                file_path="src/main.py",
-                language="python",
+                file_path='src/main.py',
+                language='python',
                 parse_result=ParseResult(
-                    calls=[CallInfo(name="my_helper", line=5)],
+                    calls=[CallInfo(name='my_helper', line=5)]
                 ),
-            ),
+            )
         ]
 
         process_calls(parse_data, g)
         calls_rels = g.get_relationships_by_type(RelType.CALLS)
         assert len(calls_rels) == 1
+
+
+class TestArgumentSubEdgeExtraProps:
+    """Argument sub-edge extra_props propagation (Phase 4b)."""
+
+    def test_argument_sub_edge_carries_dispatch_kind(self) -> None:
+        """Arg sub-edge from a thread_executor call carries dispatch_kind."""
+        g = KnowledgeGraph()
+        _add_file_node(g, 'src/runner.py')
+        # runner is the symbol that contains the call expression.
+        _add_symbol_node(
+            g, NodeLabel.FUNCTION, 'src/runner.py', 'runner', 1, 20
+        )
+        # callback is the argument identifier that resolves to a symbol.
+        _add_symbol_node(
+            g, NodeLabel.FUNCTION, 'src/runner.py', 'callback', 22, 35
+        )
+
+        parse_data = [
+            FileParseData(
+                file_path='src/runner.py',
+                language='python',
+                parse_result=ParseResult(
+                    calls=[
+                        CallInfo(
+                            name='submit',
+                            line=10,
+                            arguments=['callback'],
+                            dispatch_kind='thread_executor',
+                        )
+                    ]
+                ),
+            )
+        ]
+
+        edges = process_calls(parse_data, g, collect=True)
+        assert edges is not None
+
+        callback_id = generate_id(
+            NodeLabel.FUNCTION, 'src/runner.py', 'callback'
+        )
+        arg_edges = [e for e in edges if e.target == callback_id]
+        assert arg_edges, 'Expected at least one argument sub-edge to callback'
+        arg_edge = arg_edges[0]
+        assert arg_edge.properties.get('dispatch_kind') == 'thread_executor'
+
+    def test_argument_sub_edge_default_direct_has_no_extras(self) -> None:
+        """Direct-dispatch calls produce arg sub-edges without dispatch_kind."""
+        g = KnowledgeGraph()
+        _add_file_node(g, 'src/runner.py')
+        _add_symbol_node(
+            g, NodeLabel.FUNCTION, 'src/runner.py', 'orchestrate', 1, 20
+        )
+        _add_symbol_node(
+            g, NodeLabel.FUNCTION, 'src/runner.py', 'handler', 22, 35
+        )
+
+        parse_data = [
+            FileParseData(
+                file_path='src/runner.py',
+                language='python',
+                parse_result=ParseResult(
+                    calls=[
+                        CallInfo(
+                            name='apply',
+                            line=10,
+                            arguments=['handler'],
+                            # dispatch_kind defaults to 'direct'
+                        )
+                    ]
+                ),
+            )
+        ]
+
+        edges = process_calls(parse_data, g, collect=True)
+        assert edges is not None
+
+        handler_id = generate_id(
+            NodeLabel.FUNCTION, 'src/runner.py', 'handler'
+        )
+        arg_edges = [e for e in edges if e.target == handler_id]
+        assert arg_edges, 'Expected argument sub-edge to handler'
+        arg_edge = arg_edges[0]
+        # Sparse encoding: direct dispatch is the default, so the key must be absent.
+        assert 'dispatch_kind' not in arg_edge.properties

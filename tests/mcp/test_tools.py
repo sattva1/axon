@@ -18,6 +18,7 @@ from axon.mcp.tools import (
     _group_by_process,
     handle_call_path,
     handle_communities,
+    handle_concurrent_with,
     handle_context,
     handle_coupling,
     handle_cycles,
@@ -92,6 +93,8 @@ def mock_storage_with_relations(mock_storage):
     mock_storage.get_callees.return_value = [_callee]
     mock_storage.get_callers_with_confidence.return_value = [(_caller, 1.0)]
     mock_storage.get_callees_with_confidence.return_value = [(_callee, 0.8)]
+    mock_storage.get_callers_with_metadata.return_value = [(_caller, 1.0, {})]
+    mock_storage.get_callees_with_metadata.return_value = [(_callee, 0.8, {})]
     mock_storage.get_type_refs.return_value = [
         GraphNode(
             id="class:src/models.py:User",
@@ -932,21 +935,45 @@ class TestHandleCallPath:
             ],
         ]
         mock_storage.get_node.side_effect = [
-            GraphNode(id="function:src/auth.py:validate", label=NodeLabel.FUNCTION,
-                      name="validate", file_path="src/auth.py", start_line=10, end_line=30),
-            GraphNode(id="function:src/perms.py:check_perms", label=NodeLabel.FUNCTION,
-                      name="check_perms", file_path="src/perms.py", start_line=25, end_line=40),
+            GraphNode(
+                id='function:src/auth.py:validate',
+                label=NodeLabel.FUNCTION,
+                name='validate',
+                file_path='src/auth.py',
+                start_line=10,
+                end_line=30,
+            ),
+            GraphNode(
+                id='function:src/perms.py:check_perms',
+                label=NodeLabel.FUNCTION,
+                name='check_perms',
+                file_path='src/perms.py',
+                start_line=25,
+                end_line=40,
+            ),
             # get_node calls during path reconstruction
-            GraphNode(id="function:src/auth.py:validate", label=NodeLabel.FUNCTION,
-                      name="validate", file_path="src/auth.py", start_line=10, end_line=30),
-            GraphNode(id="function:src/perms.py:check_perms", label=NodeLabel.FUNCTION,
-                      name="check_perms", file_path="src/perms.py", start_line=25, end_line=40),
+            GraphNode(
+                id='function:src/auth.py:validate',
+                label=NodeLabel.FUNCTION,
+                name='validate',
+                file_path='src/auth.py',
+                start_line=10,
+                end_line=30,
+            ),
+            GraphNode(
+                id='function:src/perms.py:check_perms',
+                label=NodeLabel.FUNCTION,
+                name='check_perms',
+                file_path='src/perms.py',
+                start_line=25,
+                end_line=40,
+            ),
         ]
-        result = handle_call_path(mock_storage, "validate", "check_perms")
-        assert "validate" in result
-        assert "check_perms" in result
-        assert "1 hop" in result
-        assert "→" in result
+        result = handle_call_path(mock_storage, 'validate', 'check_perms')
+        assert 'validate' in result
+        assert 'check_perms' in result
+        assert '1 hop' in result
+        assert '->' in result
 
     def test_no_path_found(self, mock_storage):
         mock_storage.get_callees.return_value = []
@@ -1484,3 +1511,355 @@ class TestDottedPathIntegration:
         mock_storage.exact_name_search.assert_any_call('Foo.bar', limit=1)
         # Path not found (no call edge) but resolution succeeded.
         assert 'not found' in result.lower() or 'bar' in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 4b tests
+# ---------------------------------------------------------------------------
+
+
+class TestHandleImpactPropagate:
+    """handle_impact with propagate_through parameter."""
+
+    def test_propagate_through_limits_traversal(self, mock_storage) -> None:
+        """Only edges with matching dispatch_kind are traversed."""
+        _direct = GraphNode(
+            id='function:src/a.py:direct_caller',
+            label=NodeLabel.FUNCTION,
+            name='direct_caller',
+            file_path='src/a.py',
+            start_line=1,
+            end_line=10,
+        )
+        _threaded = GraphNode(
+            id='function:src/b.py:thread_caller',
+            label=NodeLabel.FUNCTION,
+            name='thread_caller',
+            file_path='src/b.py',
+            start_line=1,
+            end_line=10,
+        )
+        # get_callers_with_metadata returns both callers; direct_caller has
+        # dispatch_kind "direct" and thread_caller has "thread_executor".
+        mock_storage.get_callers_with_metadata.return_value = [
+            (_direct, 1.0, {'dispatch_kind': 'direct'}),
+            (_threaded, 1.0, {'dispatch_kind': 'thread_executor'}),
+        ]
+        result = handle_impact(
+            mock_storage, 'validate', propagate_through=['direct']
+        )
+        assert 'direct_caller' in result
+        assert 'thread_caller' not in result
+
+    def test_propagate_through_none_preserves_legacy_path(
+        self, mock_storage
+    ) -> None:
+        """propagate_through=None uses traverse_with_depth (legacy path)."""
+        _login = GraphNode(
+            id='function:src/api.py:login',
+            label=NodeLabel.FUNCTION,
+            name='login',
+            file_path='src/api.py',
+            start_line=5,
+            end_line=20,
+        )
+        mock_storage.traverse_with_depth.return_value = [(_login, 1)]
+        mock_storage.get_callers_with_confidence.return_value = [(_login, 1.0)]
+
+        result = handle_impact(
+            mock_storage, 'validate', propagate_through=None
+        )
+
+        mock_storage.traverse_with_depth.assert_called_once()
+        assert 'login' in result
+
+    def test_propagate_through_empty_list_no_edges_followed(
+        self, mock_storage
+    ) -> None:
+        """propagate_through=[] means nothing is followed."""
+        mock_storage.get_callers_with_metadata.return_value = [
+            (
+                GraphNode(
+                    id='function:src/a.py:some_caller',
+                    label=NodeLabel.FUNCTION,
+                    name='some_caller',
+                    file_path='src/a.py',
+                    start_line=1,
+                    end_line=5,
+                ),
+                1.0,
+                {'dispatch_kind': 'direct'},
+            )
+        ]
+        result = handle_impact(mock_storage, 'validate', propagate_through=[])
+        assert 'No upstream callers' in result or 'propagate_through' in result
+
+
+class TestHandleConcurrentWith:
+    """handle_concurrent_with tests."""
+
+    def test_reaches_thread_executor_callback(self, mock_storage) -> None:
+        """Thread-executor callees are reported under [thread_executor]."""
+        _callback = GraphNode(
+            id='function:src/tasks.py:callback',
+            label=NodeLabel.FUNCTION,
+            name='callback',
+            file_path='src/tasks.py',
+            start_line=10,
+            end_line=20,
+        )
+        mock_storage.get_callees_with_metadata.return_value = [
+            (_callback, 1.0, {'dispatch_kind': 'thread_executor'})
+        ]
+        result = handle_concurrent_with(mock_storage, 'validate')
+        assert 'callback' in result
+        assert 'thread_executor' in result
+
+    def test_ignores_direct_edges(self, mock_storage) -> None:
+        """Callees connected by direct edges are not reported."""
+        _plain = GraphNode(
+            id='function:src/utils.py:helper',
+            label=NodeLabel.FUNCTION,
+            name='helper',
+            file_path='src/utils.py',
+            start_line=1,
+            end_line=5,
+        )
+        mock_storage.get_callees_with_metadata.return_value = [
+            (_plain, 1.0, {})
+        ]
+        result = handle_concurrent_with(mock_storage, 'validate')
+        assert 'No concurrently-dispatched callees found' in result
+
+    def test_depth_bounded(self, mock_storage) -> None:
+        """depth=1 limits traversal to direct neighbours only."""
+        _callback = GraphNode(
+            id='function:src/tasks.py:cb',
+            label=NodeLabel.FUNCTION,
+            name='cb',
+            file_path='src/tasks.py',
+            start_line=5,
+            end_line=10,
+        )
+        # First call returns one async callee; subsequent calls return
+        # nothing, ensuring we don't recurse.
+        mock_storage.get_callees_with_metadata.side_effect = [
+            [(_callback, 1.0, {'dispatch_kind': 'detached_task'})],
+            [],
+        ]
+        result = handle_concurrent_with(mock_storage, 'validate', depth=1)
+        assert 'cb' in result
+
+    def test_symbol_not_found(self, mock_storage) -> None:
+        """Returns appropriate message for unknown symbol."""
+        mock_storage.exact_name_search.return_value = []
+        mock_storage.fts_search.return_value = []
+        result = handle_concurrent_with(mock_storage, 'nonexistent_xyz')
+        assert 'not found' in result.lower()
+
+    def test_mixed_dispatch_kinds_grouped(self, mock_storage) -> None:
+        """Multiple dispatch_kinds produce separate grouped sections."""
+        _cb1 = GraphNode(
+            id='function:src/a.py:thread_cb',
+            label=NodeLabel.FUNCTION,
+            name='thread_cb',
+            file_path='src/a.py',
+            start_line=1,
+            end_line=5,
+        )
+        _cb2 = GraphNode(
+            id='function:src/b.py:detached_cb',
+            label=NodeLabel.FUNCTION,
+            name='detached_cb',
+            file_path='src/b.py',
+            start_line=1,
+            end_line=5,
+        )
+        mock_storage.get_callees_with_metadata.return_value = [
+            (_cb1, 1.0, {'dispatch_kind': 'thread_executor'}),
+            (_cb2, 1.0, {'dispatch_kind': 'detached_task'}),
+        ]
+        result = handle_concurrent_with(mock_storage, 'validate')
+        assert 'thread_executor' in result
+        assert 'detached_task' in result
+        assert 'thread_cb' in result
+        assert 'detached_cb' in result
+
+
+class TestHandleContextDispatchTags:
+    """handle_context display enrichment with dispatch / metadata tags."""
+
+    def test_displays_dispatch_kind_for_non_direct_callees(
+        self, mock_storage
+    ) -> None:
+        """Callee with dispatch_kind='thread_executor' shows [thread_executor] tag."""
+        _callee = GraphNode(
+            id='function:src/tasks.py:worker',
+            label=NodeLabel.FUNCTION,
+            name='worker',
+            file_path='src/tasks.py',
+            start_line=5,
+            end_line=15,
+        )
+        mock_storage.get_callers_with_metadata.return_value = []
+        mock_storage.get_callees_with_metadata.return_value = [
+            (_callee, 1.0, {'dispatch_kind': 'thread_executor'})
+        ]
+        result = handle_context(mock_storage, 'validate')
+        assert '[thread_executor]' in result
+
+    def test_omits_dispatch_kind_for_direct_edges(self, mock_storage) -> None:
+        """Callees with default dispatch produce no extra dispatch tag."""
+        _callee = GraphNode(
+            id='function:src/utils.py:helper',
+            label=NodeLabel.FUNCTION,
+            name='helper',
+            file_path='src/utils.py',
+            start_line=1,
+            end_line=5,
+        )
+        mock_storage.get_callers_with_metadata.return_value = []
+        mock_storage.get_callees_with_metadata.return_value = [
+            (_callee, 1.0, {})
+        ]
+        result = handle_context(mock_storage, 'validate')
+        # No dispatch tag should appear for direct (default) edges.
+        assert '[direct]' not in result
+        assert '[thread_executor]' not in result
+
+    def test_displays_awaited_and_in_try(self, mock_storage) -> None:
+        """Callee with awaited=True and in_try=True shows both tags."""
+        _callee = GraphNode(
+            id='function:src/io.py:fetch',
+            label=NodeLabel.FUNCTION,
+            name='fetch',
+            file_path='src/io.py',
+            start_line=1,
+            end_line=10,
+        )
+        mock_storage.get_callers_with_metadata.return_value = []
+        mock_storage.get_callees_with_metadata.return_value = [
+            (_callee, 1.0, {'awaited': True, 'in_try': True})
+        ]
+        result = handle_context(mock_storage, 'validate')
+        assert '[awaited]' in result
+        assert '[in_try]' in result
+
+    def test_displays_return_consumption_for_callers(
+        self, mock_storage
+    ) -> None:
+        """Caller with return_consumption='passed_through' shows tag."""
+        _caller = GraphNode(
+            id='function:src/pipeline.py:pipe',
+            label=NodeLabel.FUNCTION,
+            name='pipe',
+            file_path='src/pipeline.py',
+            start_line=1,
+            end_line=10,
+        )
+        mock_storage.get_callers_with_metadata.return_value = [
+            (_caller, 1.0, {'return_consumption': 'passed_through'})
+        ]
+        mock_storage.get_callees_with_metadata.return_value = []
+        result = handle_context(mock_storage, 'validate')
+        assert 'passed_through' in result
+
+    def test_omits_return_consumption_for_stored(self, mock_storage) -> None:
+        """Default return_consumption='stored' produces no tag."""
+        _caller = GraphNode(
+            id='function:src/a.py:caller',
+            label=NodeLabel.FUNCTION,
+            name='caller',
+            file_path='src/a.py',
+            start_line=1,
+            end_line=10,
+        )
+        mock_storage.get_callers_with_metadata.return_value = [
+            (_caller, 1.0, {'return_consumption': 'ignored'})
+        ]
+        mock_storage.get_callees_with_metadata.return_value = []
+        result = handle_context(mock_storage, 'validate')
+        assert '[return: ignored]' not in result
+
+
+class TestHandleCallPathDispatchAnnotation:
+    """handle_call_path hop dispatch annotation."""
+
+    def test_hop_dispatch_annotation(self, mock_storage) -> None:
+        """Hop with dispatch_kind='detached_task' shows annotation on the hop line."""
+        _mid = GraphNode(
+            id='function:src/dispatch.py:dispatch',
+            label=NodeLabel.FUNCTION,
+            name='dispatch',
+            file_path='src/dispatch.py',
+            start_line=10,
+            end_line=20,
+        )
+        _target = GraphNode(
+            id='function:src/worker.py:run',
+            label=NodeLabel.FUNCTION,
+            name='run',
+            file_path='src/worker.py',
+            start_line=5,
+            end_line=15,
+        )
+        mock_storage.fts_search.side_effect = [
+            [
+                SearchResult(
+                    node_id='function:src/auth.py:validate',
+                    score=1.0,
+                    node_name='validate',
+                )
+            ],
+            [
+                SearchResult(
+                    node_id='function:src/worker.py:run',
+                    score=1.0,
+                    node_name='run',
+                )
+            ],
+        ]
+        mock_storage.get_node.side_effect = [
+            GraphNode(
+                id='function:src/auth.py:validate',
+                label=NodeLabel.FUNCTION,
+                name='validate',
+                file_path='src/auth.py',
+                start_line=10,
+                end_line=30,
+            ),
+            GraphNode(
+                id='function:src/worker.py:run',
+                label=NodeLabel.FUNCTION,
+                name='run',
+                file_path='src/worker.py',
+                start_line=5,
+                end_line=15,
+            ),
+            # During path reconstruction
+            GraphNode(
+                id='function:src/auth.py:validate',
+                label=NodeLabel.FUNCTION,
+                name='validate',
+                file_path='src/auth.py',
+                start_line=10,
+                end_line=30,
+            ),
+            _mid,
+            _target,
+        ]
+        # BFS: validate -> dispatch -> run
+        mock_storage.get_callees.side_effect = [
+            [_mid],  # callees of validate
+            [_target],  # callees of dispatch
+            [],
+        ]
+        # Metadata: dispatch-to-run edge has detached_task
+        mock_storage.get_callees_with_metadata.side_effect = [
+            [],  # validate -> dispatch: no metadata
+            [
+                (_target, 1.0, {'dispatch_kind': 'detached_task'})
+            ],  # dispatch -> run
+        ]
+        result = handle_call_path(mock_storage, 'validate', 'run')
+        assert '[detached_task]' in result

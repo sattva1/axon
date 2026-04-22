@@ -30,7 +30,6 @@ EMBEDDING_DIMENSIONS: int = 384
 """Number of dimensions expected for all embedding vectors."""
 
 
-
 @dataclass
 class NodeEmbedding:
     """An embedding vector associated with a graph node."""
@@ -113,7 +112,26 @@ class StorageBackend(Protocol):
         """Return ``(node, confidence)`` pairs for all nodes called by *node_id*."""
         ...
 
-    def traverse(self, start_id: str, depth: int, direction: str = "callers") -> list[GraphNode]:
+    def get_callers_with_metadata(
+        self, node_id: str
+    ) -> list[tuple[GraphNode, float, dict[str, Any]]]:
+        """Return (caller, confidence, parsed_metadata) for each incoming CALLS edge.
+
+        ``parsed_metadata`` is the deserialised ``metadata_json`` column (empty
+        dict when the edge carries no extra props). Callers who only need node
+        and confidence should use ``get_callers_with_confidence``.
+        """
+        ...
+
+    def get_callees_with_metadata(
+        self, node_id: str
+    ) -> list[tuple[GraphNode, float, dict[str, Any]]]:
+        """Return (callee, confidence, parsed_metadata) for each outgoing CALLS edge."""
+        ...
+
+    def traverse(
+        self, start_id: str, depth: int, direction: str = 'callers'
+    ) -> list[GraphNode]:
         """Breadth-first traversal up to *depth* hops from *start_id*.
 
         Args:

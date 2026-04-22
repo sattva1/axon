@@ -180,9 +180,9 @@ def _resolve_self_method(
                 fallback = nid
     return fallback
 
+
 def _build_import_cache(
-    file_path: str,
-    graph: KnowledgeGraph,
+    file_path: str, graph: KnowledgeGraph
 ) -> dict[str, set[str]]:
     """Build {symbol_name → set of imported file_paths} for a file.
 
@@ -230,6 +230,7 @@ def _resolve_via_imports(
             return nid
 
     return None
+
 
 def _common_prefix_len(a: str, b: str) -> int:
     """Return the length of the common directory prefix between two paths."""
@@ -400,7 +401,13 @@ def resolve_file_calls(
                 import_cache=import_cache,
             )
             if arg_id is not None:
-                edge = _make_edge(source_id, arg_id, arg_conf * 0.8, seen)
+                edge = _make_edge(
+                    source_id,
+                    arg_id,
+                    arg_conf * 0.8,
+                    seen,
+                    extra=call.extra_props(),
+                )
                 if edge is not None:
                     edges.append(edge)
 

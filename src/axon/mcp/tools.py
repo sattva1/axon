@@ -251,23 +251,64 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
         lines.append("Status: DEAD CODE (unreachable)")
 
     try:
-        callers_raw = storage.get_callers_with_confidence(node.id)
+        callers_meta = storage.get_callers_with_metadata(node.id)
+        callers_raw = None
     except (AttributeError, TypeError):
-        callers_raw = [(c, 1.0) for c in storage.get_callers(node.id)]
+        callers_meta = None
+        try:
+            callers_raw = storage.get_callers_with_confidence(node.id)
+        except (AttributeError, TypeError):
+            callers_raw = [(c, 1.0) for c in storage.get_callers(node.id)]
 
-    if callers_raw:
-        lines.append(f"\nCallers ({len(callers_raw)}):")
+    if callers_meta is not None:
+        if callers_meta:
+            lines.append(f'\nCallers ({len(callers_meta)}):')
+        for c, conf, meta in callers_meta:
+            tag = _confidence_tag(conf)
+            dispatch = meta.get('dispatch_kind', 'direct')
+            extra_tags = ''
+            if dispatch != 'direct':
+                extra_tags += f'  [{dispatch}]'
+            ret_consumption = meta.get('return_consumption')
+            if ret_consumption and ret_consumption != 'ignored':
+                extra_tags += f'  [return: {ret_consumption}]'
+            lines.append(
+                f'  -> {c.name}  {c.file_path}:{c.start_line}{extra_tags}{tag}'
+            )
+    elif callers_raw:
+        lines.append(f'\nCallers ({len(callers_raw)}):')
         for c, conf in callers_raw:
             tag = _confidence_tag(conf)
             lines.append(f"  -> {c.name}  {c.file_path}:{c.start_line}{tag}")
 
     try:
-        callees_raw = storage.get_callees_with_confidence(node.id)
+        callees_meta = storage.get_callees_with_metadata(node.id)
+        callees_raw = None
     except (AttributeError, TypeError):
-        callees_raw = [(c, 1.0) for c in storage.get_callees(node.id)]
+        callees_meta = None
+        try:
+            callees_raw = storage.get_callees_with_confidence(node.id)
+        except (AttributeError, TypeError):
+            callees_raw = [(c, 1.0) for c in storage.get_callees(node.id)]
 
-    if callees_raw:
-        lines.append(f"\nCallees ({len(callees_raw)}):")
+    if callees_meta is not None:
+        if callees_meta:
+            lines.append(f'\nCallees ({len(callees_meta)}):')
+        for c, conf, meta in callees_meta:
+            tag = _confidence_tag(conf)
+            dispatch = meta.get('dispatch_kind', 'direct')
+            extra_tags = ''
+            if dispatch != 'direct':
+                extra_tags += f'  [{dispatch}]'
+            if meta.get('awaited'):
+                extra_tags += '  [awaited]'
+            if meta.get('in_try'):
+                extra_tags += '  [in_try]'
+            lines.append(
+                f'  -> {c.name}  {c.file_path}:{c.start_line}{extra_tags}{tag}'
+            )
+    elif callees_raw:
+        lines.append(f'\nCallees ({len(callees_raw)}):')
         for c, conf in callees_raw:
             tag = _confidence_tag(conf)
             lines.append(f"  -> {c.name}  {c.file_path}:{c.start_line}{tag}")
@@ -303,25 +344,121 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
         ) or []
         if import_rows:
             importers = [r[0] for r in import_rows if r[0]]
-            lines.append(f"\nImported by ({len(importers)}):")
+            lines.append(f'\nImported by ({len(importers)}):')
             for imp in importers:
-                lines.append(f"  -> {imp}")
+                lines.append(f'  -> {imp}')
 
-    lines.append("")
-    lines.append("Next: Use impact() if planning changes to this symbol.")
-    return "\n".join(lines)
+    lines.append('')
+    lines.append('Next: Use impact() if planning changes to this symbol.')
+    return '\n'.join(lines)
+
+
+_DISPATCH_KINDS: frozenset[str] = frozenset(
+    {
+        'direct',
+        'thread_executor',
+        'process_executor',
+        'detached_task',
+        'enqueued_job',
+        'callback_registry',
+    }
+)
+
+_ASYNC_DISPATCH_KINDS: frozenset[str] = frozenset(
+    {
+        'thread_executor',
+        'process_executor',
+        'detached_task',
+        'enqueued_job',
+        'callback_registry',
+    }
+)
 
 _DEPTH_LABELS: dict[int, str] = {
-    1: "Direct callers (will break)",
-    2: "Indirect (may break)",
+    1: 'Direct callers (will break)',
+    2: 'Indirect (may break)',
 }
 
 
-def handle_impact(storage: StorageBackend, symbol: str, depth: int = 3) -> str:
+def _bfs_with_dispatch_filter(
+    storage: StorageBackend,
+    start_id: str,
+    depth: int,
+    direction: str,
+    dispatch_filter: set[str] | None,
+) -> list[tuple[Any, int, str]]:
+    """BFS through CALLS edges, optionally filtered by edge dispatch_kind.
+
+    When ``dispatch_filter`` is None, follow every edge (equivalent to
+    traversal with no filter). When set, follow an edge only when the
+    edge's ``metadata_json.dispatch_kind`` is in the filter set. The edge's
+    effective dispatch_kind defaults to ``"direct"`` when the metadata has
+    no explicit key (sparse-encoding default).
+
+    Args:
+        storage: The storage backend.
+        start_id: Node ID to start BFS from.
+        depth: Maximum traversal depth (clamped to MAX_TRAVERSE_DEPTH).
+        direction: ``"callers"`` or ``"callees"``.
+        dispatch_filter: Set of dispatch_kind values to follow, or None to
+            follow all edges.
+
+    Returns:
+        List of (node, hop_depth, edge_dispatch_kind) tuples. The third
+        element is the dispatch_kind of the edge by which the node was
+        first reached.
+    """
+    depth = max(1, min(depth, MAX_TRAVERSE_DEPTH))
+    visited: set[str] = set()
+    result: list[tuple[Any, int, str]] = []
+    queue: deque[tuple[str, int]] = deque([(start_id, 0)])
+    visited.add(start_id)
+
+    while queue:
+        current_id, current_depth = queue.popleft()
+        if current_depth >= depth:
+            continue
+
+        try:
+            edges = (
+                storage.get_callers_with_metadata(current_id)
+                if direction == 'callers'
+                else storage.get_callees_with_metadata(current_id)
+            )
+        except (AttributeError, TypeError):
+            edges = []
+
+        for node, _confidence, meta in edges:
+            if node.id in visited:
+                continue
+            edge_kind = meta.get('dispatch_kind', 'direct')
+            if (
+                dispatch_filter is not None
+                and edge_kind not in dispatch_filter
+            ):
+                continue
+            visited.add(node.id)
+            result.append((node, current_depth + 1, edge_kind))
+            queue.append((node.id, current_depth + 1))
+
+    return result
+
+
+def handle_impact(
+    storage: StorageBackend,
+    symbol: str,
+    depth: int = 3,
+    propagate_through: list[str] | None = None,
+) -> str:
     """Analyse the blast radius of changing a symbol, grouped by hop depth.
 
     Uses BFS traversal through CALLS edges to find all affected symbols
     up to the specified depth, then groups results by distance.
+
+    When ``propagate_through`` is set, only CALLS edges whose
+    ``dispatch_kind`` is in that set are followed. Unknown kinds are
+    accepted silently (logged at DEBUG level) but have no effect if they
+    match no edges.
 
     Args:
         storage: The storage backend.
@@ -332,6 +469,8 @@ def handle_impact(storage: StorageBackend, symbol: str, depth: int = 3) -> str:
             is chosen by score (source files over tests) then lexicographic
             node ID.
         depth: Maximum traversal depth (default 3).
+        propagate_through: Optional list of dispatch_kind values to follow.
+            When None, all edges are traversed (default behavior).
 
     Returns:
         Formatted impact analysis with depth-grouped sections.
@@ -349,42 +488,158 @@ def handle_impact(storage: StorageBackend, symbol: str, depth: int = 3) -> str:
     if not start_node:
         return f"Symbol '{symbol}' not found."
 
+    label_display = start_node.label.value.title()
+
+    if propagate_through is not None:
+        unknown = set(propagate_through) - _DISPATCH_KINDS
+        if unknown:
+            logger.debug(
+                'handle_impact: unknown dispatch_kind values in propagate_through: %s',
+                unknown,
+            )
+        dispatch_filter = set(propagate_through)
+        reached = _bfs_with_dispatch_filter(
+            storage, start_node.id, depth, 'callers', dispatch_filter
+        )
+        if not reached:
+            return (
+                f'No upstream callers via propagate_through='
+                f"{sorted(dispatch_filter)} for '{symbol}'."
+            )
+
+        by_depth: dict[int, list] = {}
+        for node, d, _kind in reached:
+            by_depth.setdefault(d, []).append(node)
+
+        total = len(reached)
+        lines = [f'Impact analysis for: {start_node.name} ({label_display})']
+        lines.append(
+            f'Depth: {depth} | Total: {total} symbols '
+            f'| filter: {sorted(dispatch_filter)}'
+        )
+
+        counter = 1
+        for d in sorted(by_depth.keys()):
+            depth_label = _DEPTH_LABELS.get(d, 'Transitive (review)')
+            lines.append(f'\nDepth {d} - {depth_label}:')
+            for node in by_depth[d]:
+                label = node.label.value.title() if node.label else 'Unknown'
+                lines.append(
+                    f'  {counter}. {node.name} ({label}) -- '
+                    f'{node.file_path}:{node.start_line}'
+                )
+                counter += 1
+
+        lines.append('')
+        lines.append('Tip: Review each affected symbol before making changes.')
+        return '\n'.join(lines)
+
     affected_with_depth = storage.traverse_with_depth(
-        start_node.id, depth, direction="callers"
+        start_node.id, depth, direction='callers'
     )
     if not affected_with_depth:
         return f"No upstream callers found for '{symbol}'."
 
-    by_depth: dict[int, list] = {}
+    by_depth_plain: dict[int, list] = {}
     for node, d in affected_with_depth:
-        by_depth.setdefault(d, []).append(node)
+        by_depth_plain.setdefault(d, []).append(node)
 
     total = len(affected_with_depth)
-    label_display = start_node.label.value.title()
-    lines = [f"Impact analysis for: {start_node.name} ({label_display})"]
-    lines.append(f"Depth: {depth} | Total: {total} symbols")
+    lines = [f'Impact analysis for: {start_node.name} ({label_display})']
+    lines.append(f'Depth: {depth} | Total: {total} symbols')
 
     conf_lookup = {
         node.id: conf for node, conf in storage.get_callers_with_confidence(start_node.id)
     }
 
     counter = 1
-    for d in sorted(by_depth.keys()):
-        depth_label = _DEPTH_LABELS.get(d, "Transitive (review)")
-        lines.append(f"\nDepth {d} — {depth_label}:")
-        for node in by_depth[d]:
-            label = node.label.value.title() if node.label else "Unknown"
+    for d in sorted(by_depth_plain.keys()):
+        depth_label = _DEPTH_LABELS.get(d, 'Transitive (review)')
+        lines.append(f'\nDepth {d} - {depth_label}:')
+        for node in by_depth_plain[d]:
+            label = node.label.value.title() if node.label else 'Unknown'
             conf = conf_lookup.get(node.id)
-            tag = f"  (confidence: {conf:.2f})" if conf is not None else ""
+            tag = f'  (confidence: {conf:.2f})' if conf is not None else ''
             lines.append(
-                f"  {counter}. {node.name} ({label}) -- "
-                f"{node.file_path}:{node.start_line}{tag}"
+                f'  {counter}. {node.name} ({label}) -- '
+                f'{node.file_path}:{node.start_line}{tag}'
             )
             counter += 1
 
     lines.append("")
     lines.append("Tip: Review each affected symbol before making changes.")
     return "\n".join(lines)
+
+
+def handle_concurrent_with(
+    storage: StorageBackend, symbol: str, depth: int = 3
+) -> str:
+    """Find symbols that may run concurrently with the given symbol.
+
+    Traces outgoing CALLS edges whose dispatch_kind is any non-direct value
+    (thread_executor, process_executor, detached_task, enqueued_job,
+    callback_registry) and reports the set of reachable symbols grouped by
+    dispatch kind.
+
+    Args:
+        storage: The storage backend.
+        symbol: Plain name or dotted path. Resolution follows the same
+            dotted-path rules as handle_context and handle_impact.
+        depth: Maximum traversal depth (default 3).
+
+    Returns:
+        Formatted list of concurrent-reachable symbols grouped by dispatch kind.
+    """
+    if not symbol or not symbol.strip():
+        return "Error: 'symbol' parameter is required and cannot be empty."
+
+    depth = max(1, min(depth, MAX_TRAVERSE_DEPTH))
+
+    results = _resolve_symbol(storage, symbol)
+    if not results:
+        return f"Symbol '{symbol}' not found."
+
+    start_node = storage.get_node(results[0].node_id)
+    if not start_node:
+        return f"Symbol '{symbol}' not found."
+
+    reached = _bfs_with_dispatch_filter(
+        storage,
+        start_node.id,
+        depth,
+        'callees',
+        dispatch_filter=set(_ASYNC_DISPATCH_KINDS),
+    )
+
+    if not reached:
+        label_display = start_node.label.value.title()
+        return (
+            f'No concurrently-dispatched callees found for '
+            f"'{start_node.name}' ({label_display}) within depth {depth}."
+        )
+
+    by_kind: dict[str, list[tuple[Any, int]]] = {}
+    for node, hop_depth, edge_kind in reached:
+        by_kind.setdefault(edge_kind, []).append((node, hop_depth))
+
+    label_display = start_node.label.value.title()
+    lines = [
+        f'Concurrent callees of: {start_node.name} ({label_display})',
+        f'Depth: {depth} | Total: {len(reached)} symbols',
+    ]
+
+    for kind in sorted(by_kind.keys()):
+        nodes_at_kind = sorted(by_kind[kind], key=lambda t: t[0].name)
+        lines.append(f'\n[{kind}] ({len(nodes_at_kind)} symbol(s)):')
+        for node, hop_depth in nodes_at_kind:
+            node_label = node.label.value.title() if node.label else 'Unknown'
+            lines.append(
+                f'  -> {node.name} ({node_label})'
+                f'  {node.file_path}:{node.start_line}'
+                f'  (depth {hop_depth})'
+            )
+
+    return '\n'.join(lines)
 
 
 def handle_dead_code(storage: StorageBackend) -> str:
@@ -699,21 +954,48 @@ def handle_call_path(
         node_id = parent.get(node_id)
     path_ids.reverse()
 
+    # Build an edge-metadata index for the hops in this path keyed by
+    # (source_id, target_id) so we can annotate each line with dispatch_kind.
+    edge_meta_index: dict[tuple[str, str], dict[str, Any]] = {}
+    for prev_id, curr_id in zip(path_ids, path_ids[1:]):
+        try:
+            callees_meta = storage.get_callees_with_metadata(prev_id)
+            for callee_node, _conf, meta in callees_meta:
+                if callee_node.id == curr_id:
+                    edge_meta_index[(prev_id, curr_id)] = meta
+                    break
+        except (AttributeError, TypeError):
+            pass
+
     hop_count = len(path_ids) - 1
     path_names = []
     lines = []
     for i, nid in enumerate(path_ids, 1):
         node = storage.get_node(nid)
+        dispatch_annotation = ''
+        if i > 1:
+            prev_nid = path_ids[i - 2]
+            meta = edge_meta_index.get((prev_nid, nid), {})
+            kind = meta.get('dispatch_kind', 'direct')
+            if kind != 'direct':
+                dispatch_annotation = f'  [{kind}]'
         if node:
-            label = node.label.value.title() if node.label else "Unknown"
+            label = node.label.value.title() if node.label else 'Unknown'
             path_names.append(node.name)
-            lines.append(f"  {i}. {node.name} ({label}) — {node.file_path}:{node.start_line}")
+            lines.append(
+                f'  {i}. {node.name} ({label})'
+                f'{dispatch_annotation}'
+                f' - {node.file_path}:{node.start_line}'
+            )
         else:
             path_names.append(nid)
-            lines.append(f"  {i}. {nid}")
+            lines.append(f'  {i}. {nid}{dispatch_annotation}')
 
-    header = f"Call path: {' → '.join(path_names)} ({hop_count} hop{'s' if hop_count != 1 else ''})"
-    return header + "\n\n" + "\n".join(lines)
+    header = (
+        f'Call path: {" -> ".join(path_names)}'
+        f' ({hop_count} hop{"s" if hop_count != 1 else ""})'
+    )
+    return header + '\n\n' + '\n'.join(lines)
 
 
 def handle_communities(

@@ -1,7 +1,8 @@
 """Tests for _make_edge extra_props propagation in call resolution.
 
 Primary CALLS edges carry Phase-4a metadata from CallInfo.extra_props().
-Sub-edges (argument/receiver callbacks) do NOT carry extra metadata.
+Argument sub-edges propagate the outer call's extra_props (Phase 4b).
+Receiver sub-edges (caller -> variable) do NOT carry extra metadata.
 """
 
 from __future__ import annotations
@@ -75,7 +76,7 @@ def _build_minimal_graph() -> KnowledgeGraph:
 
 
 class TestResolveFileCallsPrimaryEdgeExtras:
-    """Primary CALLS edges carry Phase-4a metadata; sub-edges do not."""
+    """Primary CALLS edges carry Phase-4a metadata; arg sub-edges propagate it."""
 
     def test_primary_edge_carries_dispatch_kind_and_in_try(self) -> None:
         """Primary edge properties include dispatch_kind and in_try from CallInfo."""
@@ -106,11 +107,9 @@ class TestResolveFileCallsPrimaryEdgeExtras:
         assert props.get('dispatch_kind') == 'detached_task'
         assert props.get('in_try') is True
 
-    def test_sub_edges_do_not_carry_extra(self) -> None:
-        """Argument callback sub-edges do not inherit extra_props."""
+    def _build_graph_with_cb(self) -> tuple[KnowledgeGraph, str]:
+        """Return a graph with caller, worker, and cb symbols; cb node id."""
         graph = _build_minimal_graph()
-
-        # Add a second symbol 'cb' so the argument callback resolves.
         file_id = generate_id(NodeLabel.FILE, 'src/tasks.py')
         cb_id = generate_id(NodeLabel.FUNCTION, 'src/tasks.py', 'cb')
         graph.add_node(
@@ -131,6 +130,11 @@ class TestResolveFileCallsPrimaryEdgeExtras:
                 target=cb_id,
             )
         )
+        return graph, cb_id
+
+    def test_argument_sub_edges_propagate_dispatch_kind(self) -> None:
+        """Arg sub-edge carries the outer call's dispatch_kind in properties."""
+        graph, cb_id = self._build_graph_with_cb()
 
         call = CallInfo(
             name='worker',
@@ -156,7 +160,47 @@ class TestResolveFileCallsPrimaryEdgeExtras:
         ]
         assert sub_edges, 'expected sub-edge for callback argument'
         sub_props = sub_edges[0].properties
-        # Sub-edges only carry confidence, not dispatch_kind / in_try.
-        assert 'dispatch_kind' not in sub_props
-        assert 'in_try' not in sub_props
-        assert 'confidence' in sub_props
+        assert sub_props.get('dispatch_kind') == 'detached_task'
+
+    def test_receiver_sub_edges_remain_bare(self) -> None:
+        """Receiver sub-edge (caller to variable) does not carry extra_props."""
+        graph, cb_id = self._build_graph_with_cb()
+
+        # 'worker' is called as a receiver expression; 'cb' is passed as arg.
+        # The receiver sub-edge is caller -> worker (the variable node if
+        # primary resolution fails). Use a name that won't resolve so the
+        # receiver edge is the only sub-edge produced.
+        call = CallInfo(
+            name='unknown_pool',
+            line=5,
+            arguments=['cb'],
+            dispatch_kind='detached_task',
+            in_try=True,
+        )
+        parse_data = [
+            FileParseData(
+                file_path='src/tasks.py',
+                language='python',
+                parse_result=ParseResult(calls=[call]),
+            )
+        ]
+
+        edges = process_calls(parse_data, graph, collect=True)
+        assert edges is not None
+
+        caller_id = generate_id(NodeLabel.FUNCTION, 'src/tasks.py', 'run')
+        # The argument sub-edge to cb should carry dispatch_kind (Phase 4b).
+        arg_sub_edges = [
+            e for e in edges if e.source == caller_id and e.target == cb_id
+        ]
+        assert arg_sub_edges, 'expected arg sub-edge for callback argument'
+        # Receiver/primary edge to unknown_pool does NOT exist in graph.
+        other_targets = {
+            e.target
+            for e in edges
+            if e.source == caller_id and e.target != cb_id
+        }
+        # No stray edges carrying extra props to unresolved receiver.
+        for edge in edges:
+            if edge.source == caller_id and edge.target in other_targets:
+                assert 'dispatch_kind' not in edge.properties

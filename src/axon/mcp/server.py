@@ -37,6 +37,7 @@ from axon.mcp.tools import (
     _new_ref_id,
     handle_call_path,
     handle_communities,
+    handle_concurrent_with,
     handle_context,
     handle_coupling,
     handle_cycles,
@@ -125,8 +126,6 @@ async def _with_readonly_storage(fn: Callable[[KuzuBackend], str]) -> str:
 
     Used for user-submitted Cypher. Enforces read-only at the DB layer,
     regardless of whether a read-write backend is injected via set_storage().
-
-
 
     """
     def _run() -> str:
@@ -220,6 +219,24 @@ TOOLS: list[Tool] = [
                     'default': 3,
                     'minimum': 1,
                     'maximum': MAX_TRAVERSE_DEPTH,
+                },
+                'propagate_through': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'string',
+                        'enum': [
+                            'direct',
+                            'thread_executor',
+                            'process_executor',
+                            'detached_task',
+                            'enqueued_job',
+                            'callback_registry',
+                        ],
+                    },
+                    'description': (
+                        'Optional. When set, only traverse CALLS edges whose '
+                        'dispatch_kind is in this set. Default: traverse all edges.'
+                    ),
                 },
             },
             'required': ['symbol'],
@@ -422,6 +439,34 @@ TOOLS: list[Tool] = [
             },
         },
     ),
+    Tool(
+        name='axon_concurrent_with',
+        description=(
+            'Find symbols that may run concurrently with the given symbol. '
+            'Traces dispatch edges (thread/process executors, asyncio tasks, '
+            'Celery enqueued jobs, etc.) and returns reachable callbacks.'
+        ),
+        inputSchema={
+            'type': 'object',
+            'properties': {
+                'symbol': {
+                    'type': 'string',
+                    'description': 'Name of the symbol to analyse.',
+                },
+                'depth': {
+                    'type': 'integer',
+                    'description': (
+                        f'Maximum traversal depth '
+                        f'(default 3, max {MAX_TRAVERSE_DEPTH}).'
+                    ),
+                    'default': 3,
+                    'minimum': 1,
+                    'maximum': MAX_TRAVERSE_DEPTH,
+                },
+            },
+            'required': ['symbol'],
+        },
+    ),
 ]
 
 
@@ -452,6 +497,7 @@ def _dispatch_tool(
             storage,
             arguments.get('symbol', ''),
             depth=arguments.get('depth', 3),
+            propagate_through=arguments.get('propagate_through'),
         )
     elif name == 'axon_dead_code':
         return handle_dead_code(storage)
@@ -491,6 +537,12 @@ def _dispatch_tool(
         )
     elif name == 'axon_cycles':
         return handle_cycles(storage, min_size=arguments.get('min_size', 2))
+    elif name == 'axon_concurrent_with':
+        return handle_concurrent_with(
+            storage,
+            arguments.get('symbol', ''),
+            depth=arguments.get('depth', 3),
+        )
     else:
         return f'Unknown tool: {name}'
 

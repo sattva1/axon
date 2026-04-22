@@ -105,6 +105,20 @@ def _serialize_extra_props(
     return json.dumps(extra, sort_keys=True) if extra else ''
 
 
+def _parse_edge_metadata(raw: str) -> dict[str, Any]:
+    """Deserialise a ``metadata_json`` string from a CALLS edge.
+
+    Returns an empty dict when *raw* is empty or not valid JSON.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def escape_cypher(value: str) -> str:
     """Escape a string for safe inclusion in a Cypher literal."""
     value = value.replace("\x00", "")
@@ -374,11 +388,47 @@ class KuzuBackend:
         if table is None:
             return []
         query = (
-            f"MATCH (caller:{table})-[r:CodeRelation]->(callee) "
+            f'MATCH (caller:{table})-[r:CodeRelation]->(callee) '
             f"WHERE caller.id = $nid AND r.rel_type = 'calls' "
-            f"RETURN callee.*, r.confidence"
+            f'RETURN callee.*, r.confidence'
         )
-        return self._query_nodes_with_confidence(query, parameters={"nid": node_id})
+        return self._query_nodes_with_confidence(
+            query, parameters={'nid': node_id}
+        )
+
+    def get_callers_with_metadata(
+        self, node_id: str
+    ) -> list[tuple[GraphNode, float, dict[str, Any]]]:
+        """Return (caller, confidence, parsed_metadata) for each incoming CALLS edge."""
+        self._require_conn()
+        table = _table_for_id(node_id)
+        if table is None:
+            return []
+        query = (
+            f'MATCH (caller)-[r:CodeRelation]->(callee:{table}) '
+            f"WHERE callee.id = $nid AND r.rel_type = 'calls' "
+            f'RETURN caller.*, r.confidence, r.metadata_json'
+        )
+        return self._query_nodes_with_metadata(
+            query, parameters={'nid': node_id}
+        )
+
+    def get_callees_with_metadata(
+        self, node_id: str
+    ) -> list[tuple[GraphNode, float, dict[str, Any]]]:
+        """Return (callee, confidence, parsed_metadata) for each outgoing CALLS edge."""
+        self._require_conn()
+        table = _table_for_id(node_id)
+        if table is None:
+            return []
+        query = (
+            f'MATCH (caller:{table})-[r:CodeRelation]->(callee) '
+            f"WHERE caller.id = $nid AND r.rel_type = 'calls' "
+            f'RETURN callee.*, r.confidence, r.metadata_json'
+        )
+        return self._query_nodes_with_metadata(
+            query, parameters={'nid': node_id}
+        )
 
     _MAX_BFS_DEPTH = 10
 
@@ -1418,8 +1468,43 @@ class KuzuBackend:
             logger.warning("_query_nodes_with_confidence failed: %s", query, exc_info=True)
         return pairs
 
+    def _query_nodes_with_metadata(
+        self, query: str, parameters: dict[str, Any] | None = None
+    ) -> list[tuple[GraphNode, float, dict[str, Any]]]:
+        """Execute a query returning ``n.*``, confidence, and metadata_json columns.
+
+        The query must return node columns first, then ``r.confidence``, then
+        ``r.metadata_json`` as the final two trailing columns.
+        """
+        conn = self._require_conn()
+        triples: list[tuple[GraphNode, float, dict[str, Any]]] = []
+        try:
+            with self._lock:
+                result = conn.execute(query, parameters=parameters or {})
+            while result.has_next():
+                row = result.get_next()
+                metadata_raw = row[-1] if row[-1] is not None else ''
+                confidence_raw = row[-2] if row[-2] is not None else None
+                node = self._row_to_node(row[:-2])
+                confidence = (
+                    float(confidence_raw)
+                    if confidence_raw is not None
+                    else 1.0
+                )
+                if node is not None:
+                    triples.append(
+                        (node, confidence, _parse_edge_metadata(metadata_raw))
+                    )
+        except Exception:
+            logger.warning(
+                '_query_nodes_with_metadata failed: %s', query, exc_info=True
+            )
+        return triples
+
     @staticmethod
-    def _row_to_node(row: list[Any], node_id: str | None = None) -> GraphNode | None:
+    def _row_to_node(
+        row: list[Any], node_id: str | None = None
+    ) -> GraphNode | None:
         """Convert a result row from ``RETURN n.*`` into a GraphNode.
 
         Column order matches the property definition:
