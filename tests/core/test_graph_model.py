@@ -23,6 +23,8 @@ class TestNodeLabel:
         'TYPE_ALIAS',
         'ENUM',
         'ENUM_MEMBER',
+        'CLASS_ATTRIBUTE',
+        'MODULE_CONSTANT',
         'COMMUNITY',
         'PROCESS',
     ]

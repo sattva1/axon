@@ -39,6 +39,12 @@ _KIND_TO_LABEL: dict[str, NodeLabel] = {
     "enum": NodeLabel.ENUM,
 }
 
+_MEMBER_KIND_TO_LABEL: dict[str, NodeLabel] = {
+    'enum_member': NodeLabel.ENUM_MEMBER,
+    'class_attribute': NodeLabel.CLASS_ATTRIBUTE,
+    'module_constant': NodeLabel.MODULE_CONSTANT,
+}
+
 
 _PARSER_FACTORIES: dict[str, Callable[[], LanguageParser]] = {
     "python": PythonParser,
@@ -217,24 +223,44 @@ def process_parsing(
             )
 
         for member in parse_data.parse_result.members:
-            member_symbol = f'{member.parent}.{member.name}'
-            member_id = generate_id(
-                NodeLabel.ENUM_MEMBER, file_entry.path, member_symbol
+            label = _MEMBER_KIND_TO_LABEL.get(member.kind)
+            if label is None:
+                logger.warning(
+                    'Unknown member kind %r for %s in %s, skipping',
+                    member.kind,
+                    member.name,
+                    file_entry.path,
+                )
+                continue
+            member_symbol = (
+                f'{member.parent}.{member.name}'
+                if member.parent
+                else member.name
             )
-            member_node = GraphNode(
-                id=member_id,
-                label=NodeLabel.ENUM_MEMBER,
-                name=member.name,
-                file_path=file_entry.path,
-                start_line=member.line,
-                end_line=member.line,
-                class_name=member.parent,
-                language=file_entry.language,
+            member_id = generate_id(label, file_entry.path, member_symbol)
+            graph.add_node(
+                GraphNode(
+                    id=member_id,
+                    label=label,
+                    name=member.name,
+                    file_path=file_entry.path,
+                    start_line=member.line,
+                    end_line=member.line,
+                    class_name=member.parent,
+                    language=file_entry.language,
+                )
             )
-            graph.add_node(member_node)
-            parent_id = generate_id(
-                NodeLabel.ENUM, file_entry.path, member.parent
-            )
+            # DEFINES edge: source depends on member kind.
+            if member.kind == 'enum_member':
+                parent_id = generate_id(
+                    NodeLabel.ENUM, file_entry.path, member.parent
+                )
+            elif member.kind == 'class_attribute':
+                parent_id = generate_id(
+                    NodeLabel.CLASS, file_entry.path, member.parent
+                )
+            else:  # module_constant
+                parent_id = file_id
             graph.add_relationship(
                 GraphRelationship(
                     id=f'{parent_id}->defines->{member_id}',

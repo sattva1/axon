@@ -12,3 +12,11 @@ from __future__ import annotations
 ENUM_BASES: frozenset[str] = frozenset(
     {'Enum', 'IntEnum', 'StrEnum', 'Flag', 'IntFlag'}
 )
+
+PYDANTIC_BASES: frozenset[str] = frozenset({'BaseModel', 'RootModel'})
+# Direct-inheritance detection only. Transitive inheritance is deferred.
+
+DATACLASS_DECORATORS: frozenset[str] = frozenset(
+    {'dataclass', 'dataclasses.dataclass', 'attr.s', 'attrs.define'}
+)
+# Matched against the exact decorator string captured by the parser.

@@ -39,7 +39,9 @@ from axon.core.ingestion.dead_code import process_dead_code
 from axon.core.ingestion.heritage import process_heritage
 from axon.core.ingestion.imports import build_file_index, process_imports
 from axon.core.ingestion.members import (
-    build_enum_index,
+    build_imported_names,
+    build_module_constant_index,
+    build_parent_qualified_member_index,
     process_member_accesses,
 )
 from axon.core.ingestion.parser_phase import process_parsing
@@ -74,6 +76,8 @@ _SYMBOL_LABELS: frozenset[NodeLabel] = frozenset(NodeLabel) - {
     NodeLabel.COMMUNITY,
     NodeLabel.PROCESS,
     NodeLabel.ENUM_MEMBER,  # excluded from Phase 7 gate formula
+    NodeLabel.CLASS_ATTRIBUTE,
+    NodeLabel.MODULE_CONSTANT,
 }
 
 
@@ -201,10 +205,14 @@ def run_pipeline(
     with _timed("Resolving imports"):
         process_imports(parse_data, graph, parallel=True)
 
-    with _timed("Building indexes"):
+    with _timed('Building indexes'):
+        file_index = build_file_index(graph)
         shared_labels = (
-            NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.CLASS,
-            NodeLabel.INTERFACE, NodeLabel.TYPE_ALIAS,
+            NodeLabel.FUNCTION,
+            NodeLabel.METHOD,
+            NodeLabel.CLASS,
+            NodeLabel.INTERFACE,
+            NodeLabel.TYPE_ALIAS,
         )
         shared_name_index = build_name_index(graph, shared_labels)
         heritage_labels = {NodeLabel.CLASS, NodeLabel.INTERFACE}
@@ -244,8 +252,16 @@ def run_pipeline(
         _write_collected_edges(types_f.result() or [], graph)
 
     with _timed('Resolving member accesses'):
-        enum_index = build_enum_index(graph)
-        num_accesses = process_member_accesses(parse_data, graph, enum_index)
+        parent_member_index = build_parent_qualified_member_index(graph)
+        module_const_index = build_module_constant_index(graph)
+        imported_names = build_imported_names(parse_data, file_index)
+        num_accesses = process_member_accesses(
+            parse_data,
+            graph,
+            parent_member_index,
+            module_const_index,
+            imported_names,
+        )
         log.info('Member accesses emitted: %d', num_accesses)
 
     coupling_file_nodes = graph.get_nodes_by_label(NodeLabel.FILE)
@@ -362,8 +378,20 @@ def reindex_files(
     process_calls(parse_data, graph, name_index=shared_name_index)
     process_heritage(parse_data, graph, name_index=heritage_name_index)
     process_types(parse_data, graph, name_index=shared_name_index)
-    enum_index = build_enum_index(graph)
-    process_member_accesses(parse_data, graph, enum_index)
+    # process_parsing has written new member nodes into the in-memory graph.
+    # The indexes below see them, so same-file module-constant accesses
+    # resolve correctly in the incremental path; cross-file accesses resolve
+    # via unchanged files carried over from storage.load_graph().
+    parent_member_index = build_parent_qualified_member_index(graph)
+    module_const_index = build_module_constant_index(graph)
+    imported_names_map = build_imported_names(parse_data, file_index)
+    process_member_accesses(
+        parse_data,
+        graph,
+        parent_member_index,
+        module_const_index,
+        imported_names_map,
+    )
 
     incremental_nodes = [
         node for node in graph.iter_nodes()

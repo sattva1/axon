@@ -226,12 +226,15 @@ class StorageBackend(Protocol):
         """Return (accessor_node, access_mode, confidence) for every ACCESSES
         edge pointing at node_id.
 
+        Works for any member node: ENUM_MEMBER, CLASS_ATTRIBUTE, or
+        MODULE_CONSTANT.
+
         Args:
-            node_id: Target ENUM_MEMBER node ID.
+            node_id: Target member node ID.
             mode: Optional filter - only return edges with this access_mode.
 
         Returns:
             List of (accessor_node, access_mode, confidence) triples. Returns
-            an empty list for non-enum or unknown node IDs.
+            an empty list for unknown node IDs.
         """
         ...

@@ -103,7 +103,7 @@ _REL_CSV_COLUMNS: tuple[str, ...] = (
     'access_mode',
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 def _serialize_extra_props(

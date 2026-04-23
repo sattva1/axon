@@ -244,17 +244,19 @@ class TestHandleFileContextEnumSection:
         enum_rows: list[list],
     ) -> MagicMock:
         """Wire execute_raw side effects with required minimum rows."""
-        # handle_file_context calls execute_raw 7 times (sym, imports_out,
-        # imports_in, coupling, dead, comm, enum). We make sym_rows non-empty
-        # so the function doesn't return early with 'No data found'.
+        # handle_file_context calls execute_raw 9 times (sym, imports_out,
+        # imports_in, coupling, dead, comm, enum, cls_attr, mod_const).
+        # We make sym_rows non-empty so the function doesn't return early.
         side_effects: list[list] = [
             [['my_func', 'Function', 1, False, False, False]],  # sym_rows
-            [],   # imports_out
-            [],   # imports_in
-            [],   # coupling
-            [],   # dead
-            [],   # communities
+            [],  # imports_out
+            [],  # imports_in
+            [],  # coupling
+            [],  # dead
+            [],  # communities
             enum_rows,  # enum_rows
+            [],  # cls_attr_rows
+            [],  # mod_const_rows
         ]
         mock_storage.execute_raw.side_effect = side_effects
         return mock_storage

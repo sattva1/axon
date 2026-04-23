@@ -1039,6 +1039,10 @@ class TestHandleFileContext:
             [['mcp+server', 2]],
             # Enums
             [],
+            # Class attributes
+            [],
+            # Module constants
+            [],
         ]
         result = handle_file_context(mock_storage, 'src/mcp/tools.py')
         assert 'src/mcp/tools.py' in result
@@ -1051,7 +1055,17 @@ class TestHandleFileContext:
         assert 'mcp+server' in result
 
     def test_empty_file(self, mock_storage):
-        mock_storage.execute_raw.side_effect = [[], [], [], [], [], [], []]
+        mock_storage.execute_raw.side_effect = [
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
         result = handle_file_context(mock_storage, 'src/empty.py')
         assert 'No data found' in result
 
@@ -1062,6 +1076,8 @@ class TestHandleFileContext:
             [],
             [],
             [['old_func', 45, 'Function']],
+            [],
+            [],
             [],
             [],
         ]
@@ -1082,6 +1098,8 @@ class TestHandleFileContext:
             [['tests/mcp/test_tools.py', 0.85, 12]],
             [],
             [['mcp+server', 2]],
+            [],
+            [],
             [],
         ]
 

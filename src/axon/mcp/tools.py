@@ -216,15 +216,37 @@ def handle_query(storage: StorageBackend, query: str, limit: int = 20) -> str:
     return _format_query_results(results, groups)
 
 
-def _render_enum_member_context(
-    node: GraphNode, storage: StorageBackend
-) -> str:
-    """Render a 360-degree view for an ENUM_MEMBER node."""
-    lines = [
-        f'Enum Member: {node.class_name}.{node.name} ({node.file_path}:{node.start_line})'
-    ]
-    lines.append(f'Parent: {node.class_name}')
-    lines.append('')
+_MEMBER_LABELS: frozenset[NodeLabel] = frozenset(
+    {
+        NodeLabel.ENUM_MEMBER,
+        NodeLabel.CLASS_ATTRIBUTE,
+        NodeLabel.MODULE_CONSTANT,
+    }
+)
+
+
+def _render_member_context(node: GraphNode, storage: StorageBackend) -> str:
+    """Render a 360-degree view for a member node."""
+    if node.label == NodeLabel.ENUM_MEMBER:
+        header = (
+            f'Enum Member: {node.class_name}.{node.name}'
+            f' ({node.file_path}:{node.start_line})'
+        )
+        parent_line = f'Parent: {node.class_name}'
+    elif node.label == NodeLabel.CLASS_ATTRIBUTE:
+        header = (
+            f'Class Attribute: {node.class_name}.{node.name}'
+            f' ({node.file_path}:{node.start_line})'
+        )
+        parent_line = f'Parent: {node.class_name}'
+    else:  # MODULE_CONSTANT
+        header = (
+            f'Module Constant: {node.name}'
+            f' ({node.file_path}:{node.start_line})'
+        )
+        parent_line = f'Module: {node.file_path}'
+
+    lines = [header, parent_line, '']
 
     accessors = storage.get_accessors(node.id)
     if not accessors:
@@ -246,13 +268,24 @@ def _render_enum_member_context(
     return '\n'.join(lines)
 
 
-def _render_enum_accessors_flat(
+# Back-compat alias used by existing tests that reference the old name.
+_render_enum_member_context = _render_member_context
+
+
+def _render_member_accessors_flat(
     node: GraphNode, accessors: list[tuple[GraphNode, str, float]]
 ) -> str:
     """Render a flat accessor list for handle_impact."""
-    lines = [
-        f'Impact analysis for: {node.class_name}.{node.name} (Enum_Member)'
-    ]
+    if node.label == NodeLabel.MODULE_CONSTANT:
+        subject = node.name
+        kind_label = 'Module_Constant'
+    elif node.label == NodeLabel.CLASS_ATTRIBUTE:
+        subject = f'{node.class_name}.{node.name}'
+        kind_label = 'Class_Attribute'
+    else:
+        subject = f'{node.class_name}.{node.name}'
+        kind_label = 'Enum_Member'
+    lines = [f'Impact analysis for: {subject} ({kind_label})']
     if not accessors:
         lines.append('No accessors found.')
         return '\n'.join(lines)
@@ -267,18 +300,34 @@ def _render_enum_accessors_flat(
             f'  [mode: {acc_mode or "read"}]{tag}'
         )
     lines.append('')
-    lines.append('Tip: Review each accessor before changing this enum member.')
+    lines.append('Tip: Review each accessor before changing this member.')
     return '\n'.join(lines)
 
 
-def _render_enum_member_explain(
+# Back-compat alias.
+_render_enum_accessors_flat = _render_member_accessors_flat
+
+
+def _render_member_explain(
     node: GraphNode, accessors: list[tuple[GraphNode, str, float]]
 ) -> str:
-    """Render a narrative explanation for an ENUM_MEMBER node."""
-    lines = [f'Explanation: {node.class_name}.{node.name} (Enum_Member)']
+    """Render a narrative explanation for a member node."""
+    if node.label == NodeLabel.MODULE_CONSTANT:
+        subject = node.name
+        kind_label = 'Module_Constant'
+        detail = f'Module constant in ``{node.file_path}``.'
+    elif node.label == NodeLabel.CLASS_ATTRIBUTE:
+        subject = f'{node.class_name}.{node.name}'
+        kind_label = 'Class_Attribute'
+        detail = f'Class attribute of ``{node.class_name}``.'
+    else:
+        subject = f'{node.class_name}.{node.name}'
+        kind_label = 'Enum_Member'
+        detail = f'Enum member of ``{node.class_name}``.'
+    lines = [f'Explanation: {subject} ({kind_label})']
     lines.append('=' * 48)
     lines.append('')
-    lines.append(f'Enum member of ``{node.class_name}``.')
+    lines.append(detail)
     lines.append(f'Location: {node.file_path}:{node.start_line}')
     accessor_files = {n.file_path for n, _, _ in accessors}
     lines.append(
@@ -286,6 +335,10 @@ def _render_enum_member_explain(
         f'{len(accessor_files)} file(s).'
     )
     return '\n'.join(lines)
+
+
+# Back-compat alias.
+_render_enum_member_explain = _render_member_explain
 
 
 def handle_context(storage: StorageBackend, symbol: str) -> str:
@@ -317,8 +370,8 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
     if not node:
         return f"Symbol '{symbol}' not found."
 
-    if node.label == NodeLabel.ENUM_MEMBER:
-        return _render_enum_member_context(node, storage)
+    if node.label in _MEMBER_LABELS:
+        return _render_member_context(node, storage)
 
     label_display = node.label.value.title() if node.label else 'Unknown'
     lines = [f'Symbol: {node.name} ({label_display})']
@@ -568,9 +621,9 @@ def handle_impact(
     if not start_node:
         return f"Symbol '{symbol}' not found."
 
-    if start_node.label == NodeLabel.ENUM_MEMBER:
+    if start_node.label in _MEMBER_LABELS:
         accessors = storage.get_accessors(start_node.id)
-        return _render_enum_accessors_flat(start_node, accessors)
+        return _render_member_accessors_flat(start_node, accessors)
 
     label_display = start_node.label.value.title()
 
@@ -1212,9 +1265,9 @@ def handle_explain(storage: StorageBackend, symbol: str) -> str:
     if not node:
         return f"Symbol '{symbol}' not found."
 
-    if node.label == NodeLabel.ENUM_MEMBER:
+    if node.label in _MEMBER_LABELS:
         accessors = storage.get_accessors(node.id)
-        return _render_enum_member_explain(node, accessors)
+        return _render_member_explain(node, accessors)
 
     label_display = node.label.value.title() if node.label else 'Unknown'
     lines = [f'Explanation: {node.name} ({label_display})']
@@ -1572,6 +1625,54 @@ def handle_file_context(storage: StorageBackend, file_path: str) -> str:
         if enum_parts:
             lines.append('')
             lines.append(f'Enums: {"; ".join(enum_parts)}')
+
+    # Class attribute summary.
+    cls_attr_rows = (
+        storage.execute_raw(
+            f"MATCH (c:Class) WHERE c.file_path = '{escaped}' "
+            f'OPTIONAL MATCH (c)-[d:CodeRelation]->(a:Classattribute) '
+            f"WHERE d.rel_type = 'defines' "
+            f'OPTIONAL MATCH (acc)-[r:CodeRelation]->(a) '
+            f"WHERE r.rel_type = 'accesses' "
+            f'RETURN c.name, count(DISTINCT a), count(DISTINCT acc) '
+            f'ORDER BY c.name'
+        )
+        or []
+    )
+    cls_attr_parts = []
+    for row in cls_attr_rows:
+        cls_name = row[0] or '?'
+        attr_count = int(row[1]) if row[1] is not None else 0
+        acc_count = int(row[2]) if row[2] is not None else 0
+        if attr_count > 0:
+            cls_attr_parts.append(
+                f'{cls_name} ({attr_count} attrs, {acc_count} accessors)'
+            )
+    if cls_attr_parts:
+        lines.append('')
+        lines.append(f'Class attributes: {"; ".join(cls_attr_parts)}')
+
+    # Module constant summary.
+    mod_const_rows = (
+        storage.execute_raw(
+            f'MATCH (f:File)-[d:CodeRelation]->(m:Moduleconstant) '
+            f"WHERE f.file_path = '{escaped}' AND d.rel_type = 'defines' "
+            f'OPTIONAL MATCH (acc)-[r:CodeRelation]->(m) '
+            f"WHERE r.rel_type = 'accesses' "
+            f'RETURN count(DISTINCT m), count(DISTINCT acc)'
+        )
+        or []
+    )
+    if mod_const_rows:
+        row = mod_const_rows[0]
+        const_count = int(row[0]) if row[0] is not None else 0
+        acc_count = int(row[1]) if row[1] is not None else 0
+        if const_count > 0:
+            lines.append('')
+            lines.append(
+                f'Module constants: {const_count}'
+                f' ({acc_count} accessor references)'
+            )
 
     return '\n'.join(lines)
 

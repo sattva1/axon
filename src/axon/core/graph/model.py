@@ -24,6 +24,8 @@ class NodeLabel(Enum):
     TYPE_ALIAS = 'type_alias'
     ENUM = 'enum'
     ENUM_MEMBER = 'enum_member'
+    CLASS_ATTRIBUTE = 'class_attribute'
+    MODULE_CONSTANT = 'module_constant'
     COMMUNITY = 'community'
     PROCESS = 'process'
 

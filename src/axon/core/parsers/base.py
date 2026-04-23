@@ -116,11 +116,14 @@ class TypeRef:
 
 @dataclass
 class MemberInfo:
-    """A parsed class-body member (Phase 5: enum members only)."""
+    """A parsed class-body member or module-level constant.
+
+    Accepted kind values: "enum_member", "class_attribute", "module_constant".
+    """
 
     name: str
-    parent: str  # owning class name
-    kind: str  # "enum_member" for now; Phase 7 extends
+    parent: str  # owning class name; empty string for module constants
+    kind: str  # "enum_member" | "class_attribute" | "module_constant"
     line: int
 
 

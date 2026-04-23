@@ -6,6 +6,7 @@ and inheritance relationships from Python source code.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -22,7 +23,11 @@ from axon.core.parsers.base import (
     SymbolInfo,
     TypeRef,
 )
-from axon.core.python_lang_constants import ENUM_BASES
+from axon.core.python_lang_constants import (
+    DATACLASS_DECORATORS,
+    ENUM_BASES,
+    PYDANTIC_BASES,
+)
 
 PY_LANGUAGE = Language(tspython.language())
 
@@ -97,6 +102,8 @@ class _ParseContext:
         self._self_frames: list[dict[str, _Binding]] = []
         # Import resolution map, built between pass 1 and pass 2.
         self.import_local_to_type: dict[str, str] = import_local_to_type
+        # Class-attribution stack: (class_name, self_param_name_or_None).
+        self._class_attr_stack: list[tuple[str, str | None]] = []
 
     def snapshot(self) -> dict[str, Any]:
         """Return a point-in-time snapshot of the current scope state."""
@@ -141,6 +148,32 @@ class _ParseContext:
         if not self._self_frames:
             return None
         return self._self_frames[-1].get(attr)
+
+    def push_class_attribution(
+        self, class_name: str, self_param: str | None
+    ) -> None:
+        """Push a class-attribution frame onto the stack."""
+        self._class_attr_stack.append((class_name, self_param))
+
+    def pop_class_attribution(self) -> None:
+        """Pop the innermost class-attribution frame."""
+        self._class_attr_stack.pop()
+
+    def current_class_name(self) -> str | None:
+        """Return the class name at the top of the attribution stack, or None."""
+        if not self._class_attr_stack:
+            return None
+        return self._class_attr_stack[-1][0]
+
+    def current_self_param(self) -> str | None:
+        """Return the current method self-parameter name, or None.
+
+        Returns None when not inside a method (e.g. inside a class body
+        at top level, or inside a staticmethod).
+        """
+        if not self._class_attr_stack:
+            return None
+        return self._class_attr_stack[-1][1]
 
 
 _DEFAULT_SCOPE_SNAPSHOT: dict[str, Any] = {
@@ -204,6 +237,84 @@ _CELERY_DECORATORS: frozenset[str] = frozenset(
         'app.shared_task',
     }
 )
+
+# Regex for ALL_CAPS module-constant identifier reads.
+# Requires a leading capital letter so lone `_`, `__`, and digit-only tokens
+# are rejected by construction.
+_ALL_CAPS_RE: re.Pattern[str] = re.compile(r'^[A-Z][A-Z0-9_]*$')
+
+_LITERAL_NODE_TYPES: frozenset[str] = frozenset(
+    {
+        'integer',
+        'float',
+        'string',
+        'true',
+        'false',
+        'none',
+        'list',
+        'tuple',
+        'dictionary',
+        'set',
+        'unary_operator',  # handles -5, +3.14
+    }
+)
+
+
+def _is_final_annotation(node: Node | None) -> bool:
+    """Return True if node represents ``Final`` or ``Final[...]``."""
+    if node is None:
+        return False
+    # tree-sitter wraps annotation in a "type" node
+    inner = node
+    if inner.type == 'type' and inner.children:
+        inner = inner.children[0]
+    if inner.type == 'identifier':
+        return inner.text.decode('utf8') == 'Final'
+    if inner.type == 'subscript':
+        base = inner.child_by_field_name('value')
+        if base is not None and base.type == 'identifier':
+            return base.text.decode('utf8') == 'Final'
+    if inner.type == 'generic_type':
+        for ch in inner.children:
+            if ch.type == 'identifier':
+                return ch.text.decode('utf8') == 'Final'
+    return False
+
+
+def _is_literal_rhs(node: Node | None) -> bool:
+    """Return True if node's type is a known literal type."""
+    if node is None:
+        return False
+    return node.type in _LITERAL_NODE_TYPES
+
+
+def _extract_self_param_name(func_node: Node) -> str | None:
+    """Return the first parameter's identifier text, or None.
+
+    Returns None when the first param is not a plain identifier
+    (e.g. *args, **kwargs, or a staticmethod with no self/cls).
+    Unconditional break after the first non-separator child - only the
+    first param is the potential self receiver.
+    """
+    params = func_node.child_by_field_name('parameters')
+    if params is None:
+        return None
+    for child in params.children:
+        if child.type == 'identifier':
+            return child.text.decode('utf8')
+        if child.type in (
+            'typed_parameter',
+            'default_parameter',
+            'typed_default_parameter',
+        ):
+            for sub in child.children:
+                if sub.type == 'identifier':
+                    return sub.text.decode('utf8')
+            return None
+        if child.type in ('(', ')', ','):
+            continue  # punctuation, skip
+        return None  # *args, **kwargs, or unrecognised - no self param
+    return None
 
 
 def _resolve_callee_to_type_name(
@@ -528,7 +639,9 @@ class PythonParser(LanguageParser):
         root = tree.root_node
         # Pass 1: populate symbols, imports, annotations. Bindings NOT touched.
         self._walk(root, content, result, class_name='')
-        # Between passes: build local-name -> canonical-class-name map.
+        # Between passes: extract module constants (structural, no scope state
+        # needed) and build the local-name -> canonical-class-name map.
+        self._extract_module_constants(root, result)
         import_local_to_type = result.build_import_type_map()
         # Pass 2: extract calls with full binding/scope context.
         ctx = _ParseContext(import_local_to_type=import_local_to_type)
@@ -655,25 +768,29 @@ class PythonParser(LanguageParser):
         definition_node: Node | None = None
 
         for child in node.children:
-            if child.type == "decorator":
+            if child.type == 'decorator':
                 dec_name = self._extract_decorator_name(child)
                 if dec_name:
                     decorators.append(dec_name)
-            elif child.type in ("function_definition", "class_definition"):
+            elif child.type in ('function_definition', 'class_definition'):
                 definition_node = child
 
         if definition_node is None:
             return
 
-        count_before = len(result.symbols)
-
-        if definition_node.type == "function_definition":
-            self._extract_function(definition_node, content, result, class_name)
+        if definition_node.type == 'function_definition':
+            count_before = len(result.symbols)
+            self._extract_function(
+                definition_node, content, result, class_name
+            )
+            if count_before < len(result.symbols):
+                result.symbols[count_before].decorators = decorators
         else:
-            self._extract_class(definition_node, content, result)
-
-        if count_before < len(result.symbols):
-            result.symbols[count_before].decorators = decorators
+            # Pass decorators directly so _extract_class can compute
+            # is_dataclass and write decorators onto the SymbolInfo.
+            self._extract_class(
+                definition_node, content, result, decorators=decorators
+            )
 
     def _extract_decorator_name(self, decorator_node: Node) -> str:
         """Extract the dotted name from a decorator node.
@@ -724,7 +841,7 @@ class PythonParser(LanguageParser):
             result.type_refs.append(
                 TypeRef(
                     name=type_name,
-                    kind="param",
+                    kind='param',
                     line=type_node.start_point[0] + 1,
                     param_name=param_name,
                 )
@@ -735,9 +852,12 @@ class PythonParser(LanguageParser):
         node: Node,
         content: str,
         result: ParseResult,
+        decorators: list[str] | None = None,
     ) -> None:
         """Extract a class definition and its contents."""
-        name_node = node.child_by_field_name("name")
+        if decorators is None:
+            decorators = []
+        name_node = node.child_by_field_name('name')
         if name_node is None:
             return
 
@@ -774,23 +894,30 @@ class PythonParser(LanguageParser):
                         )
 
         is_enum = bool(set(bases) & ENUM_BASES)
+        is_pydantic = bool(set(bases) & PYDANTIC_BASES)
+        # Direct set-intersection: matches full dotted decorator string.
+        is_dataclass = bool(set(decorators) & DATACLASS_DECORATORS)
 
-        result.symbols.append(
-            SymbolInfo(
-                name=class_name,
-                kind="enum" if is_enum else "class",
-                start_line=start_line,
-                end_line=end_line,
-                content=node_content,
-            )
+        symbol = SymbolInfo(
+            name=class_name,
+            kind='enum' if is_enum else 'class',
+            start_line=start_line,
+            end_line=end_line,
+            content=node_content,
+            decorators=list(decorators),
         )
+        result.symbols.append(symbol)
 
         body = node.child_by_field_name('body')
         if body is not None:
-            # _walk handles nested class/method definitions; _extract_enum_members
-            # only iterates assignment nodes at the enum-body level - no overlap.
             if is_enum:
+                # _walk handles nested defs; _extract_enum_members only
+                # iterates assignment nodes at the enum-body level - no overlap.
                 self._extract_enum_members(body, class_name, result)
+            else:
+                self._extract_class_attributes(
+                    body, class_name, is_pydantic, is_dataclass, result
+                )
             self._walk(body, content, result, class_name=class_name)
 
     def _extract_enum_members(
@@ -832,6 +959,139 @@ class PythonParser(LanguageParser):
                 )
 
     @staticmethod
+    def _class_attr_lhs(stmt: Node) -> tuple[str | None, int, bool]:
+        """Return (name, line, is_annotated) for an assignment LHS.
+
+        Returns (None, 0, False) when:
+        - Node is not an assignment.
+        - LHS is not a plain identifier.
+        - Name is a dunder (starts and ends with double underscores, length > 4).
+
+        In tree-sitter-python, all of ``x: int``, ``x: int = 5``, and
+        ``x = 5`` are represented as ``assignment`` nodes. The presence of
+        a ``type`` child field distinguishes annotated from plain assignments.
+        """
+        if stmt.type != 'assignment':
+            return None, 0, False
+        left = stmt.child_by_field_name('left')
+        if left is None:
+            return None, 0, False
+        if left.type != 'identifier':
+            return None, 0, False
+        name = left.text.decode('utf8')
+        if name.startswith('__') and name.endswith('__') and len(name) > 4:
+            return None, 0, False
+        has_annotation = stmt.child_by_field_name('type') is not None
+        return name, stmt.start_point[0] + 1, has_annotation
+
+    @staticmethod
+    def _is_field_call_rhs(stmt: Node) -> bool:
+        """Return True when the RHS is a call to ``Field`` or ``field``."""
+        right = stmt.child_by_field_name('right')
+        if right is None or right.type != 'call':
+            return False
+        func = right.child_by_field_name('function')
+        if func is None:
+            return False
+        if func.type == 'identifier':
+            return func.text.decode('utf8') in ('Field', 'field')
+        if func.type == 'attribute':
+            for ch in reversed(func.children):
+                if ch.type == 'identifier':
+                    return ch.text.decode('utf8') in ('Field', 'field')
+        return False
+
+    def _extract_class_attributes(
+        self,
+        class_body: Node,
+        class_name: str,
+        is_pydantic: bool,
+        is_dataclass: bool,
+        result: ParseResult,
+    ) -> None:
+        """Extract class attributes from a non-enum class body.
+
+        Emits MemberInfo for annotated assignments unconditionally, and for
+        plain (unannotated) assignments when the class is a Pydantic model or
+        dataclass and the RHS is a Field/field call.
+
+        In tree-sitter-python both ``x: int = 5`` and ``x = 5`` are
+        assignment nodes; the presence of a ``type`` child field distinguishes
+        them. See _class_attr_lhs for details.
+        """
+        for child in class_body.children:
+            if child.type != 'expression_statement':
+                continue
+            for stmt in child.children:
+                lhs_name, line, is_annotated = self._class_attr_lhs(stmt)
+                if lhs_name is None:
+                    continue
+                if is_annotated:
+                    # Always emit annotated class attributes.
+                    result.members.append(
+                        MemberInfo(
+                            name=lhs_name,
+                            parent=class_name,
+                            kind='class_attribute',
+                            line=line,
+                        )
+                    )
+                elif (is_pydantic or is_dataclass) and self._is_field_call_rhs(
+                    stmt
+                ):
+                    # Emit plain assignments only for framework-managed fields
+                    # with a Field/field call RHS.
+                    result.members.append(
+                        MemberInfo(
+                            name=lhs_name,
+                            parent=class_name,
+                            kind='class_attribute',
+                            line=line,
+                        )
+                    )
+
+    def _extract_module_constants(
+        self, root_node: Node, result: ParseResult
+    ) -> None:
+        """Extract top-level module constants into result.members.
+
+        Scans only the root-level expression_statement children; does NOT
+        recurse into functions or classes. A constant is emitted when:
+        - LHS is a single identifier (not a dunder).
+        - RHS is a literal node type, OR the annotation is Final[...].
+        """
+        for child in root_node.children:
+            if child.type != 'expression_statement':
+                continue
+            for stmt in child.children:
+                if stmt.type != 'assignment':
+                    continue
+                left = stmt.child_by_field_name('left')
+                if left is None:
+                    continue
+                if left.type != 'identifier':
+                    continue
+                name = left.text.decode('utf8')
+                # Dunder exclusion: double-underscore both ends, length > 4.
+                if (
+                    name.startswith('__')
+                    and name.endswith('__')
+                    and len(name) > 4
+                ):
+                    continue
+                right = stmt.child_by_field_name('right')
+                annotation = stmt.child_by_field_name('type')
+                if _is_final_annotation(annotation) or _is_literal_rhs(right):
+                    result.members.append(
+                        MemberInfo(
+                            name=name,
+                            parent='',
+                            kind='module_constant',
+                            line=stmt.start_point[0] + 1,
+                        )
+                    )
+
+    @staticmethod
     def _is_capital_attr(attr_node: Node) -> tuple[str, str] | None:
         """Return (lhs_ident, attr_name) for a qualifying ``Capital.attr`` node.
 
@@ -859,66 +1119,151 @@ class PythonParser(LanguageParser):
             return None
         return (lhs, attr)
 
+    @staticmethod
+    def _is_self_attr(
+        attr_node: Node, self_param: str
+    ) -> tuple[str, str] | None:
+        """Return (self_param, attr_name) for ``<self_param>.attr``.
+
+        Only handles the single-level form. Chained ``self.x.y`` is NOT
+        matched: the outer node's first child is itself an attribute node,
+        so the identifier guard rejects it. This is a documented known limit.
+        """
+        if not attr_node.children:
+            return None
+        lhs_node = attr_node.children[0]
+        if lhs_node.type != 'identifier':
+            return None
+        lhs = lhs_node.text.decode('utf8')
+        if lhs != self_param:
+            return None
+        attr = None
+        for ch in reversed(attr_node.children):
+            if ch.type == 'identifier':
+                attr = ch.text.decode('utf8')
+                break
+        if attr is None or attr == lhs:
+            return None
+        return (lhs, attr)
+
     def _try_emit_member_access(
-        self, attr_node: Node, mode: str, result: ParseResult
+        self,
+        attr_node: Node,
+        mode: str,
+        result: ParseResult,
+        ctx: _ParseContext | None = None,
     ) -> None:
-        """Emit a MemberAccess if attr_node matches the Capital.attr pattern."""
+        """Emit a MemberAccess for Capital.attr or self.attr."""
+        # Capital.attr path - existing behaviour.
         pair = self._is_capital_attr(attr_node)
+        if pair is not None:
+            lhs, attr = pair
+            result.member_accesses.append(
+                MemberAccess(
+                    parent=lhs,
+                    name=attr,
+                    line=attr_node.start_point[0] + 1,
+                    mode=mode,
+                )
+            )
+            return
+        # self.attr path - new in Phase 7.
+        self_param = ctx.current_self_param() if ctx is not None else None
+        if self_param is None:
+            return
+        pair = self._is_self_attr(attr_node, self_param)
         if pair is None:
             return
-        lhs, attr = pair
+        class_name = ctx.current_class_name()
+        if class_name is None:
+            return
         result.member_accesses.append(
             MemberAccess(
-                parent=lhs,
-                name=attr,
+                parent=class_name,
+                name=pair[1],
                 line=attr_node.start_point[0] + 1,
                 mode=mode,
             )
         )
 
     def _try_extract_member_access_from_assignment(
-        self, assignment_node: Node, result: ParseResult
+        self,
+        assignment_node: Node,
+        result: ParseResult,
+        ctx: _ParseContext | None = None,
     ) -> None:
-        """Emit MemberAccess for ``Capital.attr = ...`` (write mode)."""
+        """Emit MemberAccess for ``Capital.attr = ...`` or ``self.attr = ...``."""
         left = assignment_node.child_by_field_name('left')
         if left is not None and left.type == 'attribute':
-            self._try_emit_member_access(left, 'write', result)
+            self._try_emit_member_access(left, 'write', result, ctx)
         # Also scan RHS for read accesses.
         right = assignment_node.child_by_field_name('right')
         if right is not None:
-            self._scan_node_for_read_accesses(right, result)
+            self._scan_node_for_read_accesses(right, result, ctx)
 
     def _try_extract_member_access_from_augmented(
-        self, aug_node: Node, result: ParseResult
+        self,
+        aug_node: Node,
+        result: ParseResult,
+        ctx: _ParseContext | None = None,
     ) -> None:
-        """Emit MemberAccess for ``Capital.attr += ...`` (both mode)."""
+        """Emit MemberAccess for ``Capital.attr += ...`` (both mode).
+
+        Also emits a bare-identifier ALL_CAPS MemberAccess when the LHS is
+        an identifier matching the ALL_CAPS pattern (e.g. ``MY_CONST += 1``).
+        """
         left = aug_node.child_by_field_name('left')
-        if left is not None and left.type == 'attribute':
-            self._try_emit_member_access(left, 'both', result)
+        if left is not None:
+            if left.type == 'attribute':
+                self._try_emit_member_access(left, 'both', result, ctx)
+            elif left.type == 'identifier':
+                name = left.text.decode('utf8')
+                if _ALL_CAPS_RE.match(name):
+                    result.member_accesses.append(
+                        MemberAccess(
+                            parent='',
+                            name=name,
+                            line=aug_node.start_point[0] + 1,
+                            mode='both',
+                        )
+                    )
         right = aug_node.child_by_field_name('right')
         if right is not None:
-            self._scan_node_for_read_accesses(right, result)
+            self._scan_node_for_read_accesses(right, result, ctx)
 
     def _scan_node_for_read_accesses(
-        self, node: Node, result: ParseResult
+        self, node: Node, result: ParseResult, ctx: _ParseContext | None = None
     ) -> None:
-        """Recursively scan a subtree for Capital.attr reads.
+        """Recursively scan a subtree for member reads.
 
-        Stops recursion at call nodes (handled by _extract_calls_recursive)
-        and at attribute nodes that are themselves the target - those are
-        handled by their parent.
+        Stops at attribute nodes (handled by _try_emit_member_access) and
+        at call nodes (handled by _extract_calls_recursive).
+        Emits bare-identifier ALL_CAPS reads for module-constant access.
         """
         if node.type == 'attribute':
-            self._try_emit_member_access(node, 'read', result)
+            self._try_emit_member_access(node, 'read', result, ctx)
             return
         if node.type == 'call':
             # Call nodes: check if function is a Capital.attr (e.g. Foo.BAR())
             func = node.child_by_field_name('function')
             if func is not None and func.type == 'attribute':
-                self._try_emit_member_access(func, 'read', result)
+                self._try_emit_member_access(func, 'read', result, ctx)
+            return
+        if node.type == 'identifier':
+            name = node.text.decode('utf8')
+            # ALL_CAPS heuristic for module-constant reads.
+            if _ALL_CAPS_RE.match(name):
+                result.member_accesses.append(
+                    MemberAccess(
+                        parent='',
+                        name=name,
+                        line=node.start_point[0] + 1,
+                        mode='read',
+                    )
+                )
             return
         for child in node.children:
-            self._scan_node_for_read_accesses(child, result)
+            self._scan_node_for_read_accesses(child, result, ctx)
 
     def _extract_import(self, node: Node, result: ParseResult) -> None:
         """Extract a plain ``import X`` statement."""
@@ -1056,6 +1401,22 @@ class PythonParser(LanguageParser):
                 if text:
                     result.exports.append(text)
 
+    def _has_staticmethod_decorator(self, func_node: Node) -> bool:
+        """Return True when func_node is wrapped in a @staticmethod decorator.
+
+        Checks whether the immediate parent of func_node is a
+        decorated_definition whose decorator list contains 'staticmethod'.
+        """
+        parent = func_node.parent
+        if parent is None or parent.type != 'decorated_definition':
+            return False
+        for child in parent.children:
+            if child.type == 'decorator':
+                name = self._extract_decorator_name(child)
+                if name == 'staticmethod' or name.endswith('.staticmethod'):
+                    return True
+        return False
+
     def _extract_calls_recursive(
         self, node: Node, result: ParseResult, ctx: _ParseContext
     ) -> None:
@@ -1072,6 +1433,17 @@ class PythonParser(LanguageParser):
             return
 
         if t == 'function_definition':
+            self_param = _extract_self_param_name(node)
+            inherited_class = ctx.current_class_name()
+            pushed_attribution = False
+            is_static = self._has_staticmethod_decorator(node)
+            if (
+                inherited_class is not None
+                and self_param is not None
+                and not is_static
+            ):
+                ctx.push_class_attribution(inherited_class, self_param)
+                pushed_attribution = True
             ctx.push_local()
             try:
                 body = node.child_by_field_name('body')
@@ -1079,6 +1451,8 @@ class PythonParser(LanguageParser):
                     self._extract_calls_recursive(body, result, ctx)
             finally:
                 ctx.pop_local()
+                if pushed_attribution:
+                    ctx.pop_class_attribution()
             return
 
         if t == 'class_definition':
@@ -1087,10 +1461,21 @@ class PythonParser(LanguageParser):
                 self_bindings = _prescan_class_self_bindings(
                     body, ctx.import_local_to_type
                 )
+                name_node = node.child_by_field_name('name')
+                class_name_str = (
+                    name_node.text.decode('utf8')
+                    if name_node is not None
+                    else ''
+                )
                 ctx.push_class(self_bindings)
+                # Push with self_param=None at class-body level; method-level
+                # frames (with the actual self param) are pushed when we enter
+                # each function_definition inside the class body.
+                ctx.push_class_attribution(class_name_str, None)
                 try:
                     self._extract_calls_recursive(body, result, ctx)
                 finally:
+                    ctx.pop_class_attribution()
                     ctx.pop_class()
             return
 
@@ -1126,6 +1511,15 @@ class PythonParser(LanguageParser):
                 ctx.awaited_depth -= 1
             return
 
+        # return self.x / return MY_CONST — scan for member reads.
+        if t == 'return_statement':
+            for child in node.children:
+                self._scan_node_for_read_accesses(child, result, ctx)
+            # Also recurse to handle calls inside the return expression.
+            for child in node.children:
+                self._extract_calls_recursive(child, result, ctx)
+            return
+
         # raise SomeError (without parens) - reference to the exception class.
         if t == 'raise_statement':
             for child in node.children:
@@ -1146,15 +1540,15 @@ class PythonParser(LanguageParser):
                 if child.type == 'assignment':
                     _try_extract_binding(child, ctx)
                     self._try_extract_member_access_from_assignment(
-                        child, result
+                        child, result, ctx
                     )
                 elif child.type == 'augmented_assignment':
                     self._try_extract_member_access_from_augmented(
-                        child, result
+                        child, result, ctx
                     )
                 elif child.type == 'attribute':
                     # Bare attribute read: ``Status.PENDING`` as a statement.
-                    self._try_emit_member_access(child, 'read', result)
+                    self._try_emit_member_access(child, 'read', result, ctx)
 
         for child in node.children:
             self._extract_calls_recursive(child, result, ctx)
