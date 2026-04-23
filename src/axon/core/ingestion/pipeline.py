@@ -38,6 +38,10 @@ from axon.core.ingestion.coupling import resolve_coupling
 from axon.core.ingestion.dead_code import process_dead_code
 from axon.core.ingestion.heritage import process_heritage
 from axon.core.ingestion.imports import build_file_index, process_imports
+from axon.core.ingestion.members import (
+    build_enum_index,
+    process_member_accesses,
+)
 from axon.core.ingestion.parser_phase import process_parsing
 from axon.core.ingestion.processes import process_processes
 from axon.core.ingestion.resolved import ResolvedEdge
@@ -69,7 +73,9 @@ _SYMBOL_LABELS: frozenset[NodeLabel] = frozenset(NodeLabel) - {
     NodeLabel.FOLDER,
     NodeLabel.COMMUNITY,
     NodeLabel.PROCESS,
+    NodeLabel.ENUM_MEMBER,  # excluded from Phase 7 gate formula
 }
+
 
 def _write_collected_edges(
     edges: list[ResolvedEdge],
@@ -149,8 +155,8 @@ def run_pipeline(
 
     phase_times: dict[str, float] = {}
 
-    # Count phases: 11 base + 1 optional embedding
-    _phase_count = 12 if (storage is not None and embeddings) else 11
+    # Count phases: 12 base + 1 optional embedding
+    _phase_count = 13 if (storage is not None and embeddings) else 12
     _phase_idx = 0
 
     def report(phase: str, intra_pct: float) -> None:
@@ -236,6 +242,11 @@ def run_pipeline(
                 node.properties[patch.key] = patch.value
 
         _write_collected_edges(types_f.result() or [], graph)
+
+    with _timed('Resolving member accesses'):
+        enum_index = build_enum_index(graph)
+        num_accesses = process_member_accesses(parse_data, graph, enum_index)
+        log.info('Member accesses emitted: %d', num_accesses)
 
     coupling_file_nodes = graph.get_nodes_by_label(NodeLabel.FILE)
 
@@ -351,6 +362,8 @@ def reindex_files(
     process_calls(parse_data, graph, name_index=shared_name_index)
     process_heritage(parse_data, graph, name_index=heritage_name_index)
     process_types(parse_data, graph, name_index=shared_name_index)
+    enum_index = build_enum_index(graph)
+    process_member_accesses(parse_data, graph, enum_index)
 
     incremental_nodes = [
         node for node in graph.iter_nodes()

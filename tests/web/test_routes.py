@@ -112,6 +112,7 @@ def mock_storage() -> MagicMock:
     storage.get_process_memberships.return_value = {}
     storage.traverse_with_depth.return_value = []
     storage.execute_raw.return_value = []
+    storage.get_accessors.return_value = []
 
     return storage
 

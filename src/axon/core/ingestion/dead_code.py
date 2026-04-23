@@ -7,6 +7,7 @@ import logging
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import GraphNode, NodeLabel, RelType
 from axon.core.ingestion.test_classifier import is_test_file
+from axon.core.python_lang_constants import ENUM_BASES
 
 logger = logging.getLogger(__name__)
 
@@ -78,16 +79,11 @@ def _has_typing_stub_decorator(node: GraphNode) -> bool:
     return any(d in _TYPING_STUB_DECORATORS for d in decorators)
 
 
-_ENUM_BASES: frozenset[str] = frozenset({
-    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
-})
-
-
 def _is_enum_class(node: GraphNode, label: NodeLabel) -> bool:
     if label != NodeLabel.CLASS:
         return False
-    bases: list[str] = node.properties.get("bases", [])
-    return bool(_ENUM_BASES & set(bases))
+    bases: list[str] = node.properties.get('bases', [])
+    return bool(ENUM_BASES & set(bases))
 
 
 def _is_python_public_api(name: str, file_path: str) -> bool:

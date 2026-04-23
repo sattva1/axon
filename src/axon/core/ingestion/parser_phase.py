@@ -216,6 +216,34 @@ def process_parsing(
                 )
             )
 
+        for member in parse_data.parse_result.members:
+            member_symbol = f'{member.parent}.{member.name}'
+            member_id = generate_id(
+                NodeLabel.ENUM_MEMBER, file_entry.path, member_symbol
+            )
+            member_node = GraphNode(
+                id=member_id,
+                label=NodeLabel.ENUM_MEMBER,
+                name=member.name,
+                file_path=file_entry.path,
+                start_line=member.line,
+                end_line=member.line,
+                class_name=member.parent,
+                language=file_entry.language,
+            )
+            graph.add_node(member_node)
+            parent_id = generate_id(
+                NodeLabel.ENUM, file_entry.path, member.parent
+            )
+            graph.add_relationship(
+                GraphRelationship(
+                    id=f'{parent_id}->defines->{member_id}',
+                    type=RelType.DEFINES,
+                    source=parent_id,
+                    target=member_id,
+                )
+            )
+
         if progress_callback:
             progress_callback(i + 1, total_files)
 

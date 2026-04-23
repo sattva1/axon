@@ -17,6 +17,7 @@ from typing import Any
 
 from axon.core.cypher_guard import WRITE_KEYWORDS, sanitize_cypher
 from axon.core.embeddings.embedder import embed_query
+from axon.core.graph.model import GraphNode, NodeLabel
 from axon.core.ingestion.community import export_to_igraph
 from axon.core.ingestion.parser_phase import get_parser
 from axon.core.ingestion.test_classifier import (
@@ -215,6 +216,78 @@ def handle_query(storage: StorageBackend, query: str, limit: int = 20) -> str:
     return _format_query_results(results, groups)
 
 
+def _render_enum_member_context(
+    node: GraphNode, storage: StorageBackend
+) -> str:
+    """Render a 360-degree view for an ENUM_MEMBER node."""
+    lines = [
+        f'Enum Member: {node.class_name}.{node.name} ({node.file_path}:{node.start_line})'
+    ]
+    lines.append(f'Parent: {node.class_name}')
+    lines.append('')
+
+    accessors = storage.get_accessors(node.id)
+    if not accessors:
+        lines.append('Accessors: none')
+        return '\n'.join(lines)
+
+    by_mode: dict[str, list[GraphNode]] = {}
+    for acc_node, acc_mode, _ in accessors:
+        by_mode.setdefault(acc_mode or 'read', []).append(acc_node)
+
+    for mode in ('read', 'write', 'both'):
+        nodes = by_mode.get(mode, [])
+        if not nodes:
+            continue
+        lines.append(f'Accessors ({mode}): {len(nodes)}')
+        for n in nodes:
+            lines.append(f'  - {n.name}  {n.file_path}:{n.start_line}')
+
+    return '\n'.join(lines)
+
+
+def _render_enum_accessors_flat(
+    node: GraphNode, accessors: list[tuple[GraphNode, str, float]]
+) -> str:
+    """Render a flat accessor list for handle_impact."""
+    lines = [
+        f'Impact analysis for: {node.class_name}.{node.name} (Enum_Member)'
+    ]
+    if not accessors:
+        lines.append('No accessors found.')
+        return '\n'.join(lines)
+    lines.append(f'Total: {len(accessors)} accessor(s)')
+    lines.append('')
+    for i, (acc_node, acc_mode, conf) in enumerate(accessors, 1):
+        label = acc_node.label.value.title() if acc_node.label else 'Unknown'
+        tag = _confidence_tag(conf)
+        lines.append(
+            f'  {i}. {acc_node.name} ({label}) -- '
+            f'{acc_node.file_path}:{acc_node.start_line}'
+            f'  [mode: {acc_mode or "read"}]{tag}'
+        )
+    lines.append('')
+    lines.append('Tip: Review each accessor before changing this enum member.')
+    return '\n'.join(lines)
+
+
+def _render_enum_member_explain(
+    node: GraphNode, accessors: list[tuple[GraphNode, str, float]]
+) -> str:
+    """Render a narrative explanation for an ENUM_MEMBER node."""
+    lines = [f'Explanation: {node.class_name}.{node.name} (Enum_Member)']
+    lines.append('=' * 48)
+    lines.append('')
+    lines.append(f'Enum member of ``{node.class_name}``.')
+    lines.append(f'Location: {node.file_path}:{node.start_line}')
+    accessor_files = {n.file_path for n, _, _ in accessors}
+    lines.append(
+        f'Accessed by {len(accessors)} symbol(s) across '
+        f'{len(accessor_files)} file(s).'
+    )
+    return '\n'.join(lines)
+
+
 def handle_context(storage: StorageBackend, symbol: str) -> str:
     """Provide a 360-degree view of a symbol.
 
@@ -244,9 +317,12 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
     if not node:
         return f"Symbol '{symbol}' not found."
 
-    label_display = node.label.value.title() if node.label else "Unknown"
-    lines = [f"Symbol: {node.name} ({label_display})"]
-    lines.append(f"File: {node.file_path}:{node.start_line}-{node.end_line}")
+    if node.label == NodeLabel.ENUM_MEMBER:
+        return _render_enum_member_context(node, storage)
+
+    label_display = node.label.value.title() if node.label else 'Unknown'
+    lines = [f'Symbol: {node.name} ({label_display})']
+    lines.append(f'File: {node.file_path}:{node.start_line}-{node.end_line}')
 
     if node.signature:
         lines.append(f"Signature: {node.signature}")
@@ -491,6 +567,10 @@ def handle_impact(
     start_node = storage.get_node(results[0].node_id)
     if not start_node:
         return f"Symbol '{symbol}' not found."
+
+    if start_node.label == NodeLabel.ENUM_MEMBER:
+        accessors = storage.get_accessors(start_node.id)
+        return _render_enum_accessors_flat(start_node, accessors)
 
     label_display = start_node.label.value.title()
 
@@ -1132,10 +1212,14 @@ def handle_explain(storage: StorageBackend, symbol: str) -> str:
     if not node:
         return f"Symbol '{symbol}' not found."
 
-    label_display = node.label.value.title() if node.label else "Unknown"
-    lines = [f"Explanation: {node.name} ({label_display})"]
-    lines.append("=" * 48)
-    lines.append("")
+    if node.label == NodeLabel.ENUM_MEMBER:
+        accessors = storage.get_accessors(node.id)
+        return _render_enum_member_explain(node, accessors)
+
+    label_display = node.label.value.title() if node.label else 'Unknown'
+    lines = [f'Explanation: {node.name} ({label_display})']
+    lines.append('=' * 48)
+    lines.append('')
 
     roles = []
     if node.is_entry_point:
@@ -1403,6 +1487,20 @@ def handle_file_context(storage: StorageBackend, file_path: str) -> str:
         or []
     )
 
+    # Enum summary: for each enum in the file, count members and accessors.
+    enum_rows = (
+        storage.execute_raw(
+            f"MATCH (e:Enum) WHERE e.file_path = '{escaped}' "
+            f'OPTIONAL MATCH (e)-[d:CodeRelation]->(m:EnumMember) '
+            f"WHERE d.rel_type = 'defines' "
+            f'OPTIONAL MATCH (acc)-[a:CodeRelation]->(m) '
+            f"WHERE a.rel_type = 'accesses' "
+            f'RETURN e.name, count(DISTINCT m), count(DISTINCT acc) '
+            f'ORDER BY e.name'
+        )
+        or []
+    )
+
     if not sym_rows and not imports_out and not imports_in:
         return f"No data found for file '{file_path}'. Is it indexed?"
 
@@ -1457,11 +1555,25 @@ def handle_file_context(storage: StorageBackend, file_path: str) -> str:
             lines.append(f"  - {name} ({label}) line {start_line}")
 
     if comm_rows:
-        lines.append("")
-        comm_parts = [f"{r[0]} ({r[1]} symbols)" for r in comm_rows if r[0]]
-        lines.append(f"Communities: {', '.join(comm_parts)}")
+        lines.append('')
+        comm_parts = [f'{r[0]} ({r[1]} symbols)' for r in comm_rows if r[0]]
+        lines.append(f'Communities: {", ".join(comm_parts)}')
 
-    return "\n".join(lines)
+    if enum_rows:
+        enum_parts = []
+        for row in enum_rows:
+            enum_name = row[0] or '?'
+            member_count = int(row[1]) if row[1] is not None else 0
+            accessor_count = int(row[2]) if row[2] is not None else 0
+            enum_parts.append(
+                f'{enum_name} ({member_count} members, '
+                f'{accessor_count} accessors)'
+            )
+        if enum_parts:
+            lines.append('')
+            lines.append(f'Enums: {"; ".join(enum_parts)}')
+
+    return '\n'.join(lines)
 
 
 def handle_cycles(storage: StorageBackend, min_size: int = 2) -> str:

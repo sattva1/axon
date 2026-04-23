@@ -115,6 +115,31 @@ class TypeRef:
 
 
 @dataclass
+class MemberInfo:
+    """A parsed class-body member (Phase 5: enum members only)."""
+
+    name: str
+    parent: str  # owning class name
+    kind: str  # "enum_member" for now; Phase 7 extends
+    line: int
+
+
+@dataclass
+class MemberAccess:
+    """A parsed ``Capital.attr`` expression.
+
+    ``parent`` is the bare LHS identifier. Ingestion resolves it against
+    the global ENUM_MEMBER index; unresolved accesses are dropped. Mirrors
+    CallInfo's producer/consumer separation.
+    """
+
+    parent: str  # LHS identifier, e.g. "Status"
+    name: str  # attribute name, e.g. "PENDING"
+    line: int
+    mode: str  # "read" | "write" | "both"
+
+
+@dataclass
 class ParseResult:
     """Complete parse result for a single file."""
 
@@ -128,6 +153,8 @@ class ParseResult:
     exports: list[str] = field(
         default_factory=list
     )  # names from __all__ or export statements
+    members: list[MemberInfo] = field(default_factory=list)
+    member_accesses: list[MemberAccess] = field(default_factory=list)
 
     def build_import_type_map(self) -> dict[str, str]:
         """Map each locally-bound imported name to its canonical class name.

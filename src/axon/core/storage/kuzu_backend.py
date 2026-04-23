@@ -63,7 +63,15 @@ _NODE_PROPERTIES = (
 _DEDICATED_NODE_PROPS = frozenset({'cohesion'})
 
 _DEDICATED_REL_PROPS = frozenset(
-    {'confidence', 'role', 'step_number', 'strength', 'co_changes', 'symbols'}
+    {
+        'confidence',
+        'role',
+        'step_number',
+        'strength',
+        'co_changes',
+        'symbols',
+        'access_mode',
+    }
 )
 
 _REL_PROPERTIES = (
@@ -74,7 +82,8 @@ _REL_PROPERTIES = (
     'strength DOUBLE, '
     'co_changes INT64, '
     'symbols STRING, '
-    "metadata_json STRING DEFAULT ''"
+    "metadata_json STRING DEFAULT '', "
+    "access_mode STRING DEFAULT ''"
 )
 
 # Single source of truth for rel CSV column order. Consumed by both
@@ -91,9 +100,10 @@ _REL_CSV_COLUMNS: tuple[str, ...] = (
     'co_changes',
     'symbols',
     'metadata_json',
+    'access_mode',
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def _serialize_extra_props(
@@ -181,6 +191,7 @@ class KuzuBackend:
                 self._db = kuzu.Database(str(path), read_only=read_only)
                 self._conn = kuzu.Connection(self._db)
                 if not read_only:
+                    self._check_schema_version_write_mode(path)
                     self._create_schema()
                 else:
                     self._check_schema_version(path)
@@ -257,7 +268,7 @@ class KuzuBackend:
                     'RETURN caller.id, caller.file_path, n.id, '
                     'r.rel_type, r.confidence, r.role, '
                     'r.step_number, r.strength, r.co_changes, r.symbols, '
-                    'r.metadata_json',
+                    'r.metadata_json, r.access_mode',
                     parameters={'fp': file_path},
                 )
             while result.has_next():
@@ -291,6 +302,8 @@ class KuzuBackend:
                             props.update(extra)
                     except (ValueError, TypeError):
                         pass
+                if row[11] is not None and row[11] != '':
+                    props['access_mode'] = str(row[11])
                 rel_id = f'{rel_type_str}:{src_id}->{tgt_id}'
                 edges.append(
                     GraphRelationship(
@@ -429,6 +442,56 @@ class KuzuBackend:
         return self._query_nodes_with_metadata(
             query, parameters={'nid': node_id}
         )
+
+    def get_accessors(
+        self, node_id: str, mode: str | None = None
+    ) -> list[tuple[GraphNode, str, float]]:
+        """Return (accessor_node, access_mode, confidence) for each ACCESSES
+        edge pointing at node_id.
+
+        Args:
+            node_id: Target node ID (typically an ENUM_MEMBER).
+            mode: Optional filter by access_mode value.
+
+        Returns:
+            List of triples. Empty list when no edges or node unknown.
+        """
+        conn = self._require_conn()
+        query = (
+            'MATCH (src)-[r:CodeRelation]->(dst) '
+            "WHERE r.rel_type = 'accesses' AND dst.id = $target"
+        )
+        params: dict[str, Any] = {'target': node_id}
+        if mode is not None:
+            query += ' AND r.access_mode = $mode'
+            params['mode'] = mode
+        query += ' RETURN src.*, r.access_mode, r.confidence'
+        rows: list[tuple[GraphNode, str, float]] = []
+        try:
+            with self._lock:
+                result = conn.execute(query, parameters=params)
+            while result.has_next():
+                row = result.get_next()
+                # RETURN src.* yields 14 node columns, then access_mode,
+                # then confidence. Slice accordingly.
+                confidence_val = row[-1]
+                access_mode_val = row[-2]
+                node = self._row_to_node(list(row[:-2]))
+                if node is not None:
+                    rows.append(
+                        (
+                            node,
+                            str(access_mode_val) if access_mode_val else '',
+                            float(confidence_val)
+                            if confidence_val is not None
+                            else 0.0,
+                        )
+                    )
+        except Exception:
+            logger.warning(
+                'get_accessors failed for node %s', node_id, exc_info=True
+            )
+        return rows
 
     _MAX_BFS_DEPTH = 10
 
@@ -931,7 +994,7 @@ class KuzuBackend:
                     'MATCH (a)-[r:CodeRelation]->(b) '
                     'RETURN a.id, b.id, r.rel_type, r.confidence, r.role, '
                     'r.step_number, r.strength, r.co_changes, r.symbols, '
-                    'r.metadata_json'
+                    'r.metadata_json, r.access_mode'
                 )
             while result.has_next():
                 row = result.get_next()
@@ -965,6 +1028,8 @@ class KuzuBackend:
                             props.update(extra)
                     except (ValueError, TypeError):
                         pass
+                if row[10] is not None and row[10] != '':
+                    props['access_mode'] = str(row[10])
 
                 graph.add_relationship(
                     GraphRelationship(
@@ -976,7 +1041,10 @@ class KuzuBackend:
                     )
                 )
         except Exception:
-            logger.error("load_graph: relationship query failed — graph incomplete", exc_info=True)
+            logger.error(
+                'load_graph: relationship query failed - graph incomplete',
+                exc_info=True,
+            )
             raise
 
         return graph
@@ -1197,6 +1265,7 @@ class KuzuBackend:
                             _serialize_extra_props(
                                 rel.properties, _DEDICATED_REL_PROPS
                             ),
+                            str((rel.properties or {}).get('access_mode', '')),
                         ]
                         for rel in rels
                     ],
@@ -1236,32 +1305,49 @@ class KuzuBackend:
             logger.debug("CSV bulk_store_embeddings failed, falling back", exc_info=True)
             return False
 
-    def _check_schema_version(self, path: Path) -> None:
-        """Verify the stored schema version matches the code expectation.
-
-        Called only for read-only opens. Raises RuntimeError when the stored
-        version is absent or older than _SCHEMA_VERSION so the caller gets a
-        clear migration instruction instead of a cryptic column-not-found error.
-        """
+    def _read_stored_schema_version(self) -> int:
+        """Return the schema version stored in _Metadata, or 1 if absent."""
         conn = self._require_conn()
-        stored: int = 1  # pre-Phase-1 DBs have no _Metadata table
         try:
             result = conn.execute(
-                "MATCH (m:_Metadata) WHERE m.key = 'schema_version' RETURN m.value"
+                "MATCH (m:_Metadata) WHERE m.key = 'schema_version' "
+                'RETURN m.value'
             )
             if result.has_next():
                 row = result.get_next()
-                stored = int(row[0]) if row[0] is not None else 1
+                return int(row[0]) if row[0] is not None else 1
         except Exception:
-            # _Metadata table absent - treat as version 1
             pass
+        return 1
 
+    def _check_schema_version(self, path: Path) -> None:
+        """Verify the stored schema version for read-only opens.
+
+        Raises RuntimeError when the stored version is older than
+        _SCHEMA_VERSION so the caller gets a clear rebuild instruction
+        instead of a cryptic column-not-found error.
+        """
+        stored = self._read_stored_schema_version()
         if stored < _SCHEMA_VERSION:
             raise RuntimeError(
                 f'Kuzu DB at {path} is on schema version {stored} but this '
-                f'code expects version {_SCHEMA_VERSION}. Run `axon index` '
-                f'(or let the watcher run) to migrate, then restart the MCP '
-                f'server.'
+                f'code expects version {_SCHEMA_VERSION}. Run '
+                f'`axon clean && axon analyze` to rebuild.'
+            )
+
+    def _check_schema_version_write_mode(self, path: Path) -> None:
+        """Verify the stored schema version for write-mode opens.
+
+        Rejects both older AND newer schemas. A fresh DB (no _Metadata,
+        stored version returns 1) is allowed through - _create_schema will
+        populate it. An existing DB at a different version forces a rebuild.
+        """
+        stored = self._read_stored_schema_version()
+        if stored != _SCHEMA_VERSION and stored != 1:
+            raise RuntimeError(
+                f'Kuzu DB at {path} is on schema version {stored} but this '
+                f'code expects version {_SCHEMA_VERSION}. Run '
+                f'`axon clean && axon analyze` to rebuild.'
             )
 
     def _create_schema(self) -> None:
@@ -1317,6 +1403,16 @@ class KuzuBackend:
         except Exception:
             logger.debug(
                 'metadata_json column already present on CodeRelation',
+                exc_info=True,
+            )
+
+        try:
+            conn.execute(
+                "ALTER TABLE CodeRelation ADD access_mode STRING DEFAULT ''"
+            )
+        except Exception:
+            logger.debug(
+                'access_mode column already present on CodeRelation',
                 exc_info=True,
             )
 
@@ -1423,6 +1519,7 @@ class KuzuBackend:
             'metadata_json': _serialize_extra_props(
                 props, _DEDICATED_REL_PROPS
             ),
+            'access_mode': str(props.get('access_mode', '')),
         }
         try:
             conn.execute(query, parameters=params)

@@ -219,3 +219,19 @@ class StorageBackend(Protocol):
     def rebuild_fts_indexes(self) -> None:
         """Drop and recreate all FTS indexes after bulk data changes."""
         ...
+
+    def get_accessors(
+        self, node_id: str, mode: str | None = None
+    ) -> list[tuple[GraphNode, str, float]]:
+        """Return (accessor_node, access_mode, confidence) for every ACCESSES
+        edge pointing at node_id.
+
+        Args:
+            node_id: Target ENUM_MEMBER node ID.
+            mode: Optional filter - only return edges with this access_mode.
+
+        Returns:
+            List of (accessor_node, access_mode, confidence) triples. Returns
+            an empty list for non-enum or unknown node IDs.
+        """
+        ...

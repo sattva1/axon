@@ -14,16 +14,17 @@ from axon.core.graph.model import (
 
 class TestNodeLabel:
     EXPECTED = [
-        "FILE",
-        "FOLDER",
-        "FUNCTION",
-        "CLASS",
-        "METHOD",
-        "INTERFACE",
-        "TYPE_ALIAS",
-        "ENUM",
-        "COMMUNITY",
-        "PROCESS",
+        'FILE',
+        'FOLDER',
+        'FUNCTION',
+        'CLASS',
+        'METHOD',
+        'INTERFACE',
+        'TYPE_ALIAS',
+        'ENUM',
+        'ENUM_MEMBER',
+        'COMMUNITY',
+        'PROCESS',
     ]
 
     @pytest.mark.parametrize("name", EXPECTED)
@@ -41,17 +42,18 @@ class TestNodeLabel:
 
 class TestRelType:
     EXPECTED = [
-        "CONTAINS",
-        "DEFINES",
-        "CALLS",
-        "IMPORTS",
-        "EXTENDS",
-        "IMPLEMENTS",
-        "MEMBER_OF",
-        "STEP_IN_PROCESS",
-        "USES_TYPE",
-        "EXPORTS",
-        "COUPLED_WITH",
+        'CONTAINS',
+        'DEFINES',
+        'CALLS',
+        'IMPORTS',
+        'EXTENDS',
+        'IMPLEMENTS',
+        'MEMBER_OF',
+        'STEP_IN_PROCESS',
+        'USES_TYPE',
+        'EXPORTS',
+        'COUPLED_WITH',
+        'ACCESSES',
     ]
 
     @pytest.mark.parametrize("name", EXPECTED)

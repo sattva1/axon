@@ -15,33 +15,39 @@ from typing import Any
 class NodeLabel(Enum):
     """Labels for graph nodes representing code-level entities."""
 
-    FILE = "file"
-    FOLDER = "folder"
-    FUNCTION = "function"
-    CLASS = "class"
-    METHOD = "method"
-    INTERFACE = "interface"
-    TYPE_ALIAS = "type_alias"
-    ENUM = "enum"
-    COMMUNITY = "community"
-    PROCESS = "process"
+    FILE = 'file'
+    FOLDER = 'folder'
+    FUNCTION = 'function'
+    CLASS = 'class'
+    METHOD = 'method'
+    INTERFACE = 'interface'
+    TYPE_ALIAS = 'type_alias'
+    ENUM = 'enum'
+    ENUM_MEMBER = 'enum_member'
+    COMMUNITY = 'community'
+    PROCESS = 'process'
+
 
 class RelType(Enum):
     """Relationship types connecting graph nodes."""
 
-    CONTAINS = "contains"
-    DEFINES = "defines"
-    CALLS = "calls"
-    IMPORTS = "imports"
-    EXTENDS = "extends"
-    IMPLEMENTS = "implements"
-    MEMBER_OF = "member_of"
-    STEP_IN_PROCESS = "step_in_process"
-    USES_TYPE = "uses_type"
-    EXPORTS = "exports"
-    COUPLED_WITH = "coupled_with"
+    CONTAINS = 'contains'
+    DEFINES = 'defines'
+    CALLS = 'calls'
+    IMPORTS = 'imports'
+    EXTENDS = 'extends'
+    IMPLEMENTS = 'implements'
+    MEMBER_OF = 'member_of'
+    STEP_IN_PROCESS = 'step_in_process'
+    USES_TYPE = 'uses_type'
+    EXPORTS = 'exports'
+    COUPLED_WITH = 'coupled_with'
+    ACCESSES = 'accesses'
 
-def generate_id(label: NodeLabel, file_path: str, symbol_name: str = "") -> str:
+
+def generate_id(
+    label: NodeLabel, file_path: str, symbol_name: str = ''
+) -> str:
     """Produce a deterministic node ID.
 
     Format: ``{label.value}:{file_path}:{symbol_name}``

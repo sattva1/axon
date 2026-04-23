@@ -157,6 +157,9 @@ class TestStorageBackend:
             def rebuild_fts_indexes(self):
                 pass
 
+            def get_accessors(self, node_id, mode=None):
+                return []
+
         assert isinstance(_DummyBackend(), StorageBackend)
 
     def test_non_conforming_class_fails(self) -> None:

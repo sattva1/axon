@@ -16,10 +16,13 @@ from axon.core.parsers.base import (
     CallInfo,
     ImportInfo,
     LanguageParser,
+    MemberAccess,
+    MemberInfo,
     ParseResult,
     SymbolInfo,
     TypeRef,
 )
+from axon.core.python_lang_constants import ENUM_BASES
 
 PY_LANGUAGE = Language(tspython.language())
 
@@ -743,38 +746,179 @@ class PythonParser(LanguageParser):
         end_line = node.end_point[0] + 1
         node_content = content[node.start_byte : node.end_byte]
 
+        bases: list[str] = []
+        superclasses = node.child_by_field_name('superclasses')
+        if superclasses is not None:
+            for child in superclasses.children:
+                if not child.is_named:
+                    continue
+                if child.type == 'identifier':
+                    parent_name = child.text.decode('utf8')
+                    bases.append(parent_name)
+                    result.heritage.append(
+                        (class_name, 'extends', parent_name)
+                    )
+                elif child.type == 'attribute':
+                    # e.g. class Foo(module.Base): - capture "module.Base"
+                    parent_name = child.text.decode('utf8')
+                    result.heritage.append(
+                        (class_name, 'extends', parent_name)
+                    )
+                elif child.type == 'subscript':
+                    # e.g. class Foo(Generic[T]): - capture "Generic"
+                    base = child.child_by_field_name('value')
+                    if base is not None:
+                        parent_name = base.text.decode('utf8')
+                        result.heritage.append(
+                            (class_name, 'extends', parent_name)
+                        )
+
+        is_enum = bool(set(bases) & ENUM_BASES)
+
         result.symbols.append(
             SymbolInfo(
                 name=class_name,
-                kind="class",
+                kind="enum" if is_enum else "class",
                 start_line=start_line,
                 end_line=end_line,
                 content=node_content,
             )
         )
 
-        superclasses = node.child_by_field_name("superclasses")
-        if superclasses is not None:
-            for child in superclasses.children:
-                if not child.is_named:
-                    continue
-                if child.type == "identifier":
-                    parent_name = child.text.decode("utf8")
-                    result.heritage.append((class_name, "extends", parent_name))
-                elif child.type == "attribute":
-                    # e.g. class Foo(module.Base): — capture "module.Base"
-                    parent_name = child.text.decode("utf8")
-                    result.heritage.append((class_name, "extends", parent_name))
-                elif child.type == "subscript":
-                    # e.g. class Foo(Generic[T]): — capture "Generic"
-                    base = child.child_by_field_name("value")
-                    if base is not None:
-                        parent_name = base.text.decode("utf8")
-                        result.heritage.append((class_name, "extends", parent_name))
-
-        body = node.child_by_field_name("body")
+        body = node.child_by_field_name('body')
         if body is not None:
+            # _walk handles nested class/method definitions; _extract_enum_members
+            # only iterates assignment nodes at the enum-body level - no overlap.
+            if is_enum:
+                self._extract_enum_members(body, class_name, result)
             self._walk(body, content, result, class_name=class_name)
+
+    def _extract_enum_members(
+        self, class_body: Node, class_name: str, result: ParseResult
+    ) -> None:
+        """Extract enum member assignments from a class body.
+
+        Iterates direct children looking for ``expression_statement`` nodes
+        containing ``assignment`` or ``annotated_assignment``. Emits one
+        ``MemberInfo`` per valid LHS identifier.
+
+        Skips:
+        - Non-identifier LHS (tuple unpacking, subscripts, attribute targets).
+        - Dunder-style names (starts AND ends with ``_``).
+        """
+        for child in class_body.children:
+            if child.type != 'expression_statement':
+                continue
+            for stmt in child.children:
+                if stmt.type not in ('assignment', 'annotated_assignment'):
+                    continue
+                left = stmt.child_by_field_name('left')
+                if left is None:
+                    left = stmt.child_by_field_name('name')
+                if left is None:
+                    continue
+                if left.type != 'identifier':
+                    continue
+                lhs = left.text.decode('utf8')
+                if lhs.startswith('_') and lhs.endswith('_'):
+                    continue
+                result.members.append(
+                    MemberInfo(
+                        name=lhs,
+                        parent=class_name,
+                        kind='enum_member',
+                        line=stmt.start_point[0] + 1,
+                    )
+                )
+
+    @staticmethod
+    def _is_capital_attr(attr_node: Node) -> tuple[str, str] | None:
+        """Return (lhs_ident, attr_name) for a qualifying ``Capital.attr`` node.
+
+        Returns None when the node does not match the pattern:
+        - LHS must be a single identifier starting with an uppercase letter.
+        - Rejects ``self.X``, ``cls.X``, chains ``pkg.Foo.X``, and numeric LHS.
+        """
+        if not attr_node.children:
+            return None
+        lhs_node = attr_node.children[0]
+        if lhs_node.type != 'identifier':
+            return None
+        lhs = lhs_node.text.decode('utf8')
+        if not lhs or not lhs[0].isupper():
+            return None
+        # Reject known non-enum receivers.
+        if lhs in ('self', 'cls'):
+            return None
+        attr = None
+        for ch in reversed(attr_node.children):
+            if ch.type == 'identifier':
+                attr = ch.text.decode('utf8')
+                break
+        if attr is None or attr == lhs:
+            return None
+        return (lhs, attr)
+
+    def _try_emit_member_access(
+        self, attr_node: Node, mode: str, result: ParseResult
+    ) -> None:
+        """Emit a MemberAccess if attr_node matches the Capital.attr pattern."""
+        pair = self._is_capital_attr(attr_node)
+        if pair is None:
+            return
+        lhs, attr = pair
+        result.member_accesses.append(
+            MemberAccess(
+                parent=lhs,
+                name=attr,
+                line=attr_node.start_point[0] + 1,
+                mode=mode,
+            )
+        )
+
+    def _try_extract_member_access_from_assignment(
+        self, assignment_node: Node, result: ParseResult
+    ) -> None:
+        """Emit MemberAccess for ``Capital.attr = ...`` (write mode)."""
+        left = assignment_node.child_by_field_name('left')
+        if left is not None and left.type == 'attribute':
+            self._try_emit_member_access(left, 'write', result)
+        # Also scan RHS for read accesses.
+        right = assignment_node.child_by_field_name('right')
+        if right is not None:
+            self._scan_node_for_read_accesses(right, result)
+
+    def _try_extract_member_access_from_augmented(
+        self, aug_node: Node, result: ParseResult
+    ) -> None:
+        """Emit MemberAccess for ``Capital.attr += ...`` (both mode)."""
+        left = aug_node.child_by_field_name('left')
+        if left is not None and left.type == 'attribute':
+            self._try_emit_member_access(left, 'both', result)
+        right = aug_node.child_by_field_name('right')
+        if right is not None:
+            self._scan_node_for_read_accesses(right, result)
+
+    def _scan_node_for_read_accesses(
+        self, node: Node, result: ParseResult
+    ) -> None:
+        """Recursively scan a subtree for Capital.attr reads.
+
+        Stops recursion at call nodes (handled by _extract_calls_recursive)
+        and at attribute nodes that are themselves the target - those are
+        handled by their parent.
+        """
+        if node.type == 'attribute':
+            self._try_emit_member_access(node, 'read', result)
+            return
+        if node.type == 'call':
+            # Call nodes: check if function is a Capital.attr (e.g. Foo.BAR())
+            func = node.child_by_field_name('function')
+            if func is not None and func.type == 'attribute':
+                self._try_emit_member_access(func, 'read', result)
+            return
+        for child in node.children:
+            self._scan_node_for_read_accesses(child, result)
 
     def _extract_import(self, node: Node, result: ParseResult) -> None:
         """Extract a plain ``import X`` statement."""
@@ -1001,6 +1145,16 @@ class PythonParser(LanguageParser):
             for child in node.children:
                 if child.type == 'assignment':
                     _try_extract_binding(child, ctx)
+                    self._try_extract_member_access_from_assignment(
+                        child, result
+                    )
+                elif child.type == 'augmented_assignment':
+                    self._try_extract_member_access_from_augmented(
+                        child, result
+                    )
+                elif child.type == 'attribute':
+                    # Bare attribute read: ``Status.PENDING`` as a statement.
+                    self._try_emit_member_access(child, 'read', result)
 
         for child in node.children:
             self._extract_calls_recursive(child, result, ctx)

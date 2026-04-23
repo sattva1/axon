@@ -67,6 +67,7 @@ def mock_storage():
     storage.get_callees_with_confidence.return_value = []
     storage.get_process_memberships.return_value = {}
     storage.execute_raw.return_value = []
+    storage.get_accessors.return_value = []
     return storage
 
 
@@ -1035,33 +1036,38 @@ class TestHandleFileContext:
             # Dead code
             [],
             # Communities
-            [["mcp+server", 2]],
+            [['mcp+server', 2]],
+            # Enums
+            [],
         ]
-        result = handle_file_context(mock_storage, "src/mcp/tools.py")
-        assert "src/mcp/tools.py" in result
-        assert "handle_query" in result
-        assert "entry point" in result.lower()
-        assert "Imports (2)" in result
-        assert "Imported by (1)" in result
-        assert "test_tools.py" in result
-        assert "0.85" in result
-        assert "mcp+server" in result
+        result = handle_file_context(mock_storage, 'src/mcp/tools.py')
+        assert 'src/mcp/tools.py' in result
+        assert 'handle_query' in result
+        assert 'entry point' in result.lower()
+        assert 'Imports (2)' in result
+        assert 'Imported by (1)' in result
+        assert 'test_tools.py' in result
+        assert '0.85' in result
+        assert 'mcp+server' in result
 
     def test_empty_file(self, mock_storage):
-        mock_storage.execute_raw.side_effect = [[], [], [], [], [], []]
-        result = handle_file_context(mock_storage, "src/empty.py")
-        assert "No data found" in result
+        mock_storage.execute_raw.side_effect = [[], [], [], [], [], [], []]
+        result = handle_file_context(mock_storage, 'src/empty.py')
+        assert 'No data found' in result
 
     def test_file_with_dead_code(self, mock_storage):
         mock_storage.execute_raw.side_effect = [
-            [["old_func", "Function", 45, True, False, False]],
-            [], [], [],
-            [["old_func", 45, "Function"]],
+            [['old_func', 'Function', 45, True, False, False]],
+            [],
+            [],
+            [],
+            [['old_func', 45, 'Function']],
+            [],
             [],
         ]
-        result = handle_file_context(mock_storage, "src/old.py")
-        assert "Dead code" in result
-        assert "old_func" in result
+        result = handle_file_context(mock_storage, 'src/old.py')
+        assert 'Dead code' in result
+        assert 'old_func' in result
 
     def test_empty_file_path(self, mock_storage):
         result = handle_file_context(mock_storage, '')
@@ -1076,6 +1082,7 @@ class TestHandleFileContext:
             [['tests/mcp/test_tools.py', 0.85, 12]],
             [],
             [['mcp+server', 2]],
+            [],
         ]
 
         handle_file_context(mock_storage, 'src/mcp/tools.py')

@@ -515,7 +515,11 @@ def _initialize_writable_storage(
     axon_dir.mkdir(parents=True, exist_ok=True)
 
     storage = KuzuBackend()
-    storage.initialize(db_path)
+    try:
+        storage.initialize(db_path)
+    except RuntimeError as e:
+        console.print(f'[red]Error:[/red] {e}')
+        raise typer.Exit(code=1)
 
     if not _has_index_metadata(axon_dir):
         console.print("[bold]Running initial index...[/bold]")
@@ -759,7 +763,11 @@ def analyze(
     db_path = axon_dir / "kuzu"
 
     storage = KuzuBackend()
-    storage.initialize(db_path)
+    try:
+        storage.initialize(db_path)
+    except RuntimeError as e:
+        console.print(f'[red]Error:[/red] {e}')
+        raise typer.Exit(code=1)
 
     # Run pipeline: skip embeddings here if we'll do them in the background.
     run_embeddings_inline = foreground_embeddings and not no_embeddings
