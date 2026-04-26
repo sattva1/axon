@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
 import time
 from pathlib import Path
 
@@ -23,7 +22,12 @@ from watchfiles import Change
 
 from axon.config.ignore import load_gitignore, should_ignore
 from axon.config.languages import is_supported
-from axon.core.embeddings.embedder import _DEFAULT_MODEL, embed_graph, embed_nodes
+from axon.core.drift import compute_drift_inputs, _get_head_sha
+from axon.core.embeddings.embedder import (
+    _DEFAULT_MODEL,
+    embed_graph,
+    embed_nodes,
+)
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import NodeLabel, RelType
 from axon.core.ingestion.community import process_communities
@@ -78,25 +82,8 @@ def ensure_current_embeddings(
         )
         return True
     except Exception:
-        logger.warning("Full re-embedding failed", exc_info=True)
+        logger.warning('Full re-embedding failed', exc_info=True)
         return False
-
-
-def _get_head_sha(repo_path: Path) -> str | None:
-    """Return the current git HEAD sha, or None if not in a git repo."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return None
 
 
 def _reindex_files(
@@ -287,9 +274,6 @@ async def watch_repo(
 
     When global_refresh_interval_seconds is set, a background task
     periodically runs the full global phases regardless of file changes.
-
-
-
     """
     async def _run_sync(fn, *args):
         if lock is not None:
@@ -305,7 +289,6 @@ async def watch_repo(
     last_known_commit = _get_head_sha(repo_path)
 
     refresh_task: asyncio.Task[None] | None = None
-
 
     if global_refresh_interval_seconds and global_refresh_interval_seconds > 0:
         async def _periodic_refresh() -> None:
@@ -387,6 +370,16 @@ async def watch_repo(
                             snapshot,
                             run_coupling,
                         )
+                        if run_coupling:
+                            await asyncio.to_thread(
+                                lambda: update_meta(
+                                    repo_path,
+                                    **compute_drift_inputs(
+                                        repo_path,
+                                        list(storage.get_file_index().keys()),
+                                    ),
+                                )
+                            )
                 except Exception:
                     logger.exception(
                         'Global phases failed; re-queueing dirty files'

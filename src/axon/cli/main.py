@@ -47,6 +47,8 @@ from axon.core.embeddings.embedder import (
     validate_coreml,
     validate_cuda,
 )
+from axon.core.drift import compute_drift_inputs
+from axon.core.host_meta import host_json_path, load_host_meta
 from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
 from axon.core.ingestion.watcher import ensure_current_embeddings, watch_repo
 from axon.core.meta import load_meta, now_iso, update_meta
@@ -226,7 +228,7 @@ def _build_meta(result: "PipelineResult", repo_path: Path) -> dict:  # noqa: F82
 
 
 def _host_meta_path(repo_path: Path) -> Path:
-    return repo_path / ".axon" / "host.json"
+    return host_json_path(repo_path)
 
 
 def _host_lease_dir(repo_path: Path) -> Path:
@@ -243,13 +245,7 @@ def _build_host_urls(host: str, port: int) -> tuple[str, str]:
 
 
 def _read_host_meta(repo_path: Path) -> dict | None:
-    meta_path = _host_meta_path(repo_path)
-    if not meta_path.exists():
-        return None
-    try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+    return load_host_meta(repo_path)
 
 
 def _write_host_meta(
@@ -532,12 +528,25 @@ def _initialize_writable_storage(
             dead_code_last_refreshed_at=now_iso(),
             communities_last_refreshed_at=now_iso(),
         )
+        update_meta(
+            repo_path,
+            **compute_drift_inputs(
+                repo_path, list(storage.get_file_index().keys())
+            ),
+        )
         try:
             _register_in_global_registry(meta, repo_path)
         except Exception:
             logger.debug("Failed to register repo in global registry", exc_info=True)
     else:
         ensure_current_embeddings(storage, repo_path)
+        if not load_meta(repo_path).head_sha_at_index:
+            update_meta(
+                repo_path,
+                **compute_drift_inputs(
+                    repo_path, list(storage.get_file_index().keys())
+                ),
+            )
 
     return storage, axon_dir, db_path
 
@@ -807,6 +816,12 @@ def analyze(
         last_incremental_at=now_iso(),
         dead_code_last_refreshed_at=now_iso(),
         communities_last_refreshed_at=now_iso(),
+    )
+    update_meta(
+        repo_path,
+        **compute_drift_inputs(
+            repo_path, list(storage.get_file_index().keys())
+        ),
     )
 
     try:

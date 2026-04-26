@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import fields as dc_fields
 from datetime import datetime
 from pathlib import Path
 
 from axon.core.meta import (
+    IndexedDirEntry,
     MetaFile,
+    SentinelEntry,
     _sanitize_stats,
     load_meta,
     meta_path,
@@ -362,3 +365,108 @@ class TestSanitizeStats:
         """Negative integers are valid ints and kept as-is."""
         result = _sanitize_stats({'delta': -5})
         assert result['delta'] == -5
+
+
+class TestMetaDriftFieldsRoundtrip:
+    def test_sentinel_files_and_indexed_dirs_roundtrip(
+        self, tmp_path: Path
+    ) -> None:
+        """update_meta then load_meta round-trips typed sub-records exactly."""
+        sentinels = [
+            SentinelEntry(path='a.py', mtime=1_000_000.0),
+            SentinelEntry(path='b.py', mtime=1_000_100.0),
+        ]
+        dirs = [
+            IndexedDirEntry(
+                path='src/core', mtime=2_000_000.0, indexed_count=3
+            )
+        ]
+        update_meta(
+            tmp_path,
+            head_sha_at_index='deadbeef',
+            repo_root_mtime=9_000_000.0,
+            indexed_file_count=5,
+            sentinel_files=sentinels,
+            indexed_dirs=dirs,
+        )
+
+        result = load_meta(tmp_path)
+        assert result.head_sha_at_index == 'deadbeef'
+        assert result.repo_root_mtime == 9_000_000.0
+        assert result.indexed_file_count == 5
+        assert result.sentinel_files == sentinels
+        assert result.indexed_dirs == dirs
+
+    def test_load_drops_malformed_sentinel_entries(
+        self, tmp_path: Path
+    ) -> None:
+        """load_meta drops malformed sentinel_files entries, keeps valid ones."""
+        axon_dir = tmp_path / '.axon'
+        axon_dir.mkdir()
+        data = {
+            'sentinel_files': [
+                {'path': 'good.py', 'mtime': 1.0},
+                {'path': 'missing_mtime'},
+                'not_a_dict',
+                {'mtime': 2.0},
+            ]
+        }
+        (axon_dir / 'meta.json').write_text(json.dumps(data), encoding='utf-8')
+
+        result = load_meta(tmp_path)
+        assert len(result.sentinel_files) == 1
+        assert result.sentinel_files[0] == SentinelEntry(
+            path='good.py', mtime=1.0
+        )
+
+    def test_load_drops_malformed_indexed_dirs_entries(
+        self, tmp_path: Path
+    ) -> None:
+        """load_meta drops malformed indexed_dirs entries, keeps valid ones."""
+        axon_dir = tmp_path / '.axon'
+        axon_dir.mkdir()
+        data = {
+            'indexed_dirs': [
+                {'path': 'src', 'mtime': 1.0, 'indexed_count': 5},
+                {'path': 'bad'},
+                42,
+                {
+                    'path': 'also_bad',
+                    'mtime': 'not_a_float',
+                    'indexed_count': 1,
+                },
+            ]
+        }
+        (axon_dir / 'meta.json').write_text(json.dumps(data), encoding='utf-8')
+
+        result = load_meta(tmp_path)
+        assert len(result.indexed_dirs) == 1
+        assert result.indexed_dirs[0] == IndexedDirEntry(
+            path='src', mtime=1.0, indexed_count=5
+        )
+
+    def test_update_locked_against_concurrent_writers(
+        self, tmp_path: Path
+    ) -> None:
+        """16 threads each writing a unique field produce well-formed JSON."""
+        num_threads = 16
+
+        def write_field(i: int) -> None:
+            update_meta(tmp_path, **{f'stats': {f'field_{i}': i}})
+
+        threads = [
+            threading.Thread(target=write_field, args=(i,))
+            for i in range(num_threads)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        raw = (tmp_path / '.axon' / 'meta.json').read_text(encoding='utf-8')
+        parsed = json.loads(raw)
+        assert isinstance(parsed, dict)
+        stats = parsed.get('stats', {})
+        for i in range(num_threads):
+            assert f'field_{i}' in stats, f'field_{i} missing from stats'
+            assert stats[f'field_{i}'] == i

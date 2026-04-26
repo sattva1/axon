@@ -490,6 +490,36 @@ class TestWritableStorageInitialization:
         mock_storage.initialize.assert_called_once_with(db_path)
         mock_migrate.assert_called_once_with(mock_storage, tmp_path)
 
+    def test_backfills_drift_for_existing_index(self, tmp_path: Path) -> None:
+        """else-branch backfills drift fields when head_sha_at_index is absent."""
+        from axon.core.meta import load_meta
+
+        axon_dir = tmp_path / '.axon'
+        db_path = axon_dir / 'kuzu'
+        db_path.mkdir(parents=True)
+        (db_path / 'data.kz').write_text('', encoding='utf-8')
+        # Existing meta without any drift fields.
+        (axon_dir / 'meta.json').write_text(
+            json.dumps({'last_indexed_at': '2024-01-01T00:00:00+00:00'}),
+            encoding='utf-8',
+        )
+
+        fake_files = {'src/module.py': None, 'src/util.py': None}
+        mock_storage = MagicMock()
+        mock_storage.get_file_index.return_value = fake_files
+
+        with patch('axon.cli.main.KuzuBackend', return_value=mock_storage):
+            with patch('axon.cli.main.ensure_current_embeddings'):
+                _initialize_writable_storage(tmp_path, auto_index=False)
+
+        result = load_meta(tmp_path)
+        # Drift fields must have been written - file count reflects the index.
+        assert result.indexed_file_count == 2
+        assert isinstance(result.sentinel_files, list)
+        assert isinstance(result.indexed_dirs, list)
+        # head_sha_at_index is '' for non-git dirs, which is what compute_drift_inputs returns.
+        assert isinstance(result.head_sha_at_index, str)
+
 
 class TestWatch:
     def test_coreml_flag_accepted(self) -> None:
