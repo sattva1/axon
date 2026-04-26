@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -18,7 +17,7 @@ import urllib.error
 import urllib.request
 import uuid
 import webbrowser
-from datetime import datetime, timezone
+
 from pathlib import Path
 from typing import Optional
 
@@ -52,6 +51,7 @@ from axon.core.host_meta import host_json_path, load_host_meta
 from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
 from axon.core.ingestion.watcher import ensure_current_embeddings, watch_repo
 from axon.core.meta import load_meta, now_iso, update_meta
+from axon.core.repos import default_registry_dir, RegistryEntry, allocate_slug
 from axon.core.storage.base import EMBEDDING_DIMENSIONS
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp import tools as mcp_tools
@@ -165,65 +165,45 @@ def _maybe_notify_update(invoked_subcommand: str | None) -> None:
 def _register_in_global_registry(meta: dict, repo_path: Path) -> None:
     """Write meta.json into ``~/.axon/repos/{slug}/`` for multi-repo discovery.
 
-    Slug is ``{repo_name}`` if that slot is unclaimed or already belongs to
-    this repo.  Falls back to ``{repo_name}-{sha256(path)[:8]}`` on collision.
+    Delegates slug allocation and stale-slot cleanup to ``allocate_slug`` and
+    uses ``RegistryEntry`` for a schema-consistent serialisation.
     """
-    registry_root = Path.home() / ".axon" / "repos"
-    repo_name = repo_path.name
-
-    candidate = registry_root / repo_name
-    slug = repo_name
-    if candidate.exists():
-        existing_meta_path = candidate / "meta.json"
-        try:
-            existing = json.loads(existing_meta_path.read_text())
-            if existing.get("path") != str(repo_path):
-                short_hash = hashlib.sha256(str(repo_path).encode()).hexdigest()[:8]
-                slug = f"{repo_name}-{short_hash}"
-        except (json.JSONDecodeError, OSError):
-            shutil.rmtree(candidate, ignore_errors=True)  # Clean broken slot before claiming
-
-    # Remove any stale entry for the same repo_path under a different slug.
-    if registry_root.exists():
-        for old_dir in registry_root.iterdir():
-            if not old_dir.is_dir() or old_dir.name == slug:
-                continue
-            old_meta = old_dir / "meta.json"
-            try:
-                old_data = json.loads(old_meta.read_text())
-                if old_data.get("path") == str(repo_path):
-                    shutil.rmtree(old_dir, ignore_errors=True)
-            except (json.JSONDecodeError, OSError):
-                continue
-
-    slot = registry_root / slug
+    registry_dir = default_registry_dir()
+    slug = allocate_slug(repo_path, registry_dir)
+    entry = RegistryEntry(
+        name=meta['name'],
+        path=meta['path'],
+        slug=slug,
+        last_indexed_at=meta.get('last_indexed_at', ''),
+        stats=meta.get('stats', {}),
+        embedding_model=meta.get('embedding_model', ''),
+        embedding_dimensions=int(meta.get('embedding_dimensions', 0)),
+    )
+    slot = registry_dir / slug
     slot.mkdir(parents=True, exist_ok=True)
-
-    registry_meta = dict(meta)
-    registry_meta["slug"] = slug
-    (slot / "meta.json").write_text(
-        json.dumps(registry_meta, indent=2) + "\n", encoding="utf-8"
+    (slot / 'meta.json').write_text(
+        json.dumps(entry.to_json(), indent=2) + '\n', encoding='utf-8'
     )
 
 
-def _build_meta(result: "PipelineResult", repo_path: Path) -> dict:  # noqa: F821
+def _build_meta(result: 'PipelineResult', repo_path: Path) -> dict:  # noqa: F821
     return {
-        "version": __version__,
-        "name": repo_path.name,
-        "path": str(repo_path),
-        "embedding_model": _DEFAULT_MODEL,
-        "embedding_dimensions": EMBEDDING_DIMENSIONS,
-        "stats": {
-            "files": result.files,
-            "symbols": result.symbols,
-            "relationships": result.relationships,
-            "clusters": result.clusters,
-            "flows": result.processes,
-            "dead_code": result.dead_code,
-            "coupled_pairs": result.coupled_pairs,
-            "embeddings": result.embeddings,
+        'version': __version__,
+        'name': repo_path.name,
+        'path': str(repo_path),
+        'embedding_model': _DEFAULT_MODEL,
+        'embedding_dimensions': EMBEDDING_DIMENSIONS,
+        'stats': {
+            'files': result.files,
+            'symbols': result.symbols,
+            'relationships': result.relationships,
+            'clusters': result.clusters,
+            'flows': result.processes,
+            'dead_code': result.dead_code,
+            'coupled_pairs': result.coupled_pairs,
+            'embeddings': result.embeddings,
         },
-        "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
+        'last_indexed_at': now_iso(),
     }
 
 

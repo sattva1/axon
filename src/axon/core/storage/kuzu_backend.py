@@ -1323,9 +1323,9 @@ class KuzuBackend:
     def _check_schema_version(self, path: Path) -> None:
         """Verify the stored schema version for read-only opens.
 
-        Raises RuntimeError when the stored version is older than
-        _SCHEMA_VERSION so the caller gets a clear rebuild instruction
-        instead of a cryptic column-not-found error.
+        Raises RuntimeError when the stored version differs from
+        _SCHEMA_VERSION in either direction.  An older version directs the
+        user to rebuild; a newer version directs them to upgrade the CLI.
         """
         stored = self._read_stored_schema_version()
         if stored < _SCHEMA_VERSION:
@@ -1333,6 +1333,13 @@ class KuzuBackend:
                 f'Kuzu DB at {path} is on schema version {stored} but this '
                 f'code expects version {_SCHEMA_VERSION}. Run '
                 f'`axon clean && axon analyze` to rebuild.'
+            )
+        if stored > _SCHEMA_VERSION:
+            raise RuntimeError(
+                f'Kuzu DB at {path} is on schema version {stored} but this '
+                f'code only supports up to version {_SCHEMA_VERSION}. '
+                f'Upgrade the axon CLI (`pip install -U axoniq`) to read '
+                f'this index.'
             )
 
     def _check_schema_version_write_mode(self, path: Path) -> None:

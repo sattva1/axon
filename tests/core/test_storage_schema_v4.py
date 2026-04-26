@@ -78,3 +78,23 @@ class TestSchemaVersionFour:
         msg = str(exc_info.value)
         assert 'axon clean' in msg
         assert 'axon analyze' in msg
+
+    def test_check_schema_version_rejects_newer(self, tmp_path: Path) -> None:
+        """read-only open of a DB with stored version > _SCHEMA_VERSION raises RuntimeError.
+
+        The error message must direct the user to upgrade the CLI, not to rebuild.
+        """
+        db_path = tmp_path / 'db'
+        future_version = _SCHEMA_VERSION + 1
+        b = KuzuBackend()
+        b.initialize(db_path)
+        b._conn.execute(
+            f"MERGE (_m:_Metadata {{key: 'schema_version'}}) "
+            f"SET _m.value = '{future_version}'"
+        )
+        b.close()
+
+        b2 = KuzuBackend()
+        with pytest.raises(RuntimeError, match='Upgrade the axon CLI'):
+            b2.initialize(db_path, read_only=True)
+        b2.close()
