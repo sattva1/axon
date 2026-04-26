@@ -7,16 +7,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
 
 from axon.core.repos import (
+    RegistryEntry,
     RepoNotFound,
     RepoPool,
     RepoResolver,
     RepoUnavailable,
-    RegistryEntry,
     allocate_slug,
     parse_qualified_id,
     qualify_node_id,
@@ -400,6 +401,77 @@ class TestRepoPool:
         writer = KuzuBackend()
         writer.initialize(foreign / '.axon' / 'kuzu')
         writer.close()
+
+    def test_idle_handle_evicted_on_next_get_of_other_slug(
+        self, tmp_path: Path
+    ) -> None:
+        """A handle idle longer than idle_ttl_seconds is closed on the next
+        ``get`` for any slug, releasing its read-only lock so an external
+        writer can acquire the DB.
+        """
+        registry = tmp_path / 'registry'
+        idle = _make_indexed_repo(tmp_path, 'idle')
+        active = _make_indexed_repo(tmp_path, 'active')
+        _write_registry_entry(registry, 'idle', idle)
+        _write_registry_entry(registry, 'active', active)
+        resolver = RepoResolver(registry_dir=registry)
+        pool = RepoPool(resolver, idle_ttl_seconds=0.05)
+
+        idle_backend = pool.get('idle')
+        assert 'idle' in pool._backends
+
+        # Wait past the TTL, then touch a different slug.
+        time.sleep(0.1)
+        pool.get('active')
+
+        # The idle handle should have been evicted by the lazy sweep.
+        assert 'idle' not in pool._backends
+        # And its lock should now be released - a writer can open the DB.
+        writer = KuzuBackend()
+        writer.initialize(idle / '.axon' / 'kuzu')
+        writer.close()
+        # idle_backend is now closed; explicitly call close() to confirm
+        # double-close is safe (no exception).
+        idle_backend.close()
+        pool.close_all()
+
+    def test_close_idle_releases_handles_explicitly(
+        self, tmp_path: Path
+    ) -> None:
+        """close_idle() can be called externally to release stale handles
+        without waiting for the next get."""
+        registry = tmp_path / 'registry'
+        foreign = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'foreign', foreign)
+        resolver = RepoResolver(registry_dir=registry)
+        pool = RepoPool(resolver, idle_ttl_seconds=0.05)
+
+        pool.get('foreign')
+        assert 'foreign' in pool._backends
+
+        time.sleep(0.1)
+        pool.close_idle()
+
+        assert 'foreign' not in pool._backends
+        # Writer can now claim the DB.
+        writer = KuzuBackend()
+        writer.initialize(foreign / '.axon' / 'kuzu')
+        writer.close()
+        pool.close_all()
+
+    def test_get_within_ttl_keeps_handle_warm(self, tmp_path: Path) -> None:
+        """A handle re-fetched within the TTL stays open and returns the
+        same instance."""
+        registry = tmp_path / 'registry'
+        foreign = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'foreign', foreign)
+        resolver = RepoResolver(registry_dir=registry)
+        pool = RepoPool(resolver, idle_ttl_seconds=10.0)
+
+        b1 = pool.get('foreign')
+        b2 = pool.get('foreign')
+        assert b1 is b2
+        pool.close_all()
 
 
 # ---------------------------------------------------------------------------

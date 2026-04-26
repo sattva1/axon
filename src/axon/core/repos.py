@@ -16,6 +16,7 @@ import json
 import logging
 import shutil
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 _QUALIFIER_SEPARATOR = '::'
+
 
 def default_registry_dir() -> Path:
     """Return the per-user registry directory path.
@@ -392,12 +394,26 @@ class RepoUnavailable(Exception):
 # ---------------------------------------------------------------------------
 
 
-class RepoPool:
-    """Foreign-only, lazy, session-lifetime read-only KuzuBackend pool.
+DEFAULT_POOL_IDLE_TTL_SECONDS = 60.0
 
-    Each foreign repo is opened at most once per session.  Failures are cached
-    so repeated requests for an unavailable repo do not retry the expensive
-    ``KuzuBackend.initialize`` path.
+
+class RepoPool:
+    """Foreign-only, lazy, idle-evicting read-only KuzuBackend pool.
+
+    Each foreign repo is opened on first access and cached for repeat queries.
+    A handle that has not been used for ``idle_ttl_seconds`` is evicted on
+    the next ``get`` (lazy sweep) and any subsequent ``close_idle`` call.
+
+    Idle eviction is *not* a performance optimisation - it exists because
+    Kuzu's reader-writer lock prevents an external ``axon analyze`` from
+    opening a foreign DB read-write while we hold a read-only handle. The
+    TTL gives ``analyze`` a window to acquire the writer lock without us
+    fighting for it.
+
+    Failures are cached so repeated requests for an unavailable repo do not
+    retry the expensive ``KuzuBackend.initialize`` path within the same
+    session. Failures do *not* idle-evict - they remain sticky until
+    ``close_all`` clears them.
 
     Invariant: ``get`` MUST be called from inside ``asyncio.to_thread`` in
     async contexts to keep the blocking native DB open off the event loop.
@@ -407,11 +423,39 @@ class RepoPool:
     standalone fallback path directly.
     """
 
-    def __init__(self, resolver: RepoResolver) -> None:
+    def __init__(
+        self,
+        resolver: RepoResolver,
+        *,
+        idle_ttl_seconds: float = DEFAULT_POOL_IDLE_TTL_SECONDS,
+    ) -> None:
         self._resolver = resolver
         self._backends: dict[str, KuzuBackend] = {}
+        self._last_used: dict[str, float] = {}
         self._failures: dict[str, RepoUnavailable] = {}
+        self._idle_ttl = idle_ttl_seconds
         self._lock = threading.Lock()
+
+    def _evict_idle_locked(self, now: float) -> None:
+        """Close and forget any backend idle longer than _idle_ttl.
+
+        Caller must hold self._lock.
+        """
+        stale_slugs = [
+            slug
+            for slug, last in self._last_used.items()
+            if (now - last) > self._idle_ttl
+        ]
+        for slug in stale_slugs:
+            backend = self._backends.pop(slug, None)
+            self._last_used.pop(slug, None)
+            if backend is not None:
+                try:
+                    backend.close()
+                except Exception:
+                    logger.debug(
+                        'Error closing idle backend %r', slug, exc_info=True
+                    )
 
     def get(self, slug: str) -> KuzuBackend:
         """Return the cached backend for *slug*, opening it on first access.
@@ -419,8 +463,14 @@ class RepoPool:
         Raises ``RepoUnavailable`` when the repo cannot be resolved or the
         database cannot be opened (``RuntimeError`` or ``OSError`` from
         ``KuzuBackend.initialize`` are both wrapped).
+
+        Touches the requested slug's last-use timestamp. Stale handles for
+        *other* slugs are evicted lazily by this call.
         """
+        now = time.monotonic()
         with self._lock:
+            self._evict_idle_locked(now)
+
             # Reject local slug with a clear message.
             local = self._resolver.local()
             if local is not None and slug == local.slug:
@@ -431,6 +481,7 @@ class RepoPool:
                 )
 
             if slug in self._backends:
+                self._last_used[slug] = now
                 return self._backends[slug]
 
             if slug in self._failures:
@@ -457,7 +508,14 @@ class RepoPool:
                 raise exc
 
             self._backends[slug] = backend
+            self._last_used[slug] = now
             return backend
+
+    def close_idle(self) -> None:
+        """Close handles idle longer than the TTL. Public counterpart for
+        the internal lazy sweep, callable from a background timer."""
+        with self._lock:
+            self._evict_idle_locked(time.monotonic())
 
     def known_foreign_slugs(self) -> list[str]:
         """Slugs of all foreign repos currently visible in the registry."""
@@ -475,6 +533,7 @@ class RepoPool:
                         exc_info=True,
                     )
             self._backends.clear()
+            self._last_used.clear()
             self._failures.clear()
 
 

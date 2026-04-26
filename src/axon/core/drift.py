@@ -24,6 +24,7 @@ the same repo more than once per cache window.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import subprocess
@@ -434,6 +435,11 @@ def probe_drift(repo_path: Path) -> DriftReport:
     Returns a DriftReport with level UNKNOWN when no meta.json exists or
     when repo_path is not accessible. Falls through to STALE_MAJOR when
     meta.json exists but has no drift fields (pre-Phase-1 index).
+
+    The ``watcher_alive`` flag is probed independently of which tier
+    produces the verdict: a host.json file at *repo_path* always implies
+    a live watcher, regardless of whether Tier 0 short-circuited the
+    cascade or a later tier produced the freshness verdict.
     """
     if not repo_path.exists():
         return DriftReport(
@@ -450,22 +456,20 @@ def probe_drift(repo_path: Path) -> DriftReport:
 
     meta = load_meta(repo_path)
     now = time.time()
+    watcher_alive = is_host_alive_fast(repo_path)
 
     report = _probe_tier0(repo_path, meta, now)
-    if report is not None:
-        return report
+    if report is None:
+        report = _probe_tier1(repo_path, meta)
+    if report is None:
+        report = _probe_tier2(repo_path, meta)
+    if report is None:
+        report = _probe_tier3(repo_path, meta)
 
-    report = _probe_tier1(repo_path, meta)
     if report is not None:
-        return report
-
-    report = _probe_tier2(repo_path, meta)
-    if report is not None:
-        return report
-
-    report = _probe_tier3(repo_path, meta)
-    if report is not None:
-        return report
+        if report.watcher_alive == watcher_alive:
+            return report
+        return dataclasses.replace(report, watcher_alive=watcher_alive)
 
     has_drift_fields = bool(
         meta.head_sha_at_index
@@ -485,7 +489,7 @@ def probe_drift(repo_path: Path) -> DriftReport:
             head_sha_at_index=None,
             files_changed_estimate=None,
             files_indexed_estimate=meta.indexed_file_count or None,
-            watcher_alive=False,
+            watcher_alive=watcher_alive,
             tier_used=None,
         )
 
@@ -497,7 +501,7 @@ def probe_drift(repo_path: Path) -> DriftReport:
         head_sha_at_index=meta.head_sha_at_index or None,
         files_changed_estimate=None,
         files_indexed_estimate=meta.indexed_file_count or None,
-        watcher_alive=False,
+        watcher_alive=watcher_alive,
         tier_used=None,
     )
 

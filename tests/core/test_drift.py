@@ -417,6 +417,55 @@ class TestProbeEdgeCases:
         assert report.level == DriftLevel.STALE_MAJOR
         assert report.tier_used is None
 
+    def test_watcher_alive_set_when_host_json_exists_in_tier1(
+        self, tmp_path: Path
+    ) -> None:
+        """watcher_alive is True when host.json exists, regardless of which
+        tier produced the freshness verdict.
+
+        Regression test: previously watcher_alive was only set in Tier 0;
+        when Tier 1 produced FRESH, the flag stayed False even with a live
+        watcher's host.json present.
+        """
+        (tmp_path / '.gitignore').write_text('.axon/\n', encoding='utf-8')
+        (tmp_path / 'main.py').write_text('pass\n', encoding='utf-8')
+        _init_git_repo(tmp_path)
+
+        head = _git(['rev-parse', 'HEAD'], tmp_path).stdout.strip()
+        # Stale last_incremental_at so Tier 0 falls through to Tier 1.
+        update_meta(
+            tmp_path,
+            head_sha_at_index=head,
+            indexed_file_count=1,
+            last_incremental_at='2024-01-01T00:00:00+00:00',
+        )
+        # Host.json exists - watcher is alive.
+        _write_host_json(tmp_path, '2024-01-01T00:00:00+00:00')
+
+        report = probe_drift(tmp_path)
+        assert report.tier_used == 1
+        assert report.level == DriftLevel.FRESH
+        assert report.watcher_alive is True
+
+    def test_watcher_alive_false_when_no_host_json(
+        self, tmp_path: Path
+    ) -> None:
+        """watcher_alive is False when host.json is absent, even with a
+        FRESH Tier 1 verdict."""
+        (tmp_path / '.gitignore').write_text('.axon/\n', encoding='utf-8')
+        (tmp_path / 'main.py').write_text('pass\n', encoding='utf-8')
+        _init_git_repo(tmp_path)
+
+        head = _git(['rev-parse', 'HEAD'], tmp_path).stdout.strip()
+        update_meta(
+            tmp_path, head_sha_at_index=head, indexed_file_count=1
+        )
+
+        report = probe_drift(tmp_path)
+        assert report.tier_used == 1
+        assert report.level == DriftLevel.FRESH
+        assert report.watcher_alive is False
+
 
 # ---------------------------------------------------------------------------
 # DriftCache
@@ -469,7 +518,7 @@ class TestDriftCache:
                 assert call_count == 1
                 assert r2 is r1
 
-                r3 = cache.get_or_probe(tmp_path)
+                cache.get_or_probe(tmp_path)
                 assert call_count == 2
 
     def test_invalidate_drops_entry(self, tmp_path: Path) -> None:
