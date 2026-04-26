@@ -11,6 +11,7 @@ import asyncio
 import re
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -194,16 +195,24 @@ class TestCypherReadOnlyEnforcement:
 
 
 class TestDispatchToolSignature:
-    """Regression tests for _dispatch_tool signature and repo_path plumbing."""
+    """Regression tests for _dispatch_tool signature and repo_path plumbing.
 
-    def test_list_repos_works_without_repo_path(self, tmp_path: Path) -> None:
-        """axon_list_repos dispatches correctly with only the default repo_path."""
+    Phase 3 changed the signature from _dispatch_tool(name, args, storage,
+    repo_path=...) to _dispatch_tool(name, args, ctx: RepoContext). These
+    tests use make_ctx to build the context and verify the handler receives
+    ctx.repo_path correctly.
+    """
+
+    def test_list_repos_works_without_repo_path(
+        self, tmp_path: Path, make_ctx: Any
+    ) -> None:
+        """axon_list_repos dispatches correctly via a RepoContext."""
         mock_storage = MagicMock()
-        result = _dispatch_tool('axon_list_repos', {}, mock_storage)
+        result = _dispatch_tool('axon_list_repos', {}, make_ctx(mock_storage))
         assert isinstance(result, str)
 
-    def test_test_impact_receives_repo_path(self) -> None:
-        """axon_test_impact passes repo_path through to handle_test_impact."""
+    def test_test_impact_receives_repo_path(self, make_ctx: Any) -> None:
+        """axon_test_impact passes ctx.repo_path through to handle_test_impact."""
         mock_storage = MagicMock()
         mock_storage.execute_raw.return_value = []
         repo = Path('/tmp/repo')
@@ -214,21 +223,22 @@ class TestDispatchToolSignature:
         with patch.object(
             server_module,
             'handle_test_impact',
-            side_effect=lambda *a, **kw: (
-                captured.append(kw.get('repo_path')) or 'ok'
+            side_effect=lambda ctx, **kw: (
+                captured.append(ctx.repo_path) or 'ok'
             ),
         ):
             _dispatch_tool(
                 'axon_test_impact',
                 {'diff': 'diff --git a/x.py b/x.py\n'},
-                mock_storage,
-                repo_path=repo,
+                make_ctx(mock_storage, repo_path=repo),
             )
 
         assert captured == [repo]
 
-    def test_test_impact_default_repo_path_is_none(self) -> None:
-        """axon_test_impact passes repo_path=None when not supplied."""
+    def test_test_impact_default_repo_path_is_none(
+        self, make_ctx: Any
+    ) -> None:
+        """axon_test_impact receives ctx.repo_path=None when context has no path."""
         mock_storage = MagicMock()
         mock_storage.execute_raw.return_value = []
         captured: list[Path | None] = []
@@ -236,14 +246,14 @@ class TestDispatchToolSignature:
         with patch.object(
             server_module,
             'handle_test_impact',
-            side_effect=lambda *a, **kw: (
-                captured.append(kw.get('repo_path')) or 'ok'
+            side_effect=lambda ctx, **kw: (
+                captured.append(ctx.repo_path) or 'ok'
             ),
         ):
             _dispatch_tool(
                 'axon_test_impact',
                 {'diff': 'diff --git a/x.py b/x.py\n'},
-                mock_storage,
+                make_ctx(mock_storage, repo_path=None),
             )
 
         assert captured == [None]

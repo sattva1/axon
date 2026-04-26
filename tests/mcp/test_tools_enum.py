@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -102,29 +103,35 @@ class TestHandleContextEnumMember:
     """handle_context renders ENUM_MEMBER nodes correctly."""
 
     def test_enum_member_header_present(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Result contains the 'Enum Member:' header line."""
-        result = handle_context(enum_member_storage, 'Status.PENDING')
+        result = handle_context(
+            make_ctx(enum_member_storage), 'Status.PENDING'
+        )
         assert 'Enum Member:' in result
 
     def test_enum_member_parent_line(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Result contains a 'Parent:' line with the class name."""
-        result = handle_context(enum_member_storage, 'Status.PENDING')
+        result = handle_context(
+            make_ctx(enum_member_storage), 'Status.PENDING'
+        )
         assert 'Parent: Status' in result
 
     def test_enum_member_no_accessors_message(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """When no accessors exist, result says 'Accessors: none'."""
         enum_member_storage.get_accessors.return_value = []
-        result = handle_context(enum_member_storage, 'Status.PENDING')
+        result = handle_context(
+            make_ctx(enum_member_storage), 'Status.PENDING'
+        )
         assert 'Accessors: none' in result
 
     def test_enum_member_accessors_grouped_by_mode(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Accessors are rendered in mode-grouped sections."""
         read_fn = _make_accessor_node('process_item')
@@ -135,7 +142,9 @@ class TestHandleContextEnumMember:
             (write_fn, 'write', 0.8),
             (both_fn, 'both', 1.0),
         ]
-        result = handle_context(enum_member_storage, 'Status.PENDING')
+        result = handle_context(
+            make_ctx(enum_member_storage), 'Status.PENDING'
+        )
         assert 'Accessors (read)' in result
         assert 'Accessors (write)' in result
         assert 'Accessors (both)' in result
@@ -144,10 +153,10 @@ class TestHandleContextEnumMember:
         assert 'toggle_item' in result
 
     def test_non_enum_node_existing_rendering_unchanged(
-        self, mock_storage: MagicMock
+        self, mock_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Non-ENUM_MEMBER node falls through to standard context rendering."""
-        result = handle_context(mock_storage, 'validate')
+        result = handle_context(make_ctx(mock_storage), 'validate')
         assert 'Symbol: validate (Function)' in result
         assert 'Enum Member:' not in result
 
@@ -156,44 +165,48 @@ class TestHandleImpactEnumMember:
     """handle_impact on ENUM_MEMBER uses get_accessors path."""
 
     def test_enum_member_uses_accessors_not_traverse(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """get_accessors is called; traverse_with_depth is not called."""
         accessor = _make_accessor_node('handler')
-        enum_member_storage.get_accessors.return_value = [(accessor, 'read', 1.0)]
+        enum_member_storage.get_accessors.return_value = [
+            (accessor, 'read', 1.0)
+        ]
 
-        handle_impact(enum_member_storage, 'Status.PENDING')
+        handle_impact(make_ctx(enum_member_storage), 'Status.PENDING')
 
         enum_member_storage.get_accessors.assert_called_once()
         enum_member_storage.traverse_with_depth.assert_not_called()
 
     def test_enum_member_impact_renders_flat_list(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Impact output includes total accessor count."""
         accessor = _make_accessor_node('handler')
-        enum_member_storage.get_accessors.return_value = [(accessor, 'read', 1.0)]
+        enum_member_storage.get_accessors.return_value = [
+            (accessor, 'read', 1.0)
+        ]
 
-        result = handle_impact(enum_member_storage, 'Status.PENDING')
+        result = handle_impact(make_ctx(enum_member_storage), 'Status.PENDING')
         assert 'handler' in result
         assert 'Total:' in result or '1 accessor' in result
 
     def test_enum_member_no_accessors_message(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Impact output says 'No accessors found' when empty."""
         enum_member_storage.get_accessors.return_value = []
 
-        result = handle_impact(enum_member_storage, 'Status.PENDING')
+        result = handle_impact(make_ctx(enum_member_storage), 'Status.PENDING')
         assert 'No accessors found' in result
 
     def test_non_enum_impact_uses_traverse(
-        self, mock_storage: MagicMock
+        self, mock_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Standard function uses traverse_with_depth, not get_accessors."""
         mock_storage.traverse_with_depth.return_value = []
 
-        handle_impact(mock_storage, 'validate')
+        handle_impact(make_ctx(mock_storage), 'validate')
 
         mock_storage.traverse_with_depth.assert_called()
 
@@ -202,35 +215,43 @@ class TestHandleExplainEnumMember:
     """handle_explain renders ENUM_MEMBER with accessor count."""
 
     def test_enum_member_explain_header(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Explanation header shows label 'Enum_Member'."""
-        result = handle_explain(enum_member_storage, 'Status.PENDING')
+        result = handle_explain(
+            make_ctx(enum_member_storage), 'Status.PENDING'
+        )
         assert 'Enum_Member' in result
 
     def test_enum_member_explain_parent_reference(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Explanation contains 'Enum member of ``Status``.' text."""
-        result = handle_explain(enum_member_storage, 'Status.PENDING')
+        result = handle_explain(
+            make_ctx(enum_member_storage), 'Status.PENDING'
+        )
         assert 'Enum member of' in result
         assert 'Status' in result
 
     def test_enum_member_explain_accessor_count(
-        self, enum_member_storage: MagicMock
+        self, enum_member_storage: MagicMock, make_ctx: Any
     ) -> None:
         """Explanation reports the number of accessing symbols."""
         accessor = _make_accessor_node('handler')
         enum_member_storage.get_accessors.return_value = [
-            (accessor, 'read', 1.0),
+            (accessor, 'read', 1.0)
         ]
-        result = handle_explain(enum_member_storage, 'Status.PENDING')
+        result = handle_explain(
+            make_ctx(enum_member_storage), 'Status.PENDING'
+        )
         assert '1 symbol' in result
 
-    def test_non_enum_explain_unchanged(self, mock_storage: MagicMock) -> None:
+    def test_non_enum_explain_unchanged(
+        self, mock_storage: MagicMock, make_ctx: Any
+    ) -> None:
         """Non-ENUM_MEMBER explain uses the standard rendering path."""
         mock_storage.execute_raw.return_value = []
-        result = handle_explain(mock_storage, 'validate')
+        result = handle_explain(make_ctx(mock_storage), 'validate')
         assert 'Explanation: validate' in result
         assert 'Enum member of' not in result
 
@@ -262,23 +283,20 @@ class TestHandleFileContextEnumSection:
         return mock_storage
 
     def test_file_with_enums_shows_enum_section(
-        self, mock_storage: MagicMock
+        self, mock_storage: MagicMock, make_ctx: Any
     ) -> None:
         """'Enums:' line appears when enum_rows is non-empty."""
-        self._storage_with_enum_rows(
-            mock_storage,
-            [['Status', 3, 5]],
-        )
-        result = handle_file_context(mock_storage, 'src/status.py')
+        self._storage_with_enum_rows(mock_storage, [['Status', 3, 5]])
+        result = handle_file_context(make_ctx(mock_storage), 'src/status.py')
         assert 'Enums:' in result
         assert 'Status' in result
         assert '3 members' in result
         assert '5 accessors' in result
 
     def test_file_without_enums_no_enum_section(
-        self, mock_storage: MagicMock
+        self, mock_storage: MagicMock, make_ctx: Any
     ) -> None:
         """'Enums:' line is absent when enum_rows is empty."""
         self._storage_with_enum_rows(mock_storage, [])
-        result = handle_file_context(mock_storage, 'src/worker.py')
+        result = handle_file_context(make_ctx(mock_storage), 'src/worker.py')
         assert 'Enums:' not in result

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from axon.core.cypher_guard import WRITE_KEYWORDS, sanitize_cypher
+from axon.core.drift import DriftCache, DriftLevel
 from axon.core.embeddings.embedder import embed_query
 from axon.core.graph.model import GraphNode, NodeLabel
 from axon.core.ingestion.community import export_to_igraph
@@ -25,13 +26,15 @@ from axon.core.ingestion.test_classifier import (
     is_test_file,
     load_pytest_config,
 )
+from axon.core.repos import RepoPool, RepoResolver, RepoUnavailable
 from axon.core.search.hybrid import hybrid_search
-from axon.core.storage.base import StorageBackend
+from axon.core.storage.base import SearchResult, StorageBackend
 from axon.core.storage.kuzu_backend import escape_cypher as _escape_cypher
 from axon.mcp.freshness import (
     render_with_communities_warning,
     render_with_dead_code_warning,
 )
+from axon.mcp.repo_context import RepoContext
 from axon.mcp.resources import get_dead_code_list
 
 logger = logging.getLogger(__name__)
@@ -62,13 +65,29 @@ def _confidence_tag(confidence: float) -> str:
     return " (?)"
 
 
-def _resolve_symbol(storage: StorageBackend, symbol: str) -> list:
-    """Resolve a symbol name to search results, preferring exact name matches."""
-    if hasattr(storage, "exact_name_search"):
-        results = storage.exact_name_search(symbol, limit=1)
+def _resolve_symbol(
+    storage: StorageBackend, symbol: str, *, top_k: int = 1
+) -> list[SearchResult]:
+    """Resolve *symbol* to up to *top_k* SearchResults, preferring exact name.
+
+    Args:
+        storage: The storage backend to search against.
+        symbol: Plain name or dotted path.
+        top_k: Maximum number of results to return.
+
+    Returns:
+        List of SearchResult, at most *top_k* items.
+    """
+    if hasattr(storage, 'exact_name_search'):
+        results = storage.exact_name_search(symbol, limit=top_k)
         if results:
             return results
-    return storage.fts_search(symbol, limit=1)
+    return storage.fts_search(symbol, limit=top_k)
+
+
+_LOCAL_MATCHES_TOP_K = 5
+
+_MAX_FOREIGN_COUNT_REPOS = 5
 
 
 def handle_list_repos(registry_dir: Path | None = None) -> str:
@@ -128,9 +147,180 @@ def handle_list_repos(registry_dir: Path | None = None) -> str:
     return "\n".join(lines)
 
 
+def _foreign_symbol_matches(
+    pool: RepoPool,
+    resolver: RepoResolver,
+    drift_cache: DriftCache,
+    symbol: str,
+    *,
+    per_repo_limit: int = 3,
+    exclude_slug: str | None = None,
+) -> list[tuple[str, list[SearchResult]]]:
+    """Look up *symbol* in every accessible foreign repo.
+
+    Repos that cannot be opened (``RepoUnavailable``) and repos whose drift
+    level is ``STALE_MAJOR`` are skipped silently.  The local repo is
+    excluded via *exclude_slug*.
+
+    Args:
+        pool: Foreign-repo connection pool.
+        resolver: Resolver used to enumerate foreign repos.
+        drift_cache: Cache of drift reports keyed by repo path.
+        symbol: Symbol name to search for.
+        per_repo_limit: Maximum results to return per repo.
+        exclude_slug: Slug of the repo to exclude (typically the local repo).
+
+    Returns:
+        List of (slug, results) pairs, one per repo that has matches.
+        Ordered by resolver.list_foreign() order.
+    """
+    output: list[tuple[str, list[SearchResult]]] = []
+    for entry in resolver.list_foreign():
+        if entry.slug == exclude_slug:
+            continue
+        try:
+            report = drift_cache.get_or_probe(entry.path)
+        except Exception:
+            continue
+        if report.level == DriftLevel.STALE_MAJOR:
+            continue
+        try:
+            backend = pool.get(entry.slug)
+        except RepoUnavailable:
+            continue
+        try:
+            results = _resolve_symbol(backend, symbol, top_k=per_repo_limit)
+        except Exception:
+            continue
+        if results:
+            output.append((entry.slug, results))
+    return output
+
+
+def _foreign_query_hit_counts(
+    pool: RepoPool,
+    resolver: RepoResolver,
+    drift_cache: DriftCache,
+    query: str,
+    *,
+    exclude_slug: str | None = None,
+) -> list[tuple[str, int]]:
+    """Return FTS hit counts for *query* across foreign repos.
+
+    At most ``_MAX_FOREIGN_COUNT_REPOS`` foreign repos are queried.  Repos
+    are selected from ``resolver.list_foreign()`` in their natural order;
+    repos beyond the cap, repos that cannot be opened, and STALE_MAJOR
+    repos are skipped.  Only repos with >0 hits are included in the result.
+
+    Each foreign repo is probed synchronously.  The caller may wrap this
+    in ``asyncio.to_thread`` if the event loop must remain unblocked.
+
+    Args:
+        pool: Foreign-repo connection pool.
+        resolver: Resolver used to enumerate foreign repos.
+        drift_cache: Cache of drift reports keyed by repo path.
+        query: FTS query string.
+        exclude_slug: Slug of the repo to exclude (typically the local repo).
+
+    Returns:
+        List of (slug, hit_count) pairs for repos with >0 hits.
+    """
+    output: list[tuple[str, int]] = []
+    checked = 0
+    for entry in resolver.list_foreign():
+        if checked >= _MAX_FOREIGN_COUNT_REPOS:
+            break
+        if entry.slug == exclude_slug:
+            continue
+        try:
+            report = drift_cache.get_or_probe(entry.path)
+        except Exception:
+            continue
+        if report.level == DriftLevel.STALE_MAJOR:
+            continue
+        try:
+            backend = pool.get(entry.slug)
+        except RepoUnavailable:
+            continue
+        checked += 1
+        try:
+            # Two-pass: check existence cheaply, then get rough count.
+            quick = backend.fts_search(query, limit=1)
+            if not quick:
+                continue
+            results_wide = backend.fts_search(query, limit=50)
+            count = len(results_wide)
+        except Exception:
+            continue
+        if count > 0:
+            output.append((entry.slug, count))
+    return output
+
+
+def _format_local_alternates(alternates: list[SearchResult]) -> str:
+    """Format a list of alternate local symbol matches as a footer section.
+
+    Args:
+        alternates: SearchResult items beyond the first (primary) result.
+
+    Returns:
+        Formatted multi-line string, or empty string when list is empty.
+    """
+    if not alternates:
+        return ''
+    lines = ['', 'Also matches in this repo:']
+    for r in alternates:
+        lines.append(f'  - {r.node_name} ({r.label}) {r.file_path or "?"}')
+    return '\n'.join(lines)
+
+
+def _format_foreign_matches(
+    matches: list[tuple[str, list[SearchResult]]], *, redirect: bool = False
+) -> str:
+    """Format a cross-repo symbol match list as a footer or redirect section.
+
+    When *redirect* is True the output is styled as a "Symbol not found
+    locally - consider these foreign repos" redirect response.
+
+    Args:
+        matches: List of (slug, results) pairs from ``_foreign_symbol_matches``.
+        redirect: When True, use redirect-style wording instead of footer.
+
+    Returns:
+        Formatted multi-line string, or empty string when list is empty.
+    """
+    if not matches:
+        return ''
+    if redirect:
+        lines = ['Also exists in other repos (pass repo=<slug> to query):']
+    else:
+        lines = ['', 'Also exists in other repos:']
+    for slug, results in matches:
+        for r in results:
+            lines.append(
+                f'  - {slug}: {r.node_name} ({r.label}) {r.file_path or "?"}'
+            )
+    return '\n'.join(lines)
+
+
+def _format_foreign_hit_counts(counts: list[tuple[str, int]]) -> str:
+    """Format a cross-repo FTS hit-count footer for axon_query responses.
+
+    Args:
+        counts: List of (slug, hit_count) pairs from
+            ``_foreign_query_hit_counts``.
+
+    Returns:
+        Single-line footer string, or empty string when list is empty.
+    """
+    if not counts:
+        return ''
+    parts = [f'{slug} ({n})' for slug, n in counts]
+    return f'Hits also exist in: {", ".join(parts)} - pass repo=<slug> to see them.'
+
+
 def _group_by_process(
-    results: list,
-    storage: StorageBackend,
+    results: list, storage: StorageBackend
 ) -> dict[str, list]:
     """Map search results to their parent execution processes."""
     if not results:
@@ -190,30 +380,49 @@ def _format_query_results(results: list, groups: dict[str, list]) -> str:
     return "\n".join(lines)
 
 
-def handle_query(storage: StorageBackend, query: str, limit: int = 20) -> str:
+def handle_query(
+    ctx: RepoContext,
+    query: str,
+    limit: int = 20,
+    *,
+    foreign_hits: list[tuple[str, int]] | None = None,
+) -> str:
     """Execute hybrid search and format results, grouped by execution process.
 
     Args:
-        storage: The storage backend to search against.
+        ctx: Per-call repo context.
         query: Text search query.
         limit: Maximum number of results (default 20, capped at 100).
+        foreign_hits: Optional pre-computed hit counts from foreign repos,
+            appended as a footer when non-empty.
 
     Returns:
         Formatted search results grouped by process, with file, name, label,
         and snippet for each result.
     """
+    storage = ctx.storage
     limit = max(1, min(limit, 100))
 
     query_embedding = embed_query(query)
     if query_embedding is None:
-        logger.warning("embed_query returned None; falling back to FTS-only search")
+        logger.warning(
+            'embed_query returned None; falling back to FTS-only search'
+        )
 
-    results = hybrid_search(query, storage, query_embedding=query_embedding, limit=limit)
+    results = hybrid_search(
+        query, storage, query_embedding=query_embedding, limit=limit
+    )
     if not results:
-        return f"No results found for '{query}'."
+        base = f"No results found for '{query}'."
+        footer = _format_foreign_hit_counts(foreign_hits or [])
+        return base + ('\n' + footer if footer else '')
 
     groups = _group_by_process(results, storage)
-    return _format_query_results(results, groups)
+    body = _format_query_results(results, groups)
+    footer = _format_foreign_hit_counts(foreign_hits or [])
+    if footer:
+        body = body + '\n' + footer
+    return body
 
 
 _MEMBER_LABELS: frozenset[NodeLabel] = frozenset(
@@ -341,33 +550,50 @@ def _render_member_explain(
 _render_enum_member_explain = _render_member_explain
 
 
-def handle_context(storage: StorageBackend, symbol: str) -> str:
+def handle_context(
+    ctx: RepoContext,
+    symbol: str,
+    *,
+    foreign_matches: list[tuple[str, list[SearchResult]]] | None = None,
+) -> str:
     """Provide a 360-degree view of a symbol.
 
     Looks up the symbol by name via full-text search, then retrieves its
     callers, callees, and type references.
 
+    When *foreign_matches* is provided and the local lookup fails, a
+    redirect-style response is returned pointing at the foreign repos.
+
     Args:
-        storage: The storage backend.
+        ctx: Per-call repo context.
         symbol: Plain name (``foo``) or dotted path (``Class.method``).
             Multi-dot paths (e.g. ``module.Class.method``) fall back to
             the last segment. When multiple symbols match (e.g., a class
             named ``Foo`` exists in two different files), the best match
             is chosen by score (source files over tests) then lexicographic
             node ID.
+        foreign_matches: Optional pre-computed foreign-repo symbol matches.
+            When provided and non-empty, appended as a cross-repo footer.
 
     Returns:
         Formatted view including callers, callees, type refs, and guidance.
     """
+    storage = ctx.storage
     if not symbol or not symbol.strip():
         return "Error: 'symbol' parameter is required and cannot be empty."
 
-    results = _resolve_symbol(storage, symbol)
+    results = _resolve_symbol(storage, symbol, top_k=_LOCAL_MATCHES_TOP_K)
     if not results:
+        if foreign_matches:
+            redirect = _format_foreign_matches(foreign_matches, redirect=True)
+            return f"Symbol '{symbol}' not found in this repo.\n\n" + redirect
         return f"Symbol '{symbol}' not found."
 
     node = storage.get_node(results[0].node_id)
     if not node:
+        if foreign_matches:
+            redirect = _format_foreign_matches(foreign_matches, redirect=True)
+            return f"Symbol '{symbol}' not found in this repo.\n\n" + redirect
         return f"Symbol '{symbol}' not found."
 
     if node.label in _MEMBER_LABELS:
@@ -378,7 +604,7 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
     lines.append(f'File: {node.file_path}:{node.start_line}-{node.end_line}')
 
     if node.signature:
-        lines.append(f"Signature: {node.signature}")
+        lines.append(f'Signature: {node.signature}')
 
     if node.is_dead:
         lines.append("Status: DEAD CODE (unreachable)")
@@ -481,6 +707,15 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
             for imp in importers:
                 lines.append(f'  -> {imp}')
 
+    # Cross-repo footers.
+    alternates_footer = _format_local_alternates(results[1:])
+    if alternates_footer:
+        lines.append(alternates_footer)
+
+    foreign_footer = _format_foreign_matches(foreign_matches or [])
+    if foreign_footer:
+        lines.append(foreign_footer)
+
     lines.append('')
     lines.append('Next: Use impact() if planning changes to this symbol.')
     return '\n'.join(lines)
@@ -578,10 +813,12 @@ def _bfs_with_dispatch_filter(
 
 
 def handle_impact(
-    storage: StorageBackend,
+    ctx: RepoContext,
     symbol: str,
     depth: int = 3,
     propagate_through: list[str] | None = None,
+    *,
+    foreign_matches: list[tuple[str, list[SearchResult]]] | None = None,
 ) -> str:
     """Analyse the blast radius of changing a symbol, grouped by hop depth.
 
@@ -594,7 +831,7 @@ def handle_impact(
     match no edges.
 
     Args:
-        storage: The storage backend.
+        ctx: Per-call repo context.
         symbol: Plain name (``foo``) or dotted path (``Class.method``).
             Multi-dot paths (e.g. ``module.Class.method``) fall back to
             the last segment. When multiple symbols match (e.g., a class
@@ -604,21 +841,30 @@ def handle_impact(
         depth: Maximum traversal depth (default 3).
         propagate_through: Optional list of dispatch_kind values to follow.
             When None, all edges are traversed (default behavior).
+        foreign_matches: Optional pre-computed foreign-repo symbol matches,
+            appended as a cross-repo footer when non-empty.
 
     Returns:
         Formatted impact analysis with depth-grouped sections.
     """
+    storage = ctx.storage
     if not symbol or not symbol.strip():
         return "Error: 'symbol' parameter is required and cannot be empty."
 
     depth = max(1, min(depth, MAX_TRAVERSE_DEPTH))
 
-    results = _resolve_symbol(storage, symbol)
+    results = _resolve_symbol(storage, symbol, top_k=_LOCAL_MATCHES_TOP_K)
     if not results:
+        if foreign_matches:
+            redirect = _format_foreign_matches(foreign_matches, redirect=True)
+            return f"Symbol '{symbol}' not found in this repo.\n\n" + redirect
         return f"Symbol '{symbol}' not found."
 
     start_node = storage.get_node(results[0].node_id)
     if not start_node:
+        if foreign_matches:
+            redirect = _format_foreign_matches(foreign_matches, redirect=True)
+            return f"Symbol '{symbol}' not found in this repo.\n\n" + redirect
         return f"Symbol '{symbol}' not found."
 
     if start_node.label in _MEMBER_LABELS:
@@ -703,13 +949,21 @@ def handle_impact(
             )
             counter += 1
 
-    lines.append("")
-    lines.append("Tip: Review each affected symbol before making changes.")
-    return "\n".join(lines)
+    foreign_footer = _format_foreign_matches(foreign_matches or [])
+    if foreign_footer:
+        lines.append(foreign_footer)
+
+    lines.append('')
+    lines.append('Tip: Review each affected symbol before making changes.')
+    return '\n'.join(lines)
 
 
 def handle_concurrent_with(
-    storage: StorageBackend, symbol: str, depth: int = 3
+    ctx: RepoContext,
+    symbol: str,
+    depth: int = 3,
+    *,
+    foreign_matches: list[tuple[str, list[SearchResult]]] | None = None,
 ) -> str:
     """Find symbols that may run concurrently with the given symbol.
 
@@ -719,25 +973,34 @@ def handle_concurrent_with(
     dispatch kind.
 
     Args:
-        storage: The storage backend.
+        ctx: Per-call repo context.
         symbol: Plain name or dotted path. Resolution follows the same
             dotted-path rules as handle_context and handle_impact.
         depth: Maximum traversal depth (default 3).
+        foreign_matches: Optional pre-computed foreign-repo symbol matches,
+            appended as a cross-repo footer when non-empty.
 
     Returns:
         Formatted list of concurrent-reachable symbols grouped by dispatch kind.
     """
+    storage = ctx.storage
     if not symbol or not symbol.strip():
         return "Error: 'symbol' parameter is required and cannot be empty."
 
     depth = max(1, min(depth, MAX_TRAVERSE_DEPTH))
 
-    results = _resolve_symbol(storage, symbol)
+    results = _resolve_symbol(storage, symbol, top_k=_LOCAL_MATCHES_TOP_K)
     if not results:
+        if foreign_matches:
+            redirect = _format_foreign_matches(foreign_matches, redirect=True)
+            return f"Symbol '{symbol}' not found in this repo.\n\n" + redirect
         return f"Symbol '{symbol}' not found."
 
     start_node = storage.get_node(results[0].node_id)
     if not start_node:
+        if foreign_matches:
+            redirect = _format_foreign_matches(foreign_matches, redirect=True)
+            return f"Symbol '{symbol}' not found in this repo.\n\n" + redirect
         return f"Symbol '{symbol}' not found."
 
     reached = _bfs_with_dispatch_filter(
@@ -776,26 +1039,27 @@ def handle_concurrent_with(
                 f'  (depth {hop_depth})'
             )
 
+    foreign_footer = _format_foreign_matches(foreign_matches or [])
+    if foreign_footer:
+        lines.append(foreign_footer)
+
     return '\n'.join(lines)
 
 
-def handle_dead_code(
-    storage: StorageBackend, repo_path: Path | None = None
-) -> str:
+def handle_dead_code(ctx: RepoContext) -> str:
     """List all symbols marked as dead code.
 
     Delegates to :func:`~axon.mcp.resources.get_dead_code_list` for the
     shared query and formatting.
 
     Args:
-        storage: The storage backend.
-        repo_path: Optional path to the repo root for staleness warning.
+        ctx: Per-call repo context.
 
     Returns:
         Formatted list of dead code symbols grouped by file.
     """
-    body = get_dead_code_list(storage)
-    return render_with_dead_code_warning(repo_path, body)
+    body = get_dead_code_list(ctx.storage)
+    return render_with_dead_code_warning(ctx.repo_path, body)
 
 
 _DIFF_FILE_PATTERN = re.compile(r'^diff --git a/(.+?) b/(.+?)$', re.MULTILINE)
@@ -809,7 +1073,7 @@ def _parse_diff_files(diff: str) -> dict[str, list[tuple[int, int]]]:
     changed_files: dict[str, list[tuple[int, int]]] = {}
     current_file: str | None = None
 
-    for line in diff.split("\n"):
+    for line in diff.split('\n'):
         file_match = _DIFF_FILE_PATTERN.match(line)
         if file_match:
             current_file = file_match.group(2)
@@ -826,19 +1090,20 @@ def _parse_diff_files(diff: str) -> dict[str, list[tuple[int, int]]]:
     return changed_files
 
 
-def handle_detect_changes(storage: StorageBackend, diff: str) -> str:
+def handle_detect_changes(ctx: RepoContext, diff: str) -> str:
     """Map git diff output to affected symbols.
 
     Parses the diff to find changed files and line ranges, then queries
     the storage backend to identify which symbols those lines belong to.
 
     Args:
-        storage: The storage backend.
+        ctx: Per-call repo context.
         diff: Raw git diff output string.
 
     Returns:
         Formatted list of affected symbols per changed file.
     """
+    storage = ctx.storage
     if not diff.strip():
         return 'Empty diff provided.'
 
@@ -851,10 +1116,10 @@ def handle_detect_changes(storage: StorageBackend, diff: str) -> str:
     changed_files = _parse_diff_files(diff)
 
     if not changed_files:
-        return "Could not parse any changed files from the diff."
+        return 'Could not parse any changed files from the diff.'
 
-    lines = [f"Changed files: {len(changed_files)}"]
-    lines.append("")
+    lines = [f'Changed files: {len(changed_files)}']
+    lines.append('')
     total_affected = 0
 
     for file_path, ranges in changed_files.items():
@@ -897,7 +1162,7 @@ def handle_detect_changes(storage: StorageBackend, diff: str) -> str:
     return "\n".join(lines)
 
 
-def handle_cypher(storage: StorageBackend, query: str) -> str:
+def handle_cypher(ctx: RepoContext, query: str) -> str:
     """Execute a raw Cypher query and return formatted results.
 
     Only read-only queries are allowed. Queries containing write keywords
@@ -909,12 +1174,13 @@ def handle_cypher(storage: StorageBackend, query: str) -> str:
     error message than a raw KuzuDB read-only violation.
 
     Args:
-        storage: The storage backend, expected to be opened read-only.
+        ctx: Per-call repo context (storage expected to be opened read-only).
         query: The Cypher query string.
 
     Returns:
         Formatted query results, or an error message if execution fails.
     """
+    storage = ctx.storage
     if len(query) > MAX_CYPHER_LENGTH:
         return (
             f'Query rejected: exceeds maximum length of {MAX_CYPHER_LENGTH:,} '
@@ -925,8 +1191,8 @@ def handle_cypher(storage: StorageBackend, query: str) -> str:
     cleaned_query = sanitize_cypher(query)
     if WRITE_KEYWORDS.search(cleaned_query):
         return (
-            "Query rejected: only read-only queries (MATCH/RETURN) are allowed. "
-            "Write operations (DELETE, DROP, CREATE, SET, MERGE) are not permitted."
+            'Query rejected: only read-only queries (MATCH/RETURN) are allowed. '
+            'Write operations (DELETE, DROP, CREATE, SET, MERGE) are not permitted.'
         )
 
     try:
@@ -951,9 +1217,10 @@ def handle_cypher(storage: StorageBackend, query: str) -> str:
 
 
 def handle_coupling(
-    storage: StorageBackend, file_path: str, min_strength: float = 0.3
+    ctx: RepoContext, file_path: str, min_strength: float = 0.3
 ) -> str:
     """Query temporal coupling for a file and flag hidden dependencies."""
+    storage = ctx.storage
     if not file_path or not file_path.strip():
         return "Error: 'file_path' parameter is required and cannot be empty."
 
@@ -1009,15 +1276,17 @@ def handle_coupling(
 
 
 def handle_call_path(
-    storage: StorageBackend,
+    ctx: RepoContext,
     from_symbol: str,
     to_symbol: str,
     max_depth: int = 10,
+    *,
+    foreign_matches: list[tuple[str, list[SearchResult]]] | None = None,
 ) -> str:
     """Find the shortest call chain between two symbols via BFS.
 
     Args:
-        storage: The storage backend.
+        ctx: Per-call repo context.
         from_symbol: Plain name (``foo``) or dotted path (``Class.method``).
             Multi-dot paths (e.g. ``module.Class.method``) fall back to
             the last segment. When multiple symbols match (e.g., a class
@@ -1031,10 +1300,14 @@ def handle_call_path(
             is chosen by score (source files over tests) then lexicographic
             node ID.
         max_depth: Maximum BFS depth (default 10).
+        foreign_matches: Optional pre-computed foreign-repo symbol matches
+            for *from_symbol*, appended as a cross-repo footer when
+            non-empty and local lookup fails.
 
     Returns:
         Formatted call chain or a message when no path exists.
     """
+    storage = ctx.storage
     if not from_symbol or not from_symbol.strip():
         return (
             "Error: 'from_symbol' parameter is required and cannot be empty."
@@ -1044,21 +1317,29 @@ def handle_call_path(
 
     max_depth = max(1, min(max_depth, MAX_TRAVERSE_DEPTH))
 
-    from_results = _resolve_symbol(storage, from_symbol)
+    from_results = _resolve_symbol(
+        storage, from_symbol, top_k=_LOCAL_MATCHES_TOP_K
+    )
     if not from_results:
+        if foreign_matches:
+            redirect = _format_foreign_matches(foreign_matches, redirect=True)
+            return (
+                f"Source symbol '{from_symbol}' not found in this repo.\n\n"
+                + redirect
+            )
         return f"Source symbol '{from_symbol}' not found."
 
-    to_results = _resolve_symbol(storage, to_symbol)
+    to_results = _resolve_symbol(storage, to_symbol, top_k=1)
     if not to_results:
         return f"Target symbol '{to_symbol}' not found."
 
     src_node = storage.get_node(from_results[0].node_id)
     tgt_node = storage.get_node(to_results[0].node_id)
     if not src_node or not tgt_node:
-        return "Could not resolve one or both symbols."
+        return 'Could not resolve one or both symbols.'
 
     if src_node.id == tgt_node.id:
-        return f"Source and target are the same symbol: {src_node.name}"
+        return f'Source and target are the same symbol: {src_node.name}'
 
     parent: dict[str, str] = {}
     queue: deque[tuple[str, int]] = deque([(src_node.id, 0)])
@@ -1218,51 +1499,63 @@ def _build_communities(
     )
 
     if cross_procs:
-        lines.append("")
-        lines.append("Cross-community processes:")
+        lines.append('')
+        lines.append('Cross-community processes:')
         for row in cross_procs:
-            proc_name = row[0] or "?"
+            proc_name = row[0] or '?'
             comms = row[1] if len(row) > 1 else []
-            comm_str = " → ".join(comms) if isinstance(comms, list) else str(comms)
-            lines.append(f"  - {proc_name} ({comm_str})")
+            comm_str = (
+                ' → '.join(comms) if isinstance(comms, list) else str(comms)
+            )
+            lines.append(f'  - {proc_name} ({comm_str})')
 
-    return "\n".join(lines)
+    return '\n'.join(lines)
 
 
-def handle_communities(
-    storage: StorageBackend,
-    community: str | None = None,
-    repo_path: Path | None = None,
-) -> str:
+def handle_communities(ctx: RepoContext, community: str | None = None) -> str:
     """List communities or drill into a specific one."""
-    body = _build_communities(storage, community)
-    return render_with_communities_warning(repo_path, body)
+    body = _build_communities(ctx.storage, community)
+    return render_with_communities_warning(ctx.repo_path, body)
 
 
-def handle_explain(storage: StorageBackend, symbol: str) -> str:
+def handle_explain(
+    ctx: RepoContext,
+    symbol: str,
+    *,
+    foreign_matches: list[tuple[str, list[SearchResult]]] | None = None,
+) -> str:
     """Produce a narrative explanation of a symbol.
 
     Args:
-        storage: The storage backend.
+        ctx: Per-call repo context.
         symbol: Plain name (``foo``) or dotted path (``Class.method``).
             Multi-dot paths (e.g. ``module.Class.method``) fall back to
             the last segment. When multiple symbols match (e.g., a class
             named ``Foo`` exists in two different files), the best match
             is chosen by score (source files over tests) then lexicographic
             node ID.
+        foreign_matches: Optional pre-computed foreign-repo symbol matches,
+            appended as a cross-repo footer when non-empty.
 
     Returns:
         Narrative explanation of the symbol's role and relationships.
     """
+    storage = ctx.storage
     if not symbol or not symbol.strip():
         return "Error: 'symbol' parameter is required and cannot be empty."
 
-    results = _resolve_symbol(storage, symbol)
+    results = _resolve_symbol(storage, symbol, top_k=_LOCAL_MATCHES_TOP_K)
     if not results:
+        if foreign_matches:
+            redirect = _format_foreign_matches(foreign_matches, redirect=True)
+            return f"Symbol '{symbol}' not found in this repo.\n\n" + redirect
         return f"Symbol '{symbol}' not found."
 
     node = storage.get_node(results[0].node_id)
     if not node:
+        if foreign_matches:
+            redirect = _format_foreign_matches(foreign_matches, redirect=True)
+            return f"Symbol '{symbol}' not found in this repo.\n\n" + redirect
         return f"Symbol '{symbol}' not found."
 
     if node.label in _MEMBER_LABELS:
@@ -1276,18 +1569,20 @@ def handle_explain(storage: StorageBackend, symbol: str) -> str:
 
     roles = []
     if node.is_entry_point:
-        roles.append("Entry point")
+        roles.append('Entry point')
     if node.is_exported:
-        roles.append("Exported")
+        roles.append('Exported')
     if node.is_dead:
-        roles.append("Dead code (unreachable)")
+        roles.append('Dead code (unreachable)')
     if roles:
-        lines.append(f"Role: {', '.join(roles)}")
+        lines.append(f'Role: {", ".join(roles)}')
 
-    lines.append(f"Location: {node.file_path}:{node.start_line}-{node.end_line}")
+    lines.append(
+        f'Location: {node.file_path}:{node.start_line}-{node.end_line}'
+    )
 
     if node.signature:
-        lines.append(f"Signature: {node.signature}")
+        lines.append(f'Signature: {node.signature}')
 
     escaped_id = _escape_cypher(node.id)
     comm_rows = (
@@ -1333,10 +1628,14 @@ def handle_explain(storage: StorageBackend, symbol: str) -> str:
         lines.append('')
         lines.append('Process flows through this symbol:')
         for row in proc_rows:
-            proc_name = row[0] or "?"
-            lines.append(f"  - {proc_name}")
+            proc_name = row[0] or '?'
+            lines.append(f'  - {proc_name}')
 
-    return "\n".join(lines)
+    foreign_footer = _format_foreign_matches(foreign_matches or [])
+    if foreign_footer:
+        lines.append(foreign_footer)
+
+    return '\n'.join(lines)
 
 
 def _build_review_risk(storage: StorageBackend, diff: str) -> str:
@@ -1352,7 +1651,7 @@ def _build_review_risk(storage: StorageBackend, diff: str) -> str:
 
     changed_files = _parse_diff_files(diff)
     if not changed_files:
-        return "Could not parse any changed files from the diff."
+        return 'Could not parse any changed files from the diff.'
 
     changed_file_set = set(changed_files.keys())
     all_affected_symbols: list[tuple[str, str, str, int]] = []
@@ -1467,16 +1766,15 @@ def _build_review_risk(storage: StorageBackend, diff: str) -> str:
     return "\n".join(lines)
 
 
-def handle_review_risk(
-    storage: StorageBackend, diff: str, repo_path: Path | None = None
-) -> str:
+def handle_review_risk(ctx: RepoContext, diff: str) -> str:
     """Assess PR risk by synthesizing multiple graph signals."""
-    body = _build_review_risk(storage, diff)
-    return render_with_dead_code_warning(repo_path, body)
+    body = _build_review_risk(ctx.storage, diff)
+    return render_with_dead_code_warning(ctx.repo_path, body)
 
 
-def handle_file_context(storage: StorageBackend, file_path: str) -> str:
+def handle_file_context(ctx: RepoContext, file_path: str) -> str:
     """Provide comprehensive context for a single file."""
+    storage = ctx.storage
     if not file_path or not file_path.strip():
         return "Error: 'file_path' parameter is required and cannot be empty."
 
@@ -1677,8 +1975,9 @@ def handle_file_context(storage: StorageBackend, file_path: str) -> str:
     return '\n'.join(lines)
 
 
-def handle_cycles(storage: StorageBackend, min_size: int = 2) -> str:
+def handle_cycles(ctx: RepoContext, min_size: int = 2) -> str:
     """Detect circular dependencies using strongly connected components."""
+    storage = ctx.storage
     min_size = max(2, min_size)
 
     try:
@@ -1696,13 +1995,11 @@ def handle_cycles(storage: StorageBackend, min_size: int = 2) -> str:
     sccs = ig_graph.connected_components(mode="strong")
 
     cycles = [
-        list(component)
-        for component in sccs
-        if len(component) >= min_size
+        list(component) for component in sccs if len(component) >= min_size
     ]
 
     if not cycles:
-        return "No circular dependencies detected."
+        return 'No circular dependencies detected.'
 
     cycles.sort(key=len, reverse=True)
 
@@ -1934,22 +2231,19 @@ def _is_hunk_executable(
 
 
 def handle_test_impact(
-    storage: StorageBackend,
-    diff: str = '',
-    symbols: list[str] | None = None,
-    repo_path: Path | None = None,
+    ctx: RepoContext, diff: str = '', symbols: list[str] | None = None
 ) -> str:
     """Find tests likely affected by code changes.
 
-    When *repo_path* is provided, the function also:
+    When ``ctx.repo_path`` is set, the function also:
     - loads pytest config to narrow test-file classification,
     - skips changed files whose hunks are entirely docstrings or comments.
 
-    When *repo_path* is None the function operates in config-unaware mode:
-    default heuristic only, no hunk-executable filtering.
+    When ``ctx.repo_path`` is None the function operates in config-unaware
+    mode: default heuristic only, no hunk-executable filtering.
 
     Args:
-        storage: Storage backend for graph queries.
+        ctx: Per-call repo context.
         diff: Raw git diff output.
         symbols: List of symbol names to check instead of a diff. Each
             item can be a plain name (``foo``) or a dotted path
@@ -1958,11 +2252,12 @@ def handle_test_impact(
             multiple symbols match (e.g., a class named ``Foo`` exists in
             two different files), the best match is chosen by score
             (source files over tests) then lexicographic node ID.
-        repo_path: Absolute path to the repository root, or None.
 
     Returns:
         Formatted impact report string.
     """
+    storage = ctx.storage
+    repo_path = ctx.repo_path
     changed_symbol_ids: list[tuple[str, str]] = []
     non_executable_files: list[str] = []
 
@@ -2022,7 +2317,7 @@ def handle_test_impact(
 
     elif symbols:
         for sym_name in symbols:
-            results = _resolve_symbol(storage, sym_name)
+            results = _resolve_symbol(storage, sym_name, top_k=1)
             if results:
                 node = storage.get_node(results[0].node_id)
                 if node:

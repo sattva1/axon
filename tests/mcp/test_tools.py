@@ -143,75 +143,79 @@ class TestHandleListRepos:
 
 
 class TestHandleQuery:
-    def test_returns_results(self, mock_storage):
-        result = handle_query(mock_storage, "validate")
-        assert "validate" in result
-        assert "Function" in result
-        assert "src/auth.py" in result
-        assert "Next:" in result
+    def test_returns_results(self, mock_storage, make_ctx):
+        result = handle_query(make_ctx(mock_storage), 'validate')
+        assert 'validate' in result
+        assert 'Function' in result
+        assert 'src/auth.py' in result
+        assert 'Next:' in result
 
-    def test_no_results(self, mock_storage):
+    def test_no_results(self, mock_storage, make_ctx):
         mock_storage.fts_search.return_value = []
         mock_storage.vector_search.return_value = []
-        result = handle_query(mock_storage, "nonexistent")
-        assert "No results found" in result
+        result = handle_query(make_ctx(mock_storage), 'nonexistent')
+        assert 'No results found' in result
 
-    def test_snippet_included(self, mock_storage):
-        result = handle_query(mock_storage, "validate")
-        assert "def validate" in result
+    def test_snippet_included(self, mock_storage, make_ctx):
+        result = handle_query(make_ctx(mock_storage), 'validate')
+        assert 'def validate' in result
 
-    def test_custom_limit(self, mock_storage):
-        handle_query(mock_storage, "validate", limit=5)
+    def test_custom_limit(self, mock_storage, make_ctx):
+        handle_query(make_ctx(mock_storage), 'validate', limit=5)
         # hybrid_search calls fts_search with candidate_limit = limit * 3
-        mock_storage.fts_search.assert_called_once_with("validate", limit=15)
+        mock_storage.fts_search.assert_called_once_with('validate', limit=15)
 
 
 class TestHandleContext:
-    def test_basic_context(self, mock_storage):
-        result = handle_context(mock_storage, "validate")
-        assert "Symbol: validate (Function)" in result
-        assert "src/auth.py:10-30" in result
-        assert "Next:" in result
+    def test_basic_context(self, mock_storage, make_ctx):
+        result = handle_context(make_ctx(mock_storage), 'validate')
+        assert 'Symbol: validate (Function)' in result
+        assert 'src/auth.py:10-30' in result
+        assert 'Next:' in result
 
-    def test_not_found_fts_empty(self, mock_storage):
+    def test_not_found_fts_empty(self, mock_storage, make_ctx):
         mock_storage.exact_name_search.return_value = []
         mock_storage.fts_search.return_value = []
-        result = handle_context(mock_storage, "nonexistent")
-        assert "not found" in result.lower()
+        result = handle_context(make_ctx(mock_storage), 'nonexistent')
+        assert 'not found' in result.lower()
 
-    def test_not_found_node_none(self, mock_storage):
+    def test_not_found_node_none(self, mock_storage, make_ctx):
         mock_storage.get_node.return_value = None
-        result = handle_context(mock_storage, "validate")
-        assert "not found" in result.lower()
+        result = handle_context(make_ctx(mock_storage), 'validate')
+        assert 'not found' in result.lower()
 
-    def test_with_callers_callees_type_refs(self, mock_storage_with_relations):
-        result = handle_context(mock_storage_with_relations, "validate")
-        assert "Callers (1):" in result
-        assert "login_handler" in result
-        assert "Callees (1):" in result
-        assert "hash_password" in result
-        assert "Type references (1):" in result
-        assert "User" in result
+    def test_with_callers_callees_type_refs(
+        self, mock_storage_with_relations, make_ctx
+    ):
+        result = handle_context(
+            make_ctx(mock_storage_with_relations), 'validate'
+        )
+        assert 'Callers (1):' in result
+        assert 'login_handler' in result
+        assert 'Callees (1):' in result
+        assert 'hash_password' in result
+        assert 'Type references (1):' in result
+        assert 'User' in result
 
-    def test_dead_code_flag(self, mock_storage):
+    def test_dead_code_flag(self, mock_storage, make_ctx):
         mock_storage.get_node.return_value = GraphNode(
-            id="function:src/old.py:deprecated",
+            id='function:src/old.py:deprecated',
             label=NodeLabel.FUNCTION,
-            name="deprecated",
-            file_path="src/old.py",
+            name='deprecated',
+            file_path='src/old.py',
             start_line=1,
             end_line=5,
             is_dead=True,
         )
-        result = handle_context(mock_storage, "deprecated")
-        assert "DEAD CODE" in result
+        result = handle_context(make_ctx(mock_storage), 'deprecated')
+        assert 'DEAD CODE' in result
 
-    def test_heritage_shown(self, mock_storage):
+    def test_heritage_shown(self, mock_storage, make_ctx):
         mock_storage.get_node.return_value = GraphNode(
-            id="class:src/models.py:Admin",
+            id='class:src/models.py:Admin',
             label=NodeLabel.CLASS,
-            name="Admin",
-            file_path="src/models.py",
+            name='Admin',
+            file_path='src/models.py',
             start_line=50,
             end_line=80,
         )
@@ -221,35 +225,38 @@ class TestHandleContext:
             # Imported-by query
             [],
         ]
-        result = handle_context(mock_storage, "Admin")
-        assert "Heritage" in result
-        assert "extends" in result
-        assert "User" in result
+        result = handle_context(make_ctx(mock_storage), 'Admin')
+        assert 'Heritage' in result
+        assert 'extends' in result
+        assert 'User' in result
 
-    def test_imported_by_shown(self, mock_storage):
+    def test_imported_by_shown(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
             # Heritage query
             [],
             # Imported-by query
-            [["src/mcp/server.py"], ["tests/test_auth.py"]],
+            [['src/mcp/server.py'], ['tests/test_auth.py']],
         ]
-        result = handle_context(mock_storage, "validate")
-        assert "Imported by (2)" in result
-        assert "src/mcp/server.py" in result
-        assert "tests/test_auth.py" in result
+        result = handle_context(make_ctx(mock_storage), 'validate')
+        assert 'Imported by (2)' in result
+        assert 'src/mcp/server.py' in result
+        assert 'tests/test_auth.py' in result
 
 
 class TestHandleImpact:
-    def test_no_downstream(self, mock_storage):
-        result = handle_impact(mock_storage, "validate")
-        assert "No upstream callers found" in result or "No downstream dependencies" in result
+    def test_no_downstream(self, mock_storage, make_ctx):
+        result = handle_impact(make_ctx(mock_storage), 'validate')
+        assert (
+            'No upstream callers found' in result
+            or 'No downstream dependencies' in result
+        )
 
-    def test_with_affected_symbols(self, mock_storage):
+    def test_with_affected_symbols(self, mock_storage, make_ctx):
         _login = GraphNode(
-            id="function:src/api.py:login",
+            id='function:src/api.py:login',
             label=NodeLabel.FUNCTION,
-            name="login",
-            file_path="src/api.py",
+            name='login',
+            file_path='src/api.py',
             start_line=5,
             end_line=20,
         )
@@ -262,41 +269,56 @@ class TestHandleImpact:
             end_line=50,
         )
         mock_storage.traverse.return_value = [_login, _register]
-        mock_storage.traverse_with_depth.return_value = [(_login, 1), (_register, 2)]
+        mock_storage.traverse_with_depth.return_value = [
+            (_login, 1),
+            (_register, 2),
+        ]
         mock_storage.get_callers_with_confidence.return_value = [(_login, 1.0)]
-        result = handle_impact(mock_storage, "validate", depth=2)
-        assert "Impact analysis for: validate" in result
-        assert "Total: 2 symbols" in result
-        assert "login" in result
-        assert "register" in result
-        assert "Depth: 2" in result
+        result = handle_impact(make_ctx(mock_storage), 'validate', depth=2)
+        assert 'Impact analysis for: validate' in result
+        assert 'Total: 2 symbols' in result
+        assert 'login' in result
+        assert 'register' in result
+        assert 'Depth: 2' in result
 
-    def test_symbol_not_found(self, mock_storage):
+    def test_symbol_not_found(self, mock_storage, make_ctx):
         mock_storage.exact_name_search.return_value = []
         mock_storage.fts_search.return_value = []
-        result = handle_impact(mock_storage, "nonexistent")
-        assert "not found" in result.lower()
+        result = handle_impact(make_ctx(mock_storage), 'nonexistent')
+        assert 'not found' in result.lower()
 
 
 class TestHandleDeadCode:
-    def test_no_dead_code(self, mock_storage):
-        result = handle_dead_code(mock_storage)
-        assert "No dead code detected" in result
+    def test_no_dead_code(self, mock_storage, make_ctx):
+        result = handle_dead_code(make_ctx(mock_storage, repo_path=None))
+        assert 'No dead code detected' in result
 
-    def test_with_dead_code(self, mock_storage):
+    def test_with_dead_code(self, mock_storage, make_ctx):
         mock_storage.execute_raw.return_value = [
-            ["function:src/old.py:unused_func", "unused_func", "src/old.py", 10, "Function"],
-            ["class:src/models.py:DeprecatedModel", "DeprecatedModel", "src/models.py", 5, "Class"],
+            [
+                'function:src/old.py:unused_func',
+                'unused_func',
+                'src/old.py',
+                10,
+                'Function',
+            ],
+            [
+                'class:src/models.py:DeprecatedModel',
+                'DeprecatedModel',
+                'src/models.py',
+                5,
+                'Class',
+            ],
         ]
-        result = handle_dead_code(mock_storage)
-        assert "Dead Code Report (2 symbols)" in result
-        assert "unused_func" in result
-        assert "DeprecatedModel" in result
+        result = handle_dead_code(make_ctx(mock_storage, repo_path=None))
+        assert 'Dead Code Report (2 symbols)' in result
+        assert 'unused_func' in result
+        assert 'DeprecatedModel' in result
 
-    def test_execute_raw_exception(self, mock_storage):
-        mock_storage.execute_raw.side_effect = RuntimeError("DB error")
-        result = handle_dead_code(mock_storage)
-        assert "Could not retrieve dead code list" in result
+    def test_execute_raw_exception(self, mock_storage, make_ctx):
+        mock_storage.execute_raw.side_effect = RuntimeError('DB error')
+        result = handle_dead_code(make_ctx(mock_storage, repo_path=None))
+        assert 'Could not retrieve dead code list' in result
 
 
 SAMPLE_DIFF = """\
@@ -314,53 +336,60 @@ index abc1234..def5678 100644
 
 
 class TestHandleDetectChanges:
-    def test_parses_diff(self, mock_storage):
+    def test_parses_diff(self, mock_storage, make_ctx):
         # handle_detect_changes now uses execute_raw() with a Cypher query
         # to find symbols in the changed file.
         mock_storage.execute_raw.return_value = [
             ["function:src/auth.py:validate", "validate", "src/auth.py", 10, 30],
         ]
 
-        result = handle_detect_changes(mock_storage, SAMPLE_DIFF)
-        assert "src/auth.py" in result
-        assert "validate" in result
-        assert "Total affected symbols:" in result
+        result = handle_detect_changes(make_ctx(mock_storage), SAMPLE_DIFF)
+        assert 'src/auth.py' in result
+        assert 'validate' in result
+        assert 'Total affected symbols:' in result
 
-    def test_empty_diff(self, mock_storage):
-        result = handle_detect_changes(mock_storage, "")
-        assert "Empty diff provided" in result
+    def test_empty_diff(self, mock_storage, make_ctx):
+        result = handle_detect_changes(make_ctx(mock_storage), '')
+        assert 'Empty diff provided' in result
 
-    def test_unparseable_diff(self, mock_storage):
-        result = handle_detect_changes(mock_storage, "just some random text")
-        assert "Could not parse" in result
+    def test_unparseable_diff(self, mock_storage, make_ctx):
+        result = handle_detect_changes(
+            make_ctx(mock_storage), 'just some random text'
+        )
+        assert 'Could not parse' in result
 
-    def test_no_symbols_in_changed_lines(self, mock_storage):
+    def test_no_symbols_in_changed_lines(self, mock_storage, make_ctx):
         mock_storage.execute_raw.return_value = []
-        result = handle_detect_changes(mock_storage, SAMPLE_DIFF)
-        assert "src/auth.py" in result
-        assert "no indexed symbols" in result
+        result = handle_detect_changes(make_ctx(mock_storage), SAMPLE_DIFF)
+        assert 'src/auth.py' in result
+        assert 'no indexed symbols' in result
 
 
 class TestHandleCypher:
-    def test_returns_results(self, mock_storage):
+    def test_returns_results(self, mock_storage, make_ctx):
         mock_storage.execute_raw.return_value = [
-            ["validate", "src/auth.py", 10],
-            ["login", "src/api.py", 5],
+            ['validate', 'src/auth.py', 10],
+            ['login', 'src/api.py', 5],
         ]
-        result = handle_cypher(mock_storage, "MATCH (n) RETURN n.name, n.file_path, n.start_line")
-        assert "Results (2 rows)" in result
-        assert "validate" in result
-        assert "src/api.py" in result
+        result = handle_cypher(
+            make_ctx(mock_storage),
+            'MATCH (n) RETURN n.name, n.file_path, n.start_line',
+        )
+        assert 'Results (2 rows)' in result
+        assert 'validate' in result
+        assert 'src/api.py' in result
 
-    def test_no_results(self, mock_storage):
-        result = handle_cypher(mock_storage, 'MATCH (n:Nonexistent) RETURN n')
+    def test_no_results(self, mock_storage, make_ctx):
+        result = handle_cypher(
+            make_ctx(mock_storage), 'MATCH (n:Nonexistent) RETURN n'
+        )
         assert 'no results' in result.lower()
 
-    def test_query_error(self, mock_storage, caplog):
+    def test_query_error(self, mock_storage, make_ctx, caplog):
         """Exception detail is not exposed to the caller; ref id links log."""
         mock_storage.execute_raw.side_effect = RuntimeError('Syntax error')
         with caplog.at_level('ERROR'):
-            result = handle_cypher(mock_storage, 'INVALID QUERY')
+            result = handle_cypher(make_ctx(mock_storage), 'INVALID QUERY')
         assert 'Syntax error' not in result
         assert 'failed' in result.lower()
         assert 'ref ' in result
@@ -373,9 +402,12 @@ class TestHandleCypher:
         assert matching, 'Exception text must appear in a log record'
         assert matching[0].ref == ref
 
-    def test_handle_cypher_rejects_write(self, mock_storage):
-        result = handle_cypher(mock_storage, "DELETE (n)")
-        assert "not permitted" in result.lower() or "not allowed" in result.lower()
+    def test_handle_cypher_rejects_write(self, mock_storage, make_ctx):
+        result = handle_cypher(make_ctx(mock_storage), 'DELETE (n)')
+        assert (
+            'not permitted' in result.lower()
+            or 'not allowed' in result.lower()
+        )
         mock_storage.execute_raw.assert_not_called()
 
 
@@ -423,20 +455,28 @@ class TestConfidenceTag:
 
 
 class TestConfidenceInContext:
-    def test_medium_confidence_tag_shown(self, mock_storage_with_relations):
-        result = handle_context(mock_storage_with_relations, "validate")
+    def test_medium_confidence_tag_shown(
+        self, mock_storage_with_relations, make_ctx
+    ):
+        result = handle_context(
+            make_ctx(mock_storage_with_relations), 'validate'
+        )
         # _callee has confidence 0.8, which produces " (~)"
-        assert "(~)" in result
+        assert '(~)' in result
 
-    def test_high_confidence_no_tag(self, mock_storage_with_relations):
-        result = handle_context(mock_storage_with_relations, "validate")
+    def test_high_confidence_no_tag(
+        self, mock_storage_with_relations, make_ctx
+    ):
+        result = handle_context(
+            make_ctx(mock_storage_with_relations), 'validate'
+        )
         # login_handler has confidence 1.0 — no tag after its line
-        assert "login_handler" in result
+        assert 'login_handler' in result
         # There should be no "(?)" for the high-confidence caller
-        lines = result.split("\n")
-        caller_line = [line for line in lines if "login_handler" in line][0]
-        assert "(?)" not in caller_line
-        assert "(~)" not in caller_line
+        lines = result.split('\n')
+        caller_line = [line for line in lines if 'login_handler' in line][0]
+        assert '(?)' not in caller_line
+        assert '(~)' not in caller_line
 
 
 class TestGroupByProcess:
@@ -511,12 +551,12 @@ class TestFormatQueryResults:
 
 
 class TestImpactDepthGrouping:
-    def test_depth_section_headers(self, mock_storage):
+    def test_depth_section_headers(self, mock_storage, make_ctx):
         _login = GraphNode(
-            id="function:src/api.py:login",
+            id='function:src/api.py:login',
             label=NodeLabel.FUNCTION,
-            name="login",
-            file_path="src/api.py",
+            name='login',
+            file_path='src/api.py',
             start_line=5,
             end_line=20,
         )
@@ -533,91 +573,95 @@ class TestImpactDepthGrouping:
         ]
         mock_storage.get_callers_with_confidence.return_value = [(_login, 0.8)]
 
-        result = handle_impact(mock_storage, "validate", depth=2)
-        assert "Depth 1" in result
-        assert "Direct callers (will break)" in result
-        assert "Depth 2" in result
-        assert "Indirect (may break)" in result
+        result = handle_impact(make_ctx(mock_storage), 'validate', depth=2)
+        assert 'Depth 1' in result
+        assert 'Direct callers (will break)' in result
+        assert 'Depth 2' in result
+        assert 'Indirect (may break)' in result
 
-    def test_depth_3_transitive_label(self, mock_storage):
+    def test_depth_3_transitive_label(self, mock_storage, make_ctx):
         _node = GraphNode(
-            id="function:src/far.py:distant",
+            id='function:src/far.py:distant',
             label=NodeLabel.FUNCTION,
-            name="distant",
-            file_path="src/far.py",
+            name='distant',
+            file_path='src/far.py',
             start_line=1,
             end_line=10,
         )
         mock_storage.traverse_with_depth.return_value = [(_node, 3)]
         mock_storage.get_callers_with_confidence.return_value = []
 
-        result = handle_impact(mock_storage, "validate", depth=3)
-        assert "Transitive (review)" in result
+        result = handle_impact(make_ctx(mock_storage), 'validate', depth=3)
+        assert 'Transitive (review)' in result
 
-    def test_confidence_shown_for_direct_callers(self, mock_storage):
+    def test_confidence_shown_for_direct_callers(self, mock_storage, make_ctx):
         _login = GraphNode(
-            id="function:src/api.py:login",
+            id='function:src/api.py:login',
             label=NodeLabel.FUNCTION,
-            name="login",
-            file_path="src/api.py",
+            name='login',
+            file_path='src/api.py',
             start_line=5,
             end_line=20,
         )
         mock_storage.traverse_with_depth.return_value = [(_login, 1)]
-        mock_storage.get_callers_with_confidence.return_value = [(_login, 0.75)]
+        mock_storage.get_callers_with_confidence.return_value = [
+            (_login, 0.75)
+        ]
 
-        result = handle_impact(mock_storage, "validate", depth=1)
-        assert "confidence: 0.75" in result
+        result = handle_impact(make_ctx(mock_storage), 'validate', depth=1)
+        assert 'confidence: 0.75' in result
 
-    def test_depth_clamped_to_max(self, mock_storage):
+    def test_depth_clamped_to_max(self, mock_storage, make_ctx):
         mock_storage.traverse_with_depth.return_value = []
-        result = handle_impact(mock_storage, "validate", depth=100)
-        assert "No upstream callers found" in result
+        result = handle_impact(make_ctx(mock_storage), 'validate', depth=100)
+        assert 'No upstream callers found' in result
 
 
 class TestHandleCoupling:
-    def test_returns_coupled_files(self, mock_storage):
+    def test_returns_coupled_files(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
-            [["src/auth/session.py", 0.85, 12], ["src/tests/test_login.py", 0.72, 9]],
-            [["src/auth/session.py"]],
+            [
+                ['src/auth/session.py', 0.85, 12],
+                ['src/tests/test_login.py', 0.72, 9],
+            ],
+            [['src/auth/session.py']],
         ]
-        result = handle_coupling(mock_storage, "src/auth/login.py")
-        assert "src/auth/session.py" in result
-        assert "0.85" in result
-        assert "src/tests/test_login.py" in result
+        result = handle_coupling(make_ctx(mock_storage), 'src/auth/login.py')
+        assert 'src/auth/session.py' in result
+        assert '0.85' in result
+        assert 'src/tests/test_login.py' in result
 
-    def test_flags_hidden_dependencies(self, mock_storage):
+    def test_flags_hidden_dependencies(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
-            [["src/tests/test_login.py", 0.72, 9]],
+            [['src/tests/test_login.py', 0.72, 9]],
             [],
         ]
-        result = handle_coupling(mock_storage, "src/auth/login.py")
-        assert "hidden" in result.lower()
+        result = handle_coupling(make_ctx(mock_storage), 'src/auth/login.py')
+        assert 'hidden' in result.lower()
 
-    def test_no_coupling_found(self, mock_storage):
+    def test_no_coupling_found(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [[], []]
-        result = handle_coupling(mock_storage, "src/isolated.py")
-        assert "No temporal coupling" in result
+        result = handle_coupling(make_ctx(mock_storage), 'src/isolated.py')
+        assert 'No temporal coupling' in result
 
-    def test_min_strength_filter(self, mock_storage):
-        mock_storage.execute_raw.side_effect = [
-            [["src/weak.py", 0.2, 2]],
-            [],
-        ]
-        result = handle_coupling(mock_storage, "src/a.py", min_strength=0.3)
-        assert "No temporal coupling" in result
+    def test_min_strength_filter(self, mock_storage, make_ctx):
+        mock_storage.execute_raw.side_effect = [[['src/weak.py', 0.2, 2]], []]
+        result = handle_coupling(
+            make_ctx(mock_storage), 'src/a.py', min_strength=0.3
+        )
+        assert 'No temporal coupling' in result
 
-    def test_empty_file_path(self, mock_storage):
-        result = handle_coupling(mock_storage, '')
+    def test_empty_file_path(self, mock_storage, make_ctx):
+        result = handle_coupling(make_ctx(mock_storage), '')
         assert 'required' in result.lower()
 
-    def test_queries_use_code_relation(self, mock_storage):
+    def test_queries_use_code_relation(self, mock_storage, make_ctx):
         """Coupling queries use CodeRelation with rel_type, not bare table names."""
         mock_storage.execute_raw.side_effect = [
             [['src/auth/session.py', 0.85, 12]],
             [],
         ]
-        handle_coupling(mock_storage, 'src/auth/login.py')
+        handle_coupling(make_ctx(mock_storage), 'src/auth/login.py')
 
         all_queries = [
             str(call.args[0])
@@ -634,7 +678,7 @@ class TestHandleCoupling:
 
 
 class TestHandleCommunities:
-    def test_list_all_communities(self, mock_storage):
+    def test_list_all_communities(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
             [
                 ["ingestion+storage", 0.72, '{"symbol_count": 23}'],
@@ -642,39 +686,44 @@ class TestHandleCommunities:
             ],
             [],  # Cross-community processes
         ]
-        result = handle_communities(mock_storage)
-        assert "ingestion+storage" in result
-        assert "0.72" in result
-        assert "23" in result
-        assert "mcp+server" in result
+        result = handle_communities(make_ctx(mock_storage, repo_path=None))
+        assert 'ingestion+storage' in result
+        assert '0.72' in result
+        assert '23' in result
+        assert 'mcp+server' in result
 
-    def test_drill_into_community(self, mock_storage):
+    def test_drill_into_community(self, mock_storage, make_ctx):
         mock_storage.execute_raw.return_value = [
-            ["run_pipeline", "Function", "src/pipeline.py", 45, True, False],
-            ["KuzuBackend", "Class", "src/storage.py", 10, False, True],
+            ['run_pipeline', 'Function', 'src/pipeline.py', 45, True, False],
+            ['KuzuBackend', 'Class', 'src/storage.py', 10, False, True],
         ]
-        result = handle_communities(mock_storage, community="ingestion+storage")
-        assert "run_pipeline" in result
-        assert "entry point" in result.lower()
-        assert "KuzuBackend" in result
+        result = handle_communities(
+            make_ctx(mock_storage, repo_path=None),
+            community='ingestion+storage',
+        )
+        assert 'run_pipeline' in result
+        assert 'entry point' in result.lower()
+        assert 'KuzuBackend' in result
 
-    def test_no_communities(self, mock_storage):
+    def test_no_communities(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [[], []]
-        result = handle_communities(mock_storage)
-        assert "No communities" in result
+        result = handle_communities(make_ctx(mock_storage, repo_path=None))
+        assert 'No communities' in result
 
-    def test_community_not_found(self, mock_storage):
+    def test_community_not_found(self, mock_storage, make_ctx):
         mock_storage.execute_raw.return_value = []
-        result = handle_communities(mock_storage, community='nonexistent')
+        result = handle_communities(
+            make_ctx(mock_storage, repo_path=None), community='nonexistent'
+        )
         assert 'not found' in result.lower()
 
-    def test_queries_use_code_relation(self, mock_storage):
+    def test_queries_use_code_relation(self, mock_storage, make_ctx):
         """Community queries use CodeRelation with rel_type, not bare table names."""
         mock_storage.execute_raw.side_effect = [
             [['ingestion+storage', 0.72, '{"symbol_count": 23}']],
             [],
         ]
-        handle_communities(mock_storage)
+        handle_communities(make_ctx(mock_storage, repo_path=None))
 
         all_queries = [
             str(call.args[0])
@@ -696,12 +745,12 @@ class TestHandleCommunities:
 
 
 class TestHandleExplain:
-    def test_basic_explanation(self, mock_storage):
+    def test_basic_explanation(self, mock_storage, make_ctx):
         mock_storage.get_node.return_value = GraphNode(
-            id="function:src/pipeline.py:run_pipeline",
+            id='function:src/pipeline.py:run_pipeline',
             label=NodeLabel.FUNCTION,
-            name="run_pipeline",
-            file_path="src/pipeline.py",
+            name='run_pipeline',
+            file_path='src/pipeline.py',
             start_line=45,
             end_line=120,
             is_entry_point=True,
@@ -718,35 +767,35 @@ class TestHandleExplain:
                        file_path="src/parse.py", start_line=1, end_line=10), 0.8),
         ]
         mock_storage.execute_raw.side_effect = [
-            [["ingestion+storage"]],  # Community membership
-            [["run → walk → parse", 1]],  # Process flows
+            [['ingestion+storage']],  # Community membership
+            [['run -> walk -> parse', 1]],  # Process flows
         ]
 
-        result = handle_explain(mock_storage, "run_pipeline")
-        assert "run_pipeline" in result
-        assert "Entry point" in result
-        assert "Exported" in result
-        assert "ingestion+storage" in result
-        assert "Called by 1" in result
-        assert "main" in result
-        assert "Calls 2" in result
+        result = handle_explain(make_ctx(mock_storage), 'run_pipeline')
+        assert 'run_pipeline' in result
+        assert 'Entry point' in result
+        assert 'Exported' in result
+        assert 'ingestion+storage' in result
+        assert 'Called by 1' in result
+        assert 'main' in result
+        assert 'Calls 2' in result
 
-    def test_symbol_not_found(self, mock_storage):
+    def test_symbol_not_found(self, mock_storage, make_ctx):
         mock_storage.exact_name_search.return_value = []
         mock_storage.fts_search.return_value = []
-        result = handle_explain(mock_storage, "nonexistent")
-        assert "not found" in result.lower()
+        result = handle_explain(make_ctx(mock_storage), 'nonexistent')
+        assert 'not found' in result.lower()
 
-    def test_empty_symbol(self, mock_storage):
-        result = handle_explain(mock_storage, "")
-        assert "required" in result.lower()
+    def test_empty_symbol(self, mock_storage, make_ctx):
+        result = handle_explain(make_ctx(mock_storage), '')
+        assert 'required' in result.lower()
 
-    def test_dead_code_symbol(self, mock_storage):
+    def test_dead_code_symbol(self, mock_storage, make_ctx):
         mock_storage.get_node.return_value = GraphNode(
-            id="function:src/old.py:old_func",
+            id='function:src/old.py:old_func',
             label=NodeLabel.FUNCTION,
-            name="old_func",
-            file_path="src/old.py",
+            name='old_func',
+            file_path='src/old.py',
             start_line=1,
             end_line=10,
             is_dead=True,
@@ -755,10 +804,10 @@ class TestHandleExplain:
         mock_storage.get_callees_with_confidence.return_value = []
         mock_storage.execute_raw.side_effect = [[], []]
 
-        result = handle_explain(mock_storage, 'old_func')
+        result = handle_explain(make_ctx(mock_storage), 'old_func')
         assert 'dead code' in result.lower() or 'Dead code' in result
 
-    def test_queries_use_code_relation(self, mock_storage):
+    def test_queries_use_code_relation(self, mock_storage, make_ctx):
         """Explain queries use CodeRelation with rel_type, not bare table names."""
         mock_storage.get_node.return_value = GraphNode(
             id='function:src/pipeline.py:run_pipeline',
@@ -775,7 +824,7 @@ class TestHandleExplain:
             [['run -> walk', 1]],
         ]
 
-        handle_explain(mock_storage, 'run_pipeline')
+        handle_explain(make_ctx(mock_storage), 'run_pipeline')
 
         all_queries = [
             str(call.args[0])
@@ -797,7 +846,7 @@ class TestHandleExplain:
 
 
 class TestHandleReviewRisk:
-    def test_basic_risk_assessment(self, mock_storage):
+    def test_basic_risk_assessment(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
             # Symbols in changed file
             [["function:src/auth.py:validate", "validate", "src/auth.py", 10, 30]],
@@ -816,19 +865,38 @@ class TestHandleReviewRisk:
             is_entry_point=False,
         )
         mock_storage.traverse_with_depth.return_value = [
-            (GraphNode(id="f:api.py:login", label=NodeLabel.FUNCTION, name="login",
-                       file_path="src/api.py", start_line=5, end_line=20), 1),
+            (
+                GraphNode(
+                    id='f:api.py:login',
+                    label=NodeLabel.FUNCTION,
+                    name='login',
+                    file_path='src/api.py',
+                    start_line=5,
+                    end_line=20,
+                ),
+                1,
+            )
         ]
 
-        result = handle_review_risk(mock_storage, SAMPLE_DIFF)
-        assert "Risk" in result
-        assert "validate" in result
+        result = handle_review_risk(
+            make_ctx(mock_storage, repo_path=None), SAMPLE_DIFF
+        )
+        assert 'Risk' in result
+        assert 'validate' in result
 
-    def test_flags_missing_cochange_files(self, mock_storage):
+    def test_flags_missing_cochange_files(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
-            [["function:src/auth.py:validate", "validate", "src/auth.py", 10, 30]],
-            [["src/tests/test_auth.py", 0.82]],
-            [["auth"]],
+            [
+                [
+                    'function:src/auth.py:validate',
+                    'validate',
+                    'src/auth.py',
+                    10,
+                    30,
+                ]
+            ],
+            [['src/tests/test_auth.py', 0.82]],
+            [['auth']],
         ]
         mock_storage.get_node.return_value = GraphNode(
             id="function:src/auth.py:validate",
@@ -839,23 +907,29 @@ class TestHandleReviewRisk:
             end_line=30,
         )
         mock_storage.traverse_with_depth.return_value = []
-        result = handle_review_risk(mock_storage, SAMPLE_DIFF)
-        assert "test_auth.py" in result
-        assert "missing" in result.lower() or "usually change" in result.lower()
+        result = handle_review_risk(
+            make_ctx(mock_storage, repo_path=None), SAMPLE_DIFF
+        )
+        assert 'test_auth.py' in result
+        assert (
+            'missing' in result.lower() or 'usually change' in result.lower()
+        )
 
-    def test_empty_diff(self, mock_storage):
-        result = handle_review_risk(mock_storage, "")
-        assert "Empty diff" in result
+    def test_empty_diff(self, mock_storage, make_ctx):
+        result = handle_review_risk(make_ctx(mock_storage, repo_path=None), '')
+        assert 'Empty diff' in result
 
-    def test_no_affected_symbols(self, mock_storage):
+    def test_no_affected_symbols(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
             [],  # No symbols in changed file
             [],  # No coupling
         ]
-        result = handle_review_risk(mock_storage, SAMPLE_DIFF)
+        result = handle_review_risk(
+            make_ctx(mock_storage, repo_path=None), SAMPLE_DIFF
+        )
         assert 'No indexed symbols' in result or 'LOW' in result
 
-    def test_queries_use_code_relation(self, mock_storage):
+    def test_queries_use_code_relation(self, mock_storage, make_ctx):
         """Review risk queries use CodeRelation with rel_type, not bare table names."""
         mock_storage.execute_raw.side_effect = [
             [
@@ -880,7 +954,7 @@ class TestHandleReviewRisk:
         )
         mock_storage.traverse_with_depth.return_value = []
 
-        handle_review_risk(mock_storage, SAMPLE_DIFF)
+        handle_review_risk(make_ctx(mock_storage, repo_path=None), SAMPLE_DIFF)
 
         all_queries = [
             str(call.args[0])
@@ -907,7 +981,7 @@ class TestHandleReviewRisk:
 
 
 class TestHandleCallPath:
-    def test_direct_path(self, mock_storage):
+    def test_direct_path(self, mock_storage, make_ctx):
         """Two symbols where A calls B directly."""
         _callee = GraphNode(
             id="function:src/perms.py:check_perms",
@@ -970,57 +1044,77 @@ class TestHandleCallPath:
                 end_line=40,
             ),
         ]
-        result = handle_call_path(mock_storage, 'validate', 'check_perms')
+        result = handle_call_path(
+            make_ctx(mock_storage), 'validate', 'check_perms'
+        )
         assert 'validate' in result
         assert 'check_perms' in result
         assert '1 hop' in result
         assert '->' in result
 
-    def test_no_path_found(self, mock_storage):
+    def test_no_path_found(self, mock_storage, make_ctx):
         mock_storage.get_callees.return_value = []
         mock_storage.fts_search.side_effect = [
             [SearchResult(node_id="function:src/a.py:foo", score=1.0, node_name="foo")],
             [SearchResult(node_id="function:src/b.py:bar", score=1.0, node_name="bar")],
         ]
         mock_storage.get_node.side_effect = [
-            GraphNode(id="function:src/a.py:foo", label=NodeLabel.FUNCTION,
-                      name="foo", file_path="src/a.py", start_line=1, end_line=10),
-            GraphNode(id="function:src/b.py:bar", label=NodeLabel.FUNCTION,
-                      name="bar", file_path="src/b.py", start_line=1, end_line=10),
+            GraphNode(
+                id='function:src/a.py:foo',
+                label=NodeLabel.FUNCTION,
+                name='foo',
+                file_path='src/a.py',
+                start_line=1,
+                end_line=10,
+            ),
+            GraphNode(
+                id='function:src/b.py:bar',
+                label=NodeLabel.FUNCTION,
+                name='bar',
+                file_path='src/b.py',
+                start_line=1,
+                end_line=10,
+            ),
         ]
-        result = handle_call_path(mock_storage, "foo", "bar")
-        assert "No call path found" in result
+        result = handle_call_path(make_ctx(mock_storage), 'foo', 'bar')
+        assert 'No call path found' in result
 
-    def test_same_symbol(self, mock_storage):
+    def test_same_symbol(self, mock_storage, make_ctx):
         mock_storage.fts_search.return_value = [
-            SearchResult(node_id="function:src/a.py:foo", score=1.0, node_name="foo"),
+            SearchResult(
+                node_id='function:src/a.py:foo', score=1.0, node_name='foo'
+            )
         ]
         mock_storage.get_node.return_value = GraphNode(
-            id="function:src/a.py:foo", label=NodeLabel.FUNCTION,
-            name="foo", file_path="src/a.py", start_line=1, end_line=10,
+            id='function:src/a.py:foo',
+            label=NodeLabel.FUNCTION,
+            name='foo',
+            file_path='src/a.py',
+            start_line=1,
+            end_line=10,
         )
-        result = handle_call_path(mock_storage, "foo", "foo")
-        assert "same symbol" in result.lower()
+        result = handle_call_path(make_ctx(mock_storage), 'foo', 'foo')
+        assert 'same symbol' in result.lower()
 
-    def test_empty_from_symbol(self, mock_storage):
-        result = handle_call_path(mock_storage, "", "bar")
-        assert "required" in result.lower()
+    def test_empty_from_symbol(self, mock_storage, make_ctx):
+        result = handle_call_path(make_ctx(mock_storage), '', 'bar')
+        assert 'required' in result.lower()
 
-    def test_empty_to_symbol(self, mock_storage):
-        result = handle_call_path(mock_storage, "foo", "")
-        assert "required" in result.lower()
+    def test_empty_to_symbol(self, mock_storage, make_ctx):
+        result = handle_call_path(make_ctx(mock_storage), 'foo', '')
+        assert 'required' in result.lower()
 
-    def test_source_not_found(self, mock_storage):
+    def test_source_not_found(self, mock_storage, make_ctx):
         mock_storage.exact_name_search.return_value = []
         mock_storage.fts_search.side_effect = [
-            [],  # from_symbol not found
+            []  # from_symbol not found
         ]
-        result = handle_call_path(mock_storage, "nonexistent", "bar")
-        assert "not found" in result.lower()
+        result = handle_call_path(make_ctx(mock_storage), 'nonexistent', 'bar')
+        assert 'not found' in result.lower()
 
 
 class TestHandleFileContext:
-    def test_full_file_context(self, mock_storage):
+    def test_full_file_context(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
             # Symbols
             [
@@ -1044,7 +1138,9 @@ class TestHandleFileContext:
             # Module constants
             [],
         ]
-        result = handle_file_context(mock_storage, 'src/mcp/tools.py')
+        result = handle_file_context(
+            make_ctx(mock_storage), 'src/mcp/tools.py'
+        )
         assert 'src/mcp/tools.py' in result
         assert 'handle_query' in result
         assert 'entry point' in result.lower()
@@ -1054,7 +1150,7 @@ class TestHandleFileContext:
         assert '0.85' in result
         assert 'mcp+server' in result
 
-    def test_empty_file(self, mock_storage):
+    def test_empty_file(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
             [],
             [],
@@ -1066,10 +1162,10 @@ class TestHandleFileContext:
             [],
             [],
         ]
-        result = handle_file_context(mock_storage, 'src/empty.py')
+        result = handle_file_context(make_ctx(mock_storage), 'src/empty.py')
         assert 'No data found' in result
 
-    def test_file_with_dead_code(self, mock_storage):
+    def test_file_with_dead_code(self, mock_storage, make_ctx):
         mock_storage.execute_raw.side_effect = [
             [['old_func', 'Function', 45, True, False, False]],
             [],
@@ -1081,15 +1177,15 @@ class TestHandleFileContext:
             [],
             [],
         ]
-        result = handle_file_context(mock_storage, 'src/old.py')
+        result = handle_file_context(make_ctx(mock_storage), 'src/old.py')
         assert 'Dead code' in result
         assert 'old_func' in result
 
-    def test_empty_file_path(self, mock_storage):
-        result = handle_file_context(mock_storage, '')
+    def test_empty_file_path(self, mock_storage, make_ctx):
+        result = handle_file_context(make_ctx(mock_storage), '')
         assert 'required' in result.lower()
 
-    def test_queries_use_code_relation(self, mock_storage):
+    def test_queries_use_code_relation(self, mock_storage, make_ctx):
         """File context queries use CodeRelation with rel_type, not bare table names."""
         mock_storage.execute_raw.side_effect = [
             [['handle_query', 'Function', 170, False, True, False]],
@@ -1103,7 +1199,7 @@ class TestHandleFileContext:
             [],
         ]
 
-        handle_file_context(mock_storage, 'src/mcp/tools.py')
+        handle_file_context(make_ctx(mock_storage), 'src/mcp/tools.py')
 
         all_queries = [
             str(call.args[0])
@@ -1120,7 +1216,7 @@ class TestHandleFileContext:
 
 
 class TestHandleTestImpact:
-    def test_finds_test_callers_via_diff(self, mock_storage):
+    def test_finds_test_callers_via_diff(self, mock_storage, make_ctx):
         # Changed symbol in diff
         mock_storage.execute_raw.return_value = [
             ["function:src/auth.py:validate", "validate", 10, 30],
@@ -1136,29 +1232,31 @@ class TestHandleTestImpact:
         )
         mock_storage.traverse_with_depth.return_value = [(_test_caller, 1)]
 
-        result = handle_test_impact(mock_storage, diff=SAMPLE_DIFF)
-        assert "test_validate" in result
-        assert "tests/test_auth.py" in result
-        assert "validate" in result
+        result = handle_test_impact(make_ctx(mock_storage), diff=SAMPLE_DIFF)
+        assert 'test_validate' in result
+        assert 'tests/test_auth.py' in result
+        assert 'validate' in result
 
-    def test_finds_test_callers_via_symbols(self, mock_storage):
+    def test_finds_test_callers_via_symbols(self, mock_storage, make_ctx):
         _test_caller = GraphNode(
-            id="function:tests/test_auth.py:test_validate",
+            id='function:tests/test_auth.py:test_validate',
             label=NodeLabel.FUNCTION,
-            name="test_validate",
-            file_path="tests/test_auth.py",
+            name='test_validate',
+            file_path='tests/test_auth.py',
             start_line=5,
             end_line=15,
         )
         mock_storage.traverse_with_depth.return_value = [(_test_caller, 1)]
 
-        result = handle_test_impact(mock_storage, symbols=["validate"])
-        assert "test_validate" in result
-        assert "tests/test_auth.py" in result
+        result = handle_test_impact(
+            make_ctx(mock_storage), symbols=['validate']
+        )
+        assert 'test_validate' in result
+        assert 'tests/test_auth.py' in result
 
-    def test_no_tests_found(self, mock_storage):
+    def test_no_tests_found(self, mock_storage, make_ctx):
         mock_storage.execute_raw.return_value = [
-            ["function:src/auth.py:validate", "validate", 10, 30],
+            ['function:src/auth.py:validate', 'validate', 10, 30]
         ]
         # Non-test caller
         _caller = GraphNode(
@@ -1171,16 +1269,16 @@ class TestHandleTestImpact:
         )
         mock_storage.traverse_with_depth.return_value = [(_caller, 1)]
 
-        result = handle_test_impact(mock_storage, diff=SAMPLE_DIFF)
-        assert "No test files found" in result
+        result = handle_test_impact(make_ctx(mock_storage), diff=SAMPLE_DIFF)
+        assert 'No test files found' in result
 
-    def test_no_params(self, mock_storage):
-        result = handle_test_impact(mock_storage)
-        assert "provide either" in result.lower()
+    def test_no_params(self, mock_storage, make_ctx):
+        result = handle_test_impact(make_ctx(mock_storage))
+        assert 'provide either' in result.lower()
 
-    def test_transitive_test(self, mock_storage):
+    def test_transitive_test(self, mock_storage, make_ctx):
         mock_storage.execute_raw.return_value = [
-            ["function:src/auth.py:validate", "validate", 10, 30],
+            ['function:src/auth.py:validate', 'validate', 10, 30]
         ]
         _test_caller = GraphNode(
             id="function:tests/e2e/test_full.py:test_e2e",
@@ -1192,13 +1290,13 @@ class TestHandleTestImpact:
         )
         mock_storage.traverse_with_depth.return_value = [(_test_caller, 3)]
 
-        result = handle_test_impact(mock_storage, diff=SAMPLE_DIFF)
-        assert "indirect" in result.lower() or "transitive" in result.lower()
-        assert "test_e2e" in result
+        result = handle_test_impact(make_ctx(mock_storage), diff=SAMPLE_DIFF)
+        assert 'indirect' in result.lower() or 'transitive' in result.lower()
+        assert 'test_e2e' in result
 
 
 class TestHandleCycles:
-    def test_no_cycles(self, mock_storage):
+    def test_no_cycles(self, mock_storage, make_ctx):
         """Graph with no cycles returns clean message."""
         kg = KnowledgeGraph()
         # Add 3 nodes with no cycles: A -> B -> C
@@ -1218,10 +1316,10 @@ class TestHandleCycles:
 
         mock_storage.load_graph.return_value = kg
 
-        result = handle_cycles(mock_storage)
-        assert "No circular dependencies" in result
+        result = handle_cycles(make_ctx(mock_storage))
+        assert 'No circular dependencies' in result
 
-    def test_detects_cycle(self, mock_storage):
+    def test_detects_cycle(self, mock_storage, make_ctx):
         """Graph with A -> B -> A cycle is detected."""
         kg = KnowledgeGraph()
         a = GraphNode(id="function:a.py:a", label=NodeLabel.FUNCTION, name="a",
@@ -1237,13 +1335,13 @@ class TestHandleCycles:
 
         mock_storage.load_graph.return_value = kg
 
-        result = handle_cycles(mock_storage)
-        assert "Circular Dependencies" in result
-        assert "1 groups" in result or "Cycle 1" in result
-        assert "a" in result
-        assert "b" in result
+        result = handle_cycles(make_ctx(mock_storage))
+        assert 'Circular Dependencies' in result
+        assert '1 groups' in result or 'Cycle 1' in result
+        assert 'a' in result
+        assert 'b' in result
 
-    def test_critical_large_cycle(self, mock_storage):
+    def test_critical_large_cycle(self, mock_storage, make_ctx):
         """Cycles with 5+ symbols are marked CRITICAL."""
         kg = KnowledgeGraph()
         nodes = []
@@ -1260,14 +1358,14 @@ class TestHandleCycles:
 
         mock_storage.load_graph.return_value = kg
 
-        result = handle_cycles(mock_storage)
+        result = handle_cycles(make_ctx(mock_storage))
         assert 'CRITICAL' in result
 
-    def test_load_graph_error(self, mock_storage, caplog):
+    def test_load_graph_error(self, mock_storage, make_ctx, caplog):
         """Exception detail is not exposed to the caller; ref id links log."""
         mock_storage.load_graph.side_effect = RuntimeError('DB error')
         with caplog.at_level('ERROR'):
-            result = handle_cycles(mock_storage)
+            result = handle_cycles(make_ctx(mock_storage))
         assert 'DB error' not in result
         assert 'ref ' in result
         ref = result.split('ref ')[1].split(')')[0]
@@ -1279,50 +1377,60 @@ class TestHandleCycles:
         assert matching, 'Exception text must appear in a log record'
         assert matching[0].ref == ref
 
-    def test_empty_graph(self, mock_storage):
+    def test_empty_graph(self, mock_storage, make_ctx):
         kg = KnowledgeGraph()
         mock_storage.load_graph.return_value = kg
-        result = handle_cycles(mock_storage)
+        result = handle_cycles(make_ctx(mock_storage))
         assert 'No symbols' in result
 
 
 class TestInputCaps:
     """Input length cap enforcement across tool handlers."""
 
-    def test_cypher_over_max_length_rejected(self, mock_storage):
+    def test_cypher_over_max_length_rejected(self, mock_storage, make_ctx):
         """Query exceeding MAX_CYPHER_LENGTH is rejected without executing."""
         query = 'MATCH ' + 'x' * (MAX_CYPHER_LENGTH + 1)
-        result = handle_cypher(mock_storage, query)
+        result = handle_cypher(make_ctx(mock_storage), query)
         assert '100,000' in result
         mock_storage.execute_raw.assert_not_called()
 
-    def test_cypher_at_max_length_allowed(self, mock_storage):
+    def test_cypher_at_max_length_allowed(self, mock_storage, make_ctx):
         """Query of exactly MAX_CYPHER_LENGTH characters proceeds to execute."""
         base = 'MATCH (n) RETURN n'
         query = base + 'x' * (MAX_CYPHER_LENGTH - len(base))
         assert len(query) == MAX_CYPHER_LENGTH
         mock_storage.execute_raw.return_value = []
-        handle_cypher(mock_storage, query)
+        handle_cypher(make_ctx(mock_storage), query)
         mock_storage.execute_raw.assert_called_once()
 
-    def test_diff_over_max_length_rejected_detect_changes(self, mock_storage):
+    def test_diff_over_max_length_rejected_detect_changes(
+        self, mock_storage, make_ctx
+    ):
         """Diff exceeding MAX_DIFF_LENGTH is rejected in handle_detect_changes."""
         diff = 'a' * (MAX_DIFF_LENGTH + 1)
-        result = handle_detect_changes(mock_storage, diff)
+        result = handle_detect_changes(make_ctx(mock_storage), diff)
         assert '100,000' in result
         mock_storage.execute_raw.assert_not_called()
 
-    def test_diff_over_max_length_rejected_review_risk(self, mock_storage):
+    def test_diff_over_max_length_rejected_review_risk(
+        self, mock_storage, make_ctx
+    ):
         """Diff exceeding MAX_DIFF_LENGTH is rejected in handle_review_risk."""
         diff = 'a' * (MAX_DIFF_LENGTH + 1)
-        result = handle_review_risk(mock_storage, diff)
+        result = handle_review_risk(
+            make_ctx(mock_storage, repo_path=None), diff
+        )
         assert '100,000' in result
         mock_storage.execute_raw.assert_not_called()
 
-    def test_diff_over_max_length_rejected_test_impact(self, mock_storage):
+    def test_diff_over_max_length_rejected_test_impact(
+        self, mock_storage, make_ctx
+    ):
         """Diff exceeding MAX_DIFF_LENGTH is rejected in handle_test_impact."""
         diff = 'a' * (MAX_DIFF_LENGTH + 1)
-        result = handle_test_impact(mock_storage, diff=diff, symbols=None)
+        result = handle_test_impact(
+            make_ctx(mock_storage), diff=diff, symbols=None
+        )
         assert '100,000' in result
         mock_storage.execute_raw.assert_not_called()
 
@@ -1344,18 +1452,22 @@ index 0000000..1111111 100644
 class TestHandleTestImpactRepoPath:
     """Integration tests: handle_test_impact with repo_path wiring."""
 
-    def test_no_repo_path_no_exception_no_warnings(self, mock_storage) -> None:
+    def test_no_repo_path_no_exception_no_warnings(
+        self, mock_storage, make_ctx
+    ) -> None:
         """Existing callers without repo_path still work; no Warnings section."""
         mock_storage.execute_raw.return_value = [
             ['function:src/auth.py:validate', 'validate', 10, 30]
         ]
         mock_storage.traverse_with_depth.return_value = []
-        result = handle_test_impact(mock_storage, diff=SAMPLE_DIFF)
+        result = handle_test_impact(
+            make_ctx(mock_storage, repo_path=None), diff=SAMPLE_DIFF
+        )
         assert 'Warnings:' not in result
         assert 'Error' not in result
 
     def test_docstring_only_hunk_is_filtered(
-        self, mock_storage, tmp_path: Path
+        self, mock_storage, make_ctx, tmp_path: Path
     ) -> None:
         """Hunk covering only a Python docstring is listed under warnings.
 
@@ -1371,13 +1483,13 @@ class TestHandleTestImpactRepoPath:
         mock_storage.traverse_with_depth.return_value = []
         # Diff changes line 2 (the docstring) of src/foo.py.
         result = handle_test_impact(
-            mock_storage, diff=_PY_DIFF, repo_path=tmp_path
+            make_ctx(mock_storage, repo_path=tmp_path), diff=_PY_DIFF
         )
         assert 'Ignored (docstring/comment-only changes):' in result
         assert 'src/foo.py' in result
 
     def test_executable_hunk_not_in_warnings(
-        self, mock_storage, tmp_path: Path
+        self, mock_storage, make_ctx, tmp_path: Path
     ) -> None:
         """Hunk covering an executable line does not appear in the warnings."""
         src = tmp_path / 'src'
@@ -1397,12 +1509,12 @@ index 0000000..1111111 100644
         ]
         mock_storage.traverse_with_depth.return_value = []
         result = handle_test_impact(
-            mock_storage, diff=executable_diff, repo_path=tmp_path
+            make_ctx(mock_storage, repo_path=tmp_path), diff=executable_diff
         )
         assert 'Ignored (docstring/comment-only changes):' not in result
 
     def test_testpaths_excludes_out_of_scope_test_file(
-        self, mock_storage, tmp_path: Path
+        self, mock_storage, make_ctx, tmp_path: Path
     ) -> None:
         """Test caller outside testpaths appears in config-excluded warnings."""
         (tmp_path / 'pyproject.toml').write_text(
@@ -1424,7 +1536,7 @@ index 0000000..1111111 100644
         mock_storage.traverse_with_depth.return_value = [(_unit_test, 1)]
 
         result = handle_test_impact(
-            mock_storage, diff=SAMPLE_DIFF, repo_path=tmp_path
+            make_ctx(mock_storage, repo_path=tmp_path), diff=SAMPLE_DIFF
         )
         # Should NOT appear in affected tests.
         assert (
@@ -1436,7 +1548,7 @@ index 0000000..1111111 100644
         assert 'tests/unit/test_x.py' in result
 
     def test_testpaths_keeps_in_scope_test_file(
-        self, mock_storage, tmp_path: Path
+        self, mock_storage, make_ctx, tmp_path: Path
     ) -> None:
         """Test caller inside testpaths appears in affected tests, not warnings."""
         (tmp_path / 'pyproject.toml').write_text(
@@ -1456,7 +1568,7 @@ index 0000000..1111111 100644
         mock_storage.traverse_with_depth.return_value = [(_integ_test, 1)]
 
         result = handle_test_impact(
-            mock_storage, diff=SAMPLE_DIFF, repo_path=tmp_path
+            make_ctx(mock_storage, repo_path=tmp_path), diff=SAMPLE_DIFF
         )
         assert 'tests/integration/test_y.py' in result
         assert 'Excluded by pytest config' not in result
@@ -1465,7 +1577,7 @@ index 0000000..1111111 100644
 class TestDottedPathIntegration:
     """Integration tests: dotted-path symbol names flow through tool handlers."""
 
-    def test_handle_context_dotted_path(self, mock_storage) -> None:
+    def test_handle_context_dotted_path(self, mock_storage, make_ctx) -> None:
         """handle_context resolves 'Foo.bar' via exact_name_search."""
         method_result = SearchResult(
             node_id='method:src/a.py:bar',
@@ -1485,15 +1597,19 @@ class TestDottedPathIntegration:
             end_line=15,
         )
 
-        result = handle_context(mock_storage, 'Foo.bar')
+        result = handle_context(make_ctx(mock_storage), 'Foo.bar')
 
+        # Phase 3: handle_context resolves with top_k=_LOCAL_MATCHES_TOP_K (5)
+        # to enable cross-repo alternate matching; limit argument reflects that.
         mock_storage.exact_name_search.assert_called_once_with(
-            'Foo.bar', limit=1
+            'Foo.bar', limit=5
         )
         assert 'bar' in result
         assert 'src/a.py' in result
 
-    def test_handle_call_path_dotted_from_symbol(self, mock_storage) -> None:
+    def test_handle_call_path_dotted_from_symbol(
+        self, mock_storage, make_ctx
+    ) -> None:
         """handle_call_path resolves 'Foo.bar' as the from-symbol via exact_name_search."""
         from_result = SearchResult(
             node_id='method:src/a.py:bar',
@@ -1531,9 +1647,10 @@ class TestDottedPathIntegration:
         mock_storage.get_node.side_effect = [_from_node, _to_node]
         mock_storage.get_callees.return_value = []
 
-        result = handle_call_path(mock_storage, 'Foo.bar', 'baz')
+        result = handle_call_path(make_ctx(mock_storage), 'Foo.bar', 'baz')
 
-        mock_storage.exact_name_search.assert_any_call('Foo.bar', limit=1)
+        # Phase 3: from_symbol uses top_k=_LOCAL_MATCHES_TOP_K (5).
+        mock_storage.exact_name_search.assert_any_call('Foo.bar', limit=5)
         # Path not found (no call edge) but resolution succeeded.
         assert 'not found' in result.lower() or 'bar' in result
 
@@ -1546,7 +1663,9 @@ class TestDottedPathIntegration:
 class TestHandleImpactPropagate:
     """handle_impact with propagate_through parameter."""
 
-    def test_propagate_through_limits_traversal(self, mock_storage) -> None:
+    def test_propagate_through_limits_traversal(
+        self, mock_storage, make_ctx
+    ) -> None:
         """Only edges with matching dispatch_kind are traversed."""
         _direct = GraphNode(
             id='function:src/a.py:direct_caller',
@@ -1571,13 +1690,13 @@ class TestHandleImpactPropagate:
             (_threaded, 1.0, {'dispatch_kind': 'thread_executor'}),
         ]
         result = handle_impact(
-            mock_storage, 'validate', propagate_through=['direct']
+            make_ctx(mock_storage), 'validate', propagate_through=['direct']
         )
         assert 'direct_caller' in result
         assert 'thread_caller' not in result
 
     def test_propagate_through_none_preserves_legacy_path(
-        self, mock_storage
+        self, mock_storage, make_ctx
     ) -> None:
         """propagate_through=None uses traverse_with_depth (legacy path)."""
         _login = GraphNode(
@@ -1592,14 +1711,14 @@ class TestHandleImpactPropagate:
         mock_storage.get_callers_with_confidence.return_value = [(_login, 1.0)]
 
         result = handle_impact(
-            mock_storage, 'validate', propagate_through=None
+            make_ctx(mock_storage), 'validate', propagate_through=None
         )
 
         mock_storage.traverse_with_depth.assert_called_once()
         assert 'login' in result
 
     def test_propagate_through_empty_list_no_edges_followed(
-        self, mock_storage
+        self, mock_storage, make_ctx
     ) -> None:
         """propagate_through=[] means nothing is followed."""
         mock_storage.get_callers_with_metadata.return_value = [
@@ -1616,14 +1735,18 @@ class TestHandleImpactPropagate:
                 {'dispatch_kind': 'direct'},
             )
         ]
-        result = handle_impact(mock_storage, 'validate', propagate_through=[])
+        result = handle_impact(
+            make_ctx(mock_storage), 'validate', propagate_through=[]
+        )
         assert 'No upstream callers' in result or 'propagate_through' in result
 
 
 class TestHandleConcurrentWith:
     """handle_concurrent_with tests."""
 
-    def test_reaches_thread_executor_callback(self, mock_storage) -> None:
+    def test_reaches_thread_executor_callback(
+        self, mock_storage, make_ctx
+    ) -> None:
         """Thread-executor callees are reported under [thread_executor]."""
         _callback = GraphNode(
             id='function:src/tasks.py:callback',
@@ -1636,11 +1759,11 @@ class TestHandleConcurrentWith:
         mock_storage.get_callees_with_metadata.return_value = [
             (_callback, 1.0, {'dispatch_kind': 'thread_executor'})
         ]
-        result = handle_concurrent_with(mock_storage, 'validate')
+        result = handle_concurrent_with(make_ctx(mock_storage), 'validate')
         assert 'callback' in result
         assert 'thread_executor' in result
 
-    def test_ignores_direct_edges(self, mock_storage) -> None:
+    def test_ignores_direct_edges(self, mock_storage, make_ctx) -> None:
         """Callees connected by direct edges are not reported."""
         _plain = GraphNode(
             id='function:src/utils.py:helper',
@@ -1653,10 +1776,10 @@ class TestHandleConcurrentWith:
         mock_storage.get_callees_with_metadata.return_value = [
             (_plain, 1.0, {})
         ]
-        result = handle_concurrent_with(mock_storage, 'validate')
+        result = handle_concurrent_with(make_ctx(mock_storage), 'validate')
         assert 'No concurrently-dispatched callees found' in result
 
-    def test_depth_bounded(self, mock_storage) -> None:
+    def test_depth_bounded(self, mock_storage, make_ctx) -> None:
         """depth=1 limits traversal to direct neighbours only."""
         _callback = GraphNode(
             id='function:src/tasks.py:cb',
@@ -1672,17 +1795,23 @@ class TestHandleConcurrentWith:
             [(_callback, 1.0, {'dispatch_kind': 'detached_task'})],
             [],
         ]
-        result = handle_concurrent_with(mock_storage, 'validate', depth=1)
+        result = handle_concurrent_with(
+            make_ctx(mock_storage), 'validate', depth=1
+        )
         assert 'cb' in result
 
-    def test_symbol_not_found(self, mock_storage) -> None:
+    def test_symbol_not_found(self, mock_storage, make_ctx) -> None:
         """Returns appropriate message for unknown symbol."""
         mock_storage.exact_name_search.return_value = []
         mock_storage.fts_search.return_value = []
-        result = handle_concurrent_with(mock_storage, 'nonexistent_xyz')
+        result = handle_concurrent_with(
+            make_ctx(mock_storage), 'nonexistent_xyz'
+        )
         assert 'not found' in result.lower()
 
-    def test_mixed_dispatch_kinds_grouped(self, mock_storage) -> None:
+    def test_mixed_dispatch_kinds_grouped(
+        self, mock_storage, make_ctx
+    ) -> None:
         """Multiple dispatch_kinds produce separate grouped sections."""
         _cb1 = GraphNode(
             id='function:src/a.py:thread_cb',
@@ -1704,7 +1833,7 @@ class TestHandleConcurrentWith:
             (_cb1, 1.0, {'dispatch_kind': 'thread_executor'}),
             (_cb2, 1.0, {'dispatch_kind': 'detached_task'}),
         ]
-        result = handle_concurrent_with(mock_storage, 'validate')
+        result = handle_concurrent_with(make_ctx(mock_storage), 'validate')
         assert 'thread_executor' in result
         assert 'detached_task' in result
         assert 'thread_cb' in result
@@ -1715,7 +1844,7 @@ class TestHandleContextDispatchTags:
     """handle_context display enrichment with dispatch / metadata tags."""
 
     def test_displays_dispatch_kind_for_non_direct_callees(
-        self, mock_storage
+        self, mock_storage, make_ctx
     ) -> None:
         """Callee with dispatch_kind='thread_executor' shows [thread_executor] tag."""
         _callee = GraphNode(
@@ -1730,10 +1859,12 @@ class TestHandleContextDispatchTags:
         mock_storage.get_callees_with_metadata.return_value = [
             (_callee, 1.0, {'dispatch_kind': 'thread_executor'})
         ]
-        result = handle_context(mock_storage, 'validate')
+        result = handle_context(make_ctx(mock_storage), 'validate')
         assert '[thread_executor]' in result
 
-    def test_omits_dispatch_kind_for_direct_edges(self, mock_storage) -> None:
+    def test_omits_dispatch_kind_for_direct_edges(
+        self, mock_storage, make_ctx
+    ) -> None:
         """Callees with default dispatch produce no extra dispatch tag."""
         _callee = GraphNode(
             id='function:src/utils.py:helper',
@@ -1747,12 +1878,12 @@ class TestHandleContextDispatchTags:
         mock_storage.get_callees_with_metadata.return_value = [
             (_callee, 1.0, {})
         ]
-        result = handle_context(mock_storage, 'validate')
+        result = handle_context(make_ctx(mock_storage), 'validate')
         # No dispatch tag should appear for direct (default) edges.
         assert '[direct]' not in result
         assert '[thread_executor]' not in result
 
-    def test_displays_awaited_and_in_try(self, mock_storage) -> None:
+    def test_displays_awaited_and_in_try(self, mock_storage, make_ctx) -> None:
         """Callee with awaited=True and in_try=True shows both tags."""
         _callee = GraphNode(
             id='function:src/io.py:fetch',
@@ -1766,12 +1897,12 @@ class TestHandleContextDispatchTags:
         mock_storage.get_callees_with_metadata.return_value = [
             (_callee, 1.0, {'awaited': True, 'in_try': True})
         ]
-        result = handle_context(mock_storage, 'validate')
+        result = handle_context(make_ctx(mock_storage), 'validate')
         assert '[awaited]' in result
         assert '[in_try]' in result
 
     def test_displays_return_consumption_for_callers(
-        self, mock_storage
+        self, mock_storage, make_ctx
     ) -> None:
         """Caller with return_consumption='passed_through' shows tag."""
         _caller = GraphNode(
@@ -1786,10 +1917,12 @@ class TestHandleContextDispatchTags:
             (_caller, 1.0, {'return_consumption': 'passed_through'})
         ]
         mock_storage.get_callees_with_metadata.return_value = []
-        result = handle_context(mock_storage, 'validate')
+        result = handle_context(make_ctx(mock_storage), 'validate')
         assert 'passed_through' in result
 
-    def test_omits_return_consumption_for_stored(self, mock_storage) -> None:
+    def test_omits_return_consumption_for_stored(
+        self, mock_storage, make_ctx
+    ) -> None:
         """Default return_consumption='stored' produces no tag."""
         _caller = GraphNode(
             id='function:src/a.py:caller',
@@ -1803,14 +1936,14 @@ class TestHandleContextDispatchTags:
             (_caller, 1.0, {'return_consumption': 'ignored'})
         ]
         mock_storage.get_callees_with_metadata.return_value = []
-        result = handle_context(mock_storage, 'validate')
+        result = handle_context(make_ctx(mock_storage), 'validate')
         assert '[return: ignored]' not in result
 
 
 class TestHandleCallPathDispatchAnnotation:
     """handle_call_path hop dispatch annotation."""
 
-    def test_hop_dispatch_annotation(self, mock_storage) -> None:
+    def test_hop_dispatch_annotation(self, mock_storage, make_ctx) -> None:
         """Hop with dispatch_kind='detached_task' shows annotation on the hop line."""
         _mid = GraphNode(
             id='function:src/dispatch.py:dispatch',
@@ -1886,5 +2019,5 @@ class TestHandleCallPathDispatchAnnotation:
                 (_target, 1.0, {'dispatch_kind': 'detached_task'})
             ],  # dispatch -> run
         ]
-        result = handle_call_path(mock_storage, 'validate', 'run')
+        result = handle_call_path(make_ctx(mock_storage), 'validate', 'run')
         assert '[detached_task]' in result
