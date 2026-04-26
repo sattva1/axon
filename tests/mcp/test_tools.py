@@ -6,8 +6,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from axon.core.drift import DriftCache
 from axon.core.graph.graph import KnowledgeGraph
-from axon.core.graph.model import GraphNode, GraphRelationship, NodeLabel, RelType
+from axon.core.graph.model import (
+    GraphNode,
+    GraphRelationship,
+    NodeLabel,
+    RelType,
+)
+from axon.core.repos import RepoPool, RepoResolver, RegistryEntry
 from axon.core.storage.base import SearchResult
 from axon.mcp.resources import get_dead_code_list, get_overview, get_schema
 from axon.mcp.tools import (
@@ -109,37 +116,86 @@ def mock_storage_with_relations(mock_storage):
     return mock_storage
 
 
+def _write_registry_entry(
+    registry_dir: Path, slug: str, repo_path: Path
+) -> None:
+    """Write a minimal RegistryEntry meta.json for a given slug."""
+    slot = registry_dir / slug
+    slot.mkdir(parents=True, exist_ok=True)
+    entry = RegistryEntry(
+        name=repo_path.name,
+        path=str(repo_path),
+        slug=slug,
+        last_indexed_at='2024-01-01T00:00:00',
+        stats={'files': 25, 'symbols': 150, 'relationships': 200},
+        embedding_model='',
+        embedding_dimensions=0,
+    )
+    (slot / 'meta.json').write_text(
+        json.dumps(entry.to_json()), encoding='utf-8'
+    )
+
+
 class TestHandleListRepos:
-    def test_no_registry_dir(self, tmp_path):
-        result = handle_list_repos(registry_dir=tmp_path / "nonexistent")
-        assert "No indexed repositories found" in result
-
-    def test_empty_registry_dir(self, tmp_path):
-        registry = tmp_path / "repos"
+    def test_no_registered_repos(self, tmp_path: Path) -> None:
+        """No registered repos and no local path yields no-repos message."""
+        registry = tmp_path / 'repos'
         registry.mkdir()
-        result = handle_list_repos(registry_dir=registry)
-        assert "No indexed repositories found" in result
+        # Resolver with no local path returns only registered entries;
+        # empty registry -> empty list -> no-repos message.
+        resolver = RepoResolver(registry_dir=registry)
+        pool = RepoPool(resolver)
+        drift_cache = DriftCache()
+        result = handle_list_repos(
+            resolver=resolver, pool=pool, drift_cache=drift_cache
+        )
+        assert 'No indexed repositories found' in result
 
-    def test_with_repos(self, tmp_path):
-        registry = tmp_path / "repos"
-        repo_dir = registry / "my-project"
-        repo_dir.mkdir(parents=True)
-        meta = {
-            "name": "my-project",
-            "path": "/home/user/my-project",
-            "stats": {
-                "files": 25,
-                "symbols": 150,
-                "relationships": 200,
-            },
-        }
-        (repo_dir / "meta.json").write_text(json.dumps(meta))
+    def test_with_repos(self, tmp_path: Path) -> None:
+        """Registered repo appears with slug and stat counts."""
+        registry = tmp_path / 'repos'
+        repo = tmp_path / 'my-project'
+        repo.mkdir()
+        # Write repo-level .axon/meta.json with stats (load_meta reads from here).
+        axon_dir = repo / '.axon'
+        axon_dir.mkdir()
+        (axon_dir / 'meta.json').write_text(
+            json.dumps(
+                {'stats': {'files': 25, 'symbols': 150, 'relationships': 200}}
+            ),
+            encoding='utf-8',
+        )
+        _write_registry_entry(registry, 'my-project', repo)
+        resolver = RepoResolver(registry_dir=registry, local_repo_path=repo)
+        pool = RepoPool(resolver)
+        drift_cache = DriftCache()
+        result = handle_list_repos(
+            resolver=resolver,
+            pool=pool,
+            drift_cache=drift_cache,
+            local_slug='my-project',
+        )
+        assert 'my-project' in result
+        assert '150' in result
+        assert '200' in result
+        assert 'Indexed repositories (1)' in result
 
-        result = handle_list_repos(registry_dir=registry)
-        assert "my-project" in result
-        assert "150" in result
-        assert "200" in result
-        assert "Indexed repositories (1)" in result
+    def test_local_marker_present(self, tmp_path: Path) -> None:
+        """Local entry carries the (LOCAL) marker."""
+        registry = tmp_path / 'repos'
+        repo = tmp_path / 'my-project'
+        repo.mkdir()
+        _write_registry_entry(registry, 'my-project', repo)
+        resolver = RepoResolver(registry_dir=registry, local_repo_path=repo)
+        pool = RepoPool(resolver)
+        drift_cache = DriftCache()
+        result = handle_list_repos(
+            resolver=resolver,
+            pool=pool,
+            drift_cache=drift_cache,
+            local_slug='my-project',
+        )
+        assert '(LOCAL)' in result
 
 
 class TestHandleQuery:

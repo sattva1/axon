@@ -18,6 +18,8 @@ import pytest
 
 import axon.mcp.server as server_module
 import axon.mcp.tools as tools_module
+from axon.core.drift import DriftCache
+from axon.core.repos import RepoPool, RepoResolver
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.server import (
     _ServerState,
@@ -206,8 +208,17 @@ class TestDispatchToolSignature:
     def test_list_repos_works_without_repo_path(
         self, tmp_path: Path, make_ctx: Any
     ) -> None:
-        """axon_list_repos dispatches correctly via a RepoContext."""
+        """axon_list_repos dispatches via _state resolver/pool/drift_cache."""
         mock_storage = MagicMock()
+        # Inject the multi-repo state that _dispatch_tool reads directly.
+        registry = tmp_path / 'registry'
+        registry.mkdir()
+        local = tmp_path / 'local'
+        local.mkdir()
+        resolver = RepoResolver(registry_dir=registry, local_repo_path=local)
+        server_module._state.resolver = resolver
+        server_module._state.pool = RepoPool(resolver)
+        server_module._state.drift_cache = DriftCache()
         result = _dispatch_tool('axon_list_repos', {}, make_ctx(mock_storage))
         assert isinstance(result, str)
 

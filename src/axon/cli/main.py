@@ -51,7 +51,14 @@ from axon.core.host_meta import host_json_path, load_host_meta
 from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
 from axon.core.ingestion.watcher import ensure_current_embeddings, watch_repo
 from axon.core.meta import load_meta, now_iso, update_meta
-from axon.core.repos import default_registry_dir, RegistryEntry, allocate_slug
+from axon.core.drift import DriftCache
+from axon.core.repos import (
+    default_registry_dir,
+    RegistryEntry,
+    RepoPool,
+    RepoResolver,
+    allocate_slug,
+)
 from axon.core.storage.base import EMBEDDING_DIMENSIONS
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp import tools as mcp_tools
@@ -894,7 +901,18 @@ def status() -> None:
 @app.command(name='list')
 def list_repos() -> None:
     """List all indexed repositories."""
-    result = mcp_tools.handle_list_repos()
+    local_repo_path = Path.cwd().resolve()
+    resolver = RepoResolver(local_repo_path=local_repo_path)
+    pool = RepoPool(resolver)
+    drift_cache = DriftCache()
+    local_entry = resolver.local()
+    local_slug = local_entry.slug if local_entry is not None else None
+    result = mcp_tools.handle_list_repos(
+        resolver=resolver,
+        pool=pool,
+        drift_cache=drift_cache,
+        local_slug=local_slug,
+    )
     console.print(result)
 
 

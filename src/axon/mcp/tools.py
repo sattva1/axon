@@ -26,6 +26,7 @@ from axon.core.ingestion.test_classifier import (
     is_test_file,
     load_pytest_config,
 )
+from axon.core.meta import load_meta
 from axon.core.repos import RepoPool, RepoResolver, RepoUnavailable
 from axon.core.search.hybrid import hybrid_search
 from axon.core.storage.base import SearchResult, StorageBackend
@@ -90,61 +91,91 @@ _LOCAL_MATCHES_TOP_K = 5
 _MAX_FOREIGN_COUNT_REPOS = 5
 
 
-def handle_list_repos(registry_dir: Path | None = None) -> str:
-    """List indexed repositories by scanning for .axon directories.
+def handle_list_repos(
+    *,
+    resolver: RepoResolver,
+    pool: RepoPool,
+    drift_cache: DriftCache,
+    local_slug: str | None = None,
+) -> str:
+    """List indexed repositories using the resolver/pool/drift_cache.
 
-    Scans the global registry directory (defaults to ``~/.axon/repos``) for
-    project metadata files and returns a formatted summary.
+    For each entry returned by ``resolver.list_known()`` the function reads
+    per-repo stats from ``.axon/meta.json`` via ``load_meta``, probes drift
+    via ``drift_cache.get_or_probe``, and checks reachability via ``pool.get``
+    for foreign repos.
 
     Args:
-        registry_dir: Directory containing repo metadata. If ``None``,
-            defaults to ``~/.axon/repos``.
+        resolver: Resolver that enumerates known repos.
+        pool: Connection pool used to probe foreign-repo reachability.
+        drift_cache: Cache of drift reports keyed by repo path.
+        local_slug: Slug of the local repo - used for the (LOCAL) marker.
+            When None, no entry is marked local.
 
     Returns:
-        Formatted list of indexed repositories with stats, or a message
-        indicating none were found.
+        Formatted list of indexed repositories with freshness, watcher status,
+        and reachability per entry, or a message when the registry is empty.
     """
-    use_cwd_fallback = registry_dir is None
-    if registry_dir is None:
-        registry_dir = Path.home() / ".axon" / "repos"
+    entries = resolver.list_known()
+    if not entries:
+        return (
+            'No indexed repositories found. '
+            'Run `axon analyze` on a project first.'
+        )
 
-    repos: list[dict[str, Any]] = []
+    lines = [f'Indexed repositories ({len(entries)}):']
+    lines.append('')
 
-    if registry_dir.exists():
-        for meta_file in registry_dir.glob("*/meta.json"):
+    for i, entry in enumerate(entries, 1):
+        is_local = entry.is_local or entry.slug == local_slug
+        local_marker = ' (LOCAL)' if is_local else ''
+
+        # Stats from .axon/meta.json
+        try:
+            meta = load_meta(entry.path)
+            stats = meta.stats
+            files = stats.get('files', '?')
+            symbols = stats.get('symbols', '?')
+            relationships = stats.get('relationships', '?')
+        except Exception:
+            files, symbols, relationships = '?', '?', '?'
+
+        # Drift level and watcher status.
+        try:
+            report = drift_cache.get_or_probe(entry.path)
+            freshness = str(report.level)
+            watcher = 'alive' if report.watcher_alive else 'dead'
+        except Exception:
+            freshness = 'unknown'
+            watcher = 'unknown'
+
+        # Reachability: local is always reachable; foreign via pool.
+        if is_local:
+            reachable = 'yes'
+        else:
             try:
-                data = json.loads(meta_file.read_text())
-                repos.append(data)
-            except (json.JSONDecodeError, OSError):
-                continue
+                pool.get(entry.slug)
+                reachable = 'yes'
+            except (RepoUnavailable, Exception):
+                reachable = 'no'
 
-    if not repos and use_cwd_fallback:
-        cwd_axon = Path.cwd() / ".axon" / "meta.json"
-        if cwd_axon.exists():
-            try:
-                data = json.loads(cwd_axon.read_text())
-                repos.append(data)
-            except (json.JSONDecodeError, OSError):
-                pass
+        lines.append(f'  {i}. {entry.slug}{local_marker}')
+        lines.append(f'     Path: {entry.path}')
+        lines.append(
+            f'     Files: {files}  Symbols: {symbols}'
+            f'  Relationships: {relationships}'
+        )
+        lines.append(
+            f'     Freshness: {freshness}'
+            f'  Watcher: {watcher}  Reachable: {reachable}'
+        )
+        lines.append('')
 
-    if not repos:
-        return "No indexed repositories found. Run `axon index` on a project first."
-
-    lines = [f"Indexed repositories ({len(repos)}):"]
-    lines.append("")
-    for i, repo in enumerate(repos, 1):
-        name = repo.get("name", "unknown")
-        path = repo.get("path", "")
-        stats = repo.get("stats", {})
-        files = stats.get("files", "?")
-        symbols = stats.get("symbols", "?")
-        relationships = stats.get("relationships", "?")
-        lines.append(f"  {i}. {name}")
-        lines.append(f"     Path: {path}")
-        lines.append(f"     Files: {files}  Symbols: {symbols}  Relationships: {relationships}")
-        lines.append("")
-
-    return "\n".join(lines)
+    lines.append(
+        'To query a specific repo, pass repo=<slug> to any multi-repo tool'
+        ' (e.g. axon_context, axon_query).'
+    )
+    return '\n'.join(lines)
 
 
 def _foreign_symbol_matches(

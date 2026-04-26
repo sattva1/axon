@@ -28,7 +28,7 @@ from mcp.server import Server
 from mcp.server.fastmcp.server import StreamableHTTPASGIApp
 from mcp.server.stdio import stdio_server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import Resource, TextContent, Tool
+from mcp.types import Resource, TextContent, Tool, ToolAnnotations
 
 from axon.core.drift import DriftCache, DriftLevel
 from axon.core.repos import RepoNotFound, RepoPool, RepoResolver
@@ -329,17 +329,57 @@ async def _build_repo_context(
     )
 
 
+_TOOL_ANNOTATIONS = ToolAnnotations(readOnlyHint=True, idempotentHint=True)
+
 TOOLS: list[Tool] = [
     Tool(
         name='axon_list_repos',
-        description='List all indexed repositories with their stats.',
+        description=(
+            'List all indexed repositories the current MCP session can reach,'
+            ' with freshness, watcher status, and reachability per entry.\n\n'
+            'When to use this instead of Grep/Read: use this as the first'
+            ' step before any cross-repo query to discover available slugs'
+            ' and assess whether each repo is fresh enough to trust.\n\n'
+            'Parameters:\n'
+            '  (none) - this tool takes no arguments.\n\n'
+            'Returns: a numbered list of repos. Each entry shows slug, path,'
+            ' file/symbol/relationship counts, freshness level'
+            ' (fresh/stale_minor/stale_major/unknown), watcher alive state,'
+            ' and whether the repo is reachable from this session. The local'
+            ' repo is marked (LOCAL). A usage hint footer explains how to'
+            ' target a specific repo with `repo=<slug>`.\n\n'
+            'Multi-repo posture: enumerates every entry registered in'
+            ' ~/.axon/repos. Stale-major repos are listed but queries against'
+            ' them will be refused - re-run `axon analyze` to refresh.'
+        ),
         inputSchema={'type': 'object', 'properties': {}},
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_query',
         description=(
-            'Search the knowledge graph using hybrid (keyword + vector) search. '
-            'Returns ranked symbols matching the query.'
+            'Search the knowledge graph using hybrid keyword-plus-vector'
+            ' search and return ranked symbols matching the query.\n\n'
+            'When to use this instead of Grep/Read: prefer this over grep'
+            ' when the question is conceptual - "auth handlers",'
+            ' "things that compute totals", "classes that validate input" -'
+            ' rather than a literal string. Returns ranked symbols grouped by'
+            ' execution flow with file, label, and snippet per result.\n\n'
+            'Parameters:\n'
+            '  - `query`: natural-language or keyword search text.\n'
+            '  - `limit`: maximum results to return (default 20, cap 100).\n'
+            '  - `repo` (optional): slug, absolute path, or relative path of'
+            ' the repo to query. Defaults to the local repo. Use'
+            ' `axon_list_repos` to discover slugs.\n\n'
+            'Returns: results numbered and grouped by execution-process'
+            ' section when process membership is detected, otherwise a flat'
+            ' ranked list. Each entry shows name, label, file path, and a'
+            ' short snippet. A cross-repo footer reports hit counts in other'
+            ' repos so you know where to look next.\n\n'
+            'Multi-repo posture: when `repo` is omitted, queries the local'
+            ' repo and appends a footer with hit counts from up to 5 foreign'
+            ' repos (excluding stale-major ones). Pass `repo=<slug>` to'
+            ' search a specific foreign repo directly.'
         ),
         inputSchema={
             'type': 'object',
@@ -357,12 +397,33 @@ TOOLS: list[Tool] = [
             },
             'required': ['query'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_context',
         description=(
-            'Get a 360-degree view of a symbol: callers, callees, type references, '
-            'and community membership.'
+            'Get a 360-degree structural view of a named symbol: callers,'
+            ' callees, type references, heritage, importers, and community'
+            ' membership in one call.\n\n'
+            'When to use this instead of Grep/Read: prefer this over Read'
+            ' and Grep when you want the full neighborhood of a symbol -'
+            ' who calls it, what it calls, what types it references, which'
+            ' files import it, and what community it belongs to - without'
+            ' manually chasing definitions across files.\n\n'
+            'Parameters:\n'
+            '  - `symbol`: plain name (`foo`) or dotted path (`Class.method`).'
+            ' Multi-dot paths fall back to the last segment.\n'
+            '  - `repo` (optional): target repo slug, absolute path, or'
+            ' relative path. Defaults to the local repo.\n\n'
+            'Returns: symbol header (label, file, line range, signature),'
+            ' callers with dispatch kind and confidence, callees with await'
+            ' and try annotations, type references, heritage (extends/'
+            'implements), importers, alternate local matches, and a'
+            ' cross-repo "also exists in" footer.\n\n'
+            'Multi-repo posture: when the symbol is not found locally and'
+            ' foreign repos have matches, returns a redirect response listing'
+            ' those repos with `repo=<slug>` hint. Cross-repo footers are'
+            ' appended for symbols that also exist in accessible foreign repos.'
         ),
         inputSchema={
             'type': 'object',
@@ -375,11 +436,35 @@ TOOLS: list[Tool] = [
             },
             'required': ['symbol'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_impact',
         description=(
-            'Blast radius analysis: find all symbols affected by changing a given symbol.'
+            'Blast-radius analysis: find all symbols affected by changing'
+            ' a given symbol, grouped by hop depth from the change point.\n\n'
+            'When to use this instead of Grep/Read: prefer this over grep'
+            ' when you are about to change a symbol and want to know what'
+            ' breaks. Grep finds some callers in the same file or module;'
+            ' this traces the full upstream caller graph with depth labels'
+            ' and confidence scores, including indirect dependents that grep'
+            ' will miss.\n\n'
+            'Parameters:\n'
+            '  - `symbol`: name of the symbol being changed.\n'
+            '  - `depth`: maximum traversal depth (default 3, max'
+            f' {MAX_TRAVERSE_DEPTH}).\n'
+            '  - `propagate_through`: optional list of dispatch_kind values'
+            ' to follow (direct, thread_executor, process_executor,'
+            ' detached_task, enqueued_job, callback_registry). When omitted,'
+            ' all edges are traversed.\n'
+            '  - `repo` (optional): target repo slug or path.\n\n'
+            'Returns: impact header with total count, then depth-grouped'
+            ' sections (Depth 1 = direct callers, Depth 2 = indirect, etc.).'
+            ' Each entry shows name, label, file, and line. Confidence scores'
+            ' appear for depth-1 callers.\n\n'
+            'Multi-repo posture: appends a cross-repo footer when the symbol'
+            ' also exists in accessible foreign repos. Stale-major foreign'
+            ' repos are excluded from footers.'
         ),
         inputSchema={
             'type': 'object',
@@ -391,7 +476,8 @@ TOOLS: list[Tool] = [
                 'depth': {
                     'type': 'integer',
                     'description': (
-                        f'Maximum traversal depth (default 3, max {MAX_TRAVERSE_DEPTH}).'
+                        f'Maximum traversal depth (default 3, max'
+                        f' {MAX_TRAVERSE_DEPTH}).'
                     ),
                     'default': 3,
                     'minimum': 1,
@@ -419,22 +505,58 @@ TOOLS: list[Tool] = [
             },
             'required': ['symbol'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_dead_code',
-        description='List all symbols detected as dead (unreachable) code.',
+        description=(
+            'List all symbols flagged as dead (unreachable) code in the'
+            ' indexed graph, grouped by file.\n\n'
+            'When to use this instead of Grep/Read: use this instead of'
+            ' manually scanning for unused definitions. Axon computes'
+            ' reachability over the full call graph at index time; this'
+            ' tool surfaces the result without requiring any query text.\n\n'
+            'Parameters:\n'
+            '  - `repo` (optional): target repo slug or path. Defaults to'
+            ' the local repo.\n\n'
+            'Returns: symbols grouped by file, each entry showing name,'
+            ' label, and line number. A freshness warning is prepended when'
+            ' dead-code data predates the last index run.\n\n'
+            'Multi-repo posture: targets a single repo per call. Pass'
+            ' `repo=<slug>` to inspect a foreign repo.'
+            ' Stale-major foreign repos are refused.'
+        ),
         inputSchema={
             'type': 'object',
             'properties': {
                 'repo': {'type': 'string', 'description': _REPO_PARAM_DESC}
             },
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_detect_changes',
         description=(
-            'Parse a git diff and map changed files/lines to affected symbols '
-            'in the knowledge graph.'
+            'Parse a raw git diff and map changed lines to the indexed'
+            ' symbols that overlap those lines in each changed file.\n\n'
+            'When to use this instead of Grep/Read: use this as the first'
+            ' step when reviewing a patch - it tells you which named symbols'
+            ' are touched by each hunk, so you can then call `axon_impact`'
+            ' on the affected symbols to see downstream effects without'
+            ' manually correlating line numbers to function boundaries.\n\n'
+            'Parameters:\n'
+            '  - `diff`: raw `git diff` output (max 100 000 chars).\n'
+            '  - `repo` (optional): target repo slug or path. When omitted,'
+            ' the diff is routed to the repo that owns the majority of the'
+            ' changed files.\n\n'
+            'Returns: a section per changed file listing affected symbol'
+            ' names, labels, and line ranges. Files with no indexed symbols'
+            ' in the changed lines are noted explicitly. A total count'
+            ' closes the output.\n\n'
+            'Multi-repo posture: routes to the repo that owns the changed'
+            ' files. *Cross-repo diffs (files from different repos in one'
+            ' patch) are refused* with a routing error listing the repos'
+            ' detected.'
         ),
         inputSchema={
             'type': 'object',
@@ -448,10 +570,29 @@ TOOLS: list[Tool] = [
             },
             'required': ['diff'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_cypher',
-        description='Execute a raw Cypher query against the knowledge graph.',
+        description=(
+            'Execute a read-only Cypher query directly against the Axon'
+            ' knowledge graph and return raw tabular results.\n\n'
+            'When to use this instead of Grep/Read: use this for ad-hoc'
+            ' structural questions that no other tool answers - e.g., "all'
+            ' nodes with more than 20 callers", "files that import X and'
+            ' belong to community Y". Requires familiarity with the Axon'
+            ' graph schema (call `axon://schema` resource for the layout).\n\n'
+            'Parameters:\n'
+            '  - `query`: Cypher MATCH/RETURN query (max 100 000 chars).'
+            ' *Write operations (CREATE, DELETE, SET, MERGE, DROP) are'
+            ' rejected.*\n'
+            '  - `repo` (optional): target repo slug or path.\n\n'
+            'Returns: tabular results as "N rows:" followed by one'
+            ' pipe-delimited row per line, or "Query returned no results."\n\n'
+            'Multi-repo posture: each call targets a single repo. The query'
+            ' runs against a read-only connection regardless of whether the'
+            ' local injected storage is read-write.'
+        ),
         inputSchema={
             'type': 'object',
             'properties': {
@@ -464,12 +605,32 @@ TOOLS: list[Tool] = [
             },
             'required': ['query'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_coupling',
         description=(
-            'Show files temporally coupled with a given file. '
-            'Reveals hidden dependencies from git co-change patterns.'
+            'Show files that are temporally coupled with a given file,'
+            ' revealing hidden dependencies inferred from git co-change'
+            ' history.\n\n'
+            'When to use this instead of Grep/Read: use this when you want'
+            ' to know which files tend to change together with a given file'
+            ' - even when there is no static import between them. Grep'
+            ' cannot surface this relationship; it is computed from commit'
+            ' history during indexing.\n\n'
+            'Parameters:\n'
+            '  - `file_path`: path to the file to analyse (relative or'
+            ' absolute).\n'
+            '  - `min_strength`: minimum coupling strength (0.0-1.0,'
+            ' default 0.3). Lower values return more pairs.\n'
+            '  - `repo` (optional): target repo slug or path. When omitted,'
+            ' the file path is used to auto-route to the owning repo.\n\n'
+            'Returns: coupled files ordered by strength descending. Each'
+            ' entry shows path, strength, co-change count, and whether a'
+            ' static import already covers the dependency. Files with no'
+            ' static import are flagged as hidden dependencies.\n\n'
+            'Multi-repo posture: auto-routes to the repo that owns'
+            ' `file_path`. Pass `repo=<slug>` to override.'
         ),
         inputSchema={
             'type': 'object',
@@ -480,36 +641,77 @@ TOOLS: list[Tool] = [
                 },
                 'min_strength': {
                     'type': 'number',
-                    'description': 'Minimum coupling strength threshold (default 0.3).',
+                    'description': (
+                        'Minimum coupling strength threshold (default 0.3).'
+                    ),
                     'default': 0.3,
                 },
                 'repo': {'type': 'string', 'description': _REPO_PARAM_DESC},
             },
             'required': ['file_path'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_communities',
         description=(
-            'List detected code communities (Leiden clusters) or drill into '
-            'a specific community to see its members.'
+            'List detected code communities (Leiden clusters over the call'
+            ' graph) or drill into a specific community to see its members.\n\n'
+            'When to use this instead of Grep/Read: use this to understand'
+            ' module-level boundaries that were not explicitly designed -'
+            ' which functions cluster together by call patterns, and which'
+            ' processes cross community boundaries. Read cannot surface this;\n'
+            ' it must be computed over the full graph.\n\n'
+            'Parameters:\n'
+            '  - `community`: optional community name to drill into.'
+            ' When omitted, returns a summary list of all communities with'
+            ' cohesion score and symbol count.\n'
+            '  - `repo` (optional): target repo slug or path.\n\n'
+            'Returns (list mode): communities ranked by cohesion descending,'
+            ' each with name, cohesion score, and symbol count. A'
+            ' cross-community processes section lists processes that span'
+            ' multiple communities. Returns (drill mode): all members of the'
+            ' named community with name, label, file, line, entry-point,'
+            ' and exported flags.\n\n'
+            'Multi-repo posture: targets a single repo per call.'
+            ' A freshness warning is prepended when community data is stale.'
         ),
         inputSchema={
             'type': 'object',
             'properties': {
                 'community': {
                     'type': 'string',
-                    'description': 'Optional community name to drill into. Omit to list all.',
+                    'description': (
+                        'Optional community name to drill into. Omit to list all.'
+                    ),
                 },
                 'repo': {'type': 'string', 'description': _REPO_PARAM_DESC},
             },
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_explain',
         description=(
-            'Get a narrative explanation of a symbol: its role, community, '
-            'process flows, and relationships summarized for onboarding.'
+            'Get a narrative explanation of a symbol: its role, community'
+            ' membership, process flows it participates in, caller count,'
+            ' and callee summary - formatted for onboarding and code review.\n\n'
+            'When to use this instead of Grep/Read: use this when you need'
+            ' a plain-language description of what a symbol does and where'
+            ' it fits in the system, rather than its raw call graph.'
+            ' Combines information from multiple graph queries into a single'
+            ' readable summary.\n\n'
+            'Parameters:\n'
+            '  - `symbol`: plain name or dotted path of the symbol.\n'
+            '  - `repo` (optional): target repo slug or path.\n\n'
+            'Returns: explanation header, role flags (entry point, exported,'
+            ' dead code), location, signature, community, caller and callee'
+            ' summaries (top 5 with overflow count), and process flows the'
+            ' symbol participates in. A cross-repo footer lists other repos'
+            ' that contain the symbol.\n\n'
+            'Multi-repo posture: appends a cross-repo footer from accessible'
+            ' foreign repos. When the symbol is absent locally and present'
+            ' in a foreign repo, returns a redirect with `repo=<slug>` hint.'
         ),
         inputSchema={
             'type': 'object',
@@ -522,13 +724,31 @@ TOOLS: list[Tool] = [
             },
             'required': ['symbol'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_review_risk',
         description=(
-            'PR risk assessment: analyzes a git diff to find affected symbols, '
-            'missing co-change files, community boundary crossings, and '
-            'downstream blast radius. Returns a risk score.'
+            'PR risk assessment: synthesises multiple graph signals from a'
+            ' git diff to produce a risk score (LOW/MEDIUM/HIGH out of 10)'
+            ' with supporting evidence.\n\n'
+            'When to use this instead of Grep/Read: use this before merging'
+            ' a PR to quantify risk from blast radius, missing co-change'
+            ' files, and community boundary crossings. Grep can find changed'
+            ' symbols; this computes downstream dependents, hidden coupling'
+            ' violations, and cross-community span in one call.\n\n'
+            'Parameters:\n'
+            '  - `diff`: raw `git diff` output (max 100 000 chars).\n'
+            '  - `repo` (optional): target repo slug or path. Auto-routes'
+            ' to the repo that owns the changed files when omitted.\n\n'
+            'Returns: risk level and numeric score, changed symbols with'
+            ' downstream-dependent counts, missing co-change files (coupled'
+            ' files not present in the diff), and community boundary'
+            ' crossings. Score components: entry points hit, missing'
+            ' co-change files, dependents / 10, +2 for multi-community span.\n\n'
+            'Multi-repo posture: routes to the repo that owns the diff files.'
+            ' *Cross-repo diffs are refused.* Stale-major foreign repos'
+            ' are refused with a re-index hint.'
         ),
         inputSchema={
             'type': 'object',
@@ -542,12 +762,33 @@ TOOLS: list[Tool] = [
             },
             'required': ['diff'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_call_path',
         description=(
-            'Find the shortest call chain between two symbols. '
-            'Uses BFS over CALLS edges.'
+            'Find the shortest call chain between two named symbols using'
+            ' BFS over CALLS edges in the knowledge graph.\n\n'
+            'When to use this instead of Grep/Read: use this instead of'
+            ' manual grep-tracing when you need the shortest execution path'
+            ' between two functions. Grep requires chasing each callee by'
+            ' hand; this returns the full path in one call, annotated with'
+            ' dispatch kinds (thread, async, etc.) where applicable.\n\n'
+            'Parameters:\n'
+            '  - `from_symbol`: source symbol name or dotted path. Resolved'
+            ' with top_k=5 so alternate matches surface if the primary is'
+            ' wrong.\n'
+            '  - `to_symbol`: target symbol name or dotted path. Resolved'
+            ' with top_k=1 (binary success/fail).\n'
+            '  - `max_depth`: maximum BFS hops (default 10, max'
+            f' {MAX_TRAVERSE_DEPTH}).\n'
+            '  - `repo` (optional): target repo slug or path.\n\n'
+            'Returns: a header with the path as "A -> B -> C (N hops)"'
+            ' followed by a numbered list of each hop with label, file,'
+            ' line, and dispatch-kind annotation when non-direct.\n\n'
+            'Multi-repo posture: operates within a single repo. A cross-repo'
+            ' footer is appended when `from_symbol` also exists in foreign'
+            ' repos. Stale-major foreign repos are excluded from footers.'
         ),
         inputSchema={
             'type': 'object',
@@ -562,7 +803,9 @@ TOOLS: list[Tool] = [
                 },
                 'max_depth': {
                     'type': 'integer',
-                    'description': f'Maximum hops (default 10, max {MAX_TRAVERSE_DEPTH}).',
+                    'description': (
+                        f'Maximum hops (default 10, max {MAX_TRAVERSE_DEPTH}).'
+                    ),
                     'default': 10,
                     'minimum': 1,
                     'maximum': MAX_TRAVERSE_DEPTH,
@@ -571,12 +814,31 @@ TOOLS: list[Tool] = [
             },
             'required': ['from_symbol', 'to_symbol'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_file_context',
         description=(
-            'Get comprehensive context for a file: symbols, imports, '
-            'coupling, dead code, and community membership in one call.'
+            'Get comprehensive context for a single file: all its indexed'
+            ' symbols, import graph (in and out), temporal coupling, dead'
+            ' code, community membership, enum summaries, and class-attribute'
+            ' summaries in one call.\n\n'
+            'When to use this instead of Grep/Read: use this instead of'
+            ' Read + grep when you need a structural overview of an entire'
+            ' file before editing it. Read gives you source text; this gives'
+            ' you the graph neighborhood - what the file imports, what imports'
+            ' it, which symbols are dead, and what it couples to.\n\n'
+            'Parameters:\n'
+            '  - `file_path`: path to the file (relative or absolute).\n'
+            '  - `repo` (optional): target repo slug or path. Auto-routes'
+            ' to the owning repo from `file_path` when omitted.\n\n'
+            'Returns: symbols table (name, label, line, entry-point/exported/'
+            'dead flags), outbound imports, inbound importers, top-5 coupled'
+            ' files by strength, dead-code entries, community memberships,'
+            ' enum summaries with member and accessor counts, class-attribute'
+            ' summaries, and module-constant counts.\n\n'
+            'Multi-repo posture: auto-routes to the repo that owns the file'
+            ' path. Pass `repo=<slug>` to override.'
         ),
         inputSchema={
             'type': 'object',
@@ -589,12 +851,32 @@ TOOLS: list[Tool] = [
             },
             'required': ['file_path'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_test_impact',
         description=(
-            'Find tests likely affected by code changes. Accepts a git diff '
-            'or symbol names, traces callers to find test files.'
+            'Find test files likely affected by code changes by tracing'
+            ' callers from changed symbols up to test-file boundaries.\n\n'
+            'When to use this instead of Grep/Read: use this before running'
+            ' CI to select the minimal relevant test subset, or after a'
+            ' refactor to identify which tests need updating. Grep can find'
+            ' literal usages; this traces indirect callers through the full'
+            ' call graph to surface tests that exercise changed code without'
+            ' directly naming it.\n\n'
+            'Parameters:\n'
+            '  - `diff`: raw `git diff` output (max 100 000 chars). Supply'
+            ' this *or* `symbols` - at least one is required.\n'
+            '  - `symbols`: explicit list of symbol names to trace from.'
+            ' Used when you already know which symbols changed.\n'
+            '  - `repo` (optional): target repo slug or path. Diff input'
+            ' auto-routes to the owning repo.\n\n'
+            'Returns: directly impacted test files, indirectly impacted files'
+            ' (via caller graph), and a warnings section listing'
+            ' docstring/comment-only hunks that were skipped and test files'
+            ' excluded by pytest config.\n\n'
+            'Multi-repo posture: routes to the repo that owns the diff files.'
+            ' *Cross-repo diffs are refused.*'
         ),
         inputSchema={
             'type': 'object',
@@ -612,12 +894,27 @@ TOOLS: list[Tool] = [
                 'repo': {'type': 'string', 'description': _REPO_PARAM_DESC},
             },
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_cycles',
         description=(
-            'Detect circular dependencies using strongly connected '
-            'component analysis. Returns cycle groups sorted by size.'
+            'Detect circular dependencies in the knowledge graph using'
+            ' strongly connected component (SCC) analysis. Returns cycle'
+            ' groups sorted by size descending.\n\n'
+            'When to use this instead of Grep/Read: use this to find import'
+            ' or call cycles that prevent clean module separation. Grep'
+            ' cannot detect cycles; it sees individual edges, not paths.'
+            ' This runs over the entire graph in one call.\n\n'
+            'Parameters:\n'
+            '  - `min_size`: minimum number of nodes in a cycle to report'
+            ' (default 2, minimum 2). Raise to filter noise.\n'
+            '  - `repo` (optional): target repo slug or path.\n\n'
+            'Returns: cycle groups numbered and sorted by size, each listing'
+            ' member symbols with name, label, file, and line. Groups of 5+'
+            ' nodes are flagged CRITICAL.\n\n'
+            'Multi-repo posture: operates within a single repo per call.'
+            ' Stale-major repos are refused.'
         ),
         inputSchema={
             'type': 'object',
@@ -631,13 +928,32 @@ TOOLS: list[Tool] = [
                 'repo': {'type': 'string', 'description': _REPO_PARAM_DESC},
             },
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
     Tool(
         name='axon_concurrent_with',
         description=(
-            'Find symbols that may run concurrently with the given symbol. '
-            'Traces dispatch edges (thread/process executors, asyncio tasks, '
-            'Celery enqueued jobs, etc.) and returns reachable callbacks.'
+            'Find symbols that may execute concurrently with a given symbol'
+            ' by tracing outgoing CALLS edges whose dispatch_kind is'
+            ' non-direct (thread_executor, process_executor, detached_task,'
+            ' enqueued_job, callback_registry).\n\n'
+            'When to use this instead of Grep/Read: use this when auditing'
+            ' thread safety or async correctness. Grep finds`executor.submit`'
+            ' call sites; this returns the actual callees reachable through'
+            ' those dispatch edges, grouped by dispatch mechanism, so you'
+            ' know which symbols share mutable state and may race.\n\n'
+            'Parameters:\n'
+            '  - `symbol`: name of the symbol to analyse.\n'
+            '  - `depth`: maximum traversal depth (default 3, max'
+            f' {MAX_TRAVERSE_DEPTH}).\n'
+            '  - `repo` (optional): target repo slug or path.\n\n'
+            'Returns: concurrent callees grouped by dispatch kind,'
+            ' each entry showing name, label, file, line, and hop depth.'
+            ' When no concurrently dispatched callees are found, says so'
+            ' explicitly.\n\n'
+            'Multi-repo posture: appends a cross-repo footer when the'
+            ' symbol also exists in accessible foreign repos.'
+            ' Stale-major foreign repos are excluded from footers.'
         ),
         inputSchema={
             'type': 'object',
@@ -660,6 +976,7 @@ TOOLS: list[Tool] = [
             },
             'required': ['symbol'],
         },
+        annotations=_TOOL_ANNOTATIONS,
     ),
 ]
 
@@ -682,7 +999,12 @@ def _dispatch_tool(name: str, arguments: dict, ctx: RepoContext) -> str:
         Formatted handler result string.
     """
     if name == 'axon_list_repos':
-        return handle_list_repos()
+        return handle_list_repos(
+            resolver=_state.resolver,  # type: ignore[arg-type]
+            pool=_state.pool,  # type: ignore[arg-type]
+            drift_cache=_state.drift_cache,  # type: ignore[arg-type]
+            local_slug=_state.local_slug,
+        )
     elif name == 'axon_query':
         return handle_query(
             ctx, arguments.get('query', ''), limit=arguments.get('limit', 20)
@@ -844,7 +1166,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Dispatch a tool call to the appropriate handler."""
     try:
         if name == 'axon_list_repos':
-            result = handle_list_repos()
+            await _ensure_multi_repo()
+            result = await asyncio.to_thread(
+                handle_list_repos,
+                resolver=_state.resolver,  # type: ignore[arg-type]
+                pool=_state.pool,  # type: ignore[arg-type]
+                drift_cache=_state.drift_cache,  # type: ignore[arg-type]
+                local_slug=_state.local_slug,
+            )
             return [TextContent(type='text', text=result)]
 
         # Build repo context via multi-repo aware resolver.
