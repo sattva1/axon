@@ -258,9 +258,21 @@ async def _build_repo_context(
     explicit_repo: str | None = arguments.get('repo')
     try:
         if tool_name in _PATH_KEYED_TOOLS:
-            entry = route_for_path(
-                resolver, arguments.get('file_path', ''), explicit_repo
-            )
+            raw_file_path = arguments.get('file_path', '')
+            entry = route_for_path(resolver, raw_file_path, explicit_repo)
+            # Normalize an absolute path that lives under entry.path into a
+            # repo-relative path so the handler's storage queries (which key
+            # on repo-relative file_path) match indexed File nodes. Mutates
+            # the arguments dict in place.
+            if raw_file_path:
+                try:
+                    abs_path = Path(raw_file_path).resolve()
+                    if abs_path.is_relative_to(entry.path):
+                        arguments['file_path'] = str(
+                            abs_path.relative_to(entry.path)
+                        )
+                except (OSError, ValueError):
+                    pass  # Leave path unchanged on resolution error.
         elif tool_name in _DIFF_KEYED_TOOLS:
             entry = route_for_diff(
                 resolver, arguments.get('diff', ''), explicit_repo
@@ -1129,7 +1141,6 @@ async def _run_tool_with_fan_out(
     resolver = _state.resolver
     pool = _state.pool
     drift_cache = _state.drift_cache
-    local_slug = _state.local_slug
 
     if (
         name in _SYMBOL_KEYED_TOOLS
@@ -1140,8 +1151,11 @@ async def _run_tool_with_fan_out(
         symbol = arguments.get('symbol') or arguments.get('from_symbol', '')
 
         def _get_foreign_matches() -> list:
+            # Exclude the targeted repo (which may or may not equal the
+            # local repo); otherwise its own matches show up in the
+            # "Also exists in other repos" footer.
             return _foreign_symbol_matches(
-                pool, resolver, drift_cache, symbol, exclude_slug=local_slug
+                pool, resolver, drift_cache, symbol, exclude_slug=ctx.slug
             )
 
         foreign_matches = await asyncio.to_thread(_get_foreign_matches)
@@ -1194,8 +1208,9 @@ async def _run_tool_with_fan_out(
         query = arguments.get('query', '')
 
         def _get_foreign_hits() -> list:
+            # Exclude the targeted repo, not just the local repo.
             return _foreign_query_hit_counts(
-                pool, resolver, drift_cache, query, exclude_slug=local_slug
+                pool, resolver, drift_cache, query, exclude_slug=ctx.slug
             )
 
         foreign_hits = await asyncio.to_thread(_get_foreign_hits)

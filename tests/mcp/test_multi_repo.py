@@ -751,3 +751,182 @@ class TestFormatterConsistency:
         assert 'Widget' in entry_line
         assert 'function' in entry_line
         assert 'src/widget.py' in entry_line
+
+
+# ---------------------------------------------------------------------------
+# Bug 4 regression: path-keyed routing normalises absolute file_path
+# ---------------------------------------------------------------------------
+
+
+class TestPathKeyedNormalization:
+    """_build_repo_context rewrites absolute file_path to repo-relative
+    after routing to a foreign repo, so handler storage queries match
+    the indexed (repo-relative) File node keys."""
+
+    def test_absolute_path_under_foreign_repo_is_made_relative(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Absolute path under a foreign repo is rewritten to repo-relative."""
+        registry = tmp_path / 'registry'
+        local_repo = _make_repo_dir(tmp_path, 'local')
+        foreign_repo = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'foreign', foreign_repo)
+
+        # Patch _state in place so _ensure_multi_repo points at our registry.
+        monkeypatch.setattr(server_module, '_state', _ServerState())
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        server_module._state.resolver = resolver
+        server_module._state.pool = RepoPool(resolver)
+        server_module._state.drift_cache = MagicMock(spec=DriftCache)
+        server_module._state.drift_cache.get_or_probe.return_value = (
+            _fresh_report()
+        )
+        server_module._state.local_slug = 'local'
+
+        target_file = foreign_repo / 'src' / 'widget.py'
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        target_file.write_text('', encoding='utf-8')
+
+        arguments = {'file_path': str(target_file)}
+        ctx_or_refusal = asyncio.run(
+            _build_repo_context('axon_file_context', arguments)
+        )
+        assert isinstance(ctx_or_refusal, RepoContext)
+        assert ctx_or_refusal.slug == 'foreign'
+        # The arguments dict was mutated in place.
+        assert arguments['file_path'] == 'src/widget.py'
+
+        server_module._state.pool.close_all()
+
+    def test_relative_path_passes_through_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A repo-relative path stays unchanged (no spurious resolution)."""
+        registry = tmp_path / 'registry'
+        local_repo = _make_indexed_repo(tmp_path, 'local')
+        _write_registry_entry(registry, 'local', local_repo)
+
+        monkeypatch.setattr(server_module, '_state', _ServerState())
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        server_module._state.resolver = resolver
+        server_module._state.pool = RepoPool(resolver)
+        server_module._state.drift_cache = MagicMock(spec=DriftCache)
+        server_module._state.drift_cache.get_or_probe.return_value = (
+            _fresh_report()
+        )
+        server_module._state.local_slug = 'local'
+
+        arguments = {'file_path': 'src/widget.py'}
+        ctx_or_refusal = asyncio.run(
+            _build_repo_context('axon_file_context', arguments)
+        )
+        assert isinstance(ctx_or_refusal, RepoContext)
+        # Path unchanged.
+        assert arguments['file_path'] == 'src/widget.py'
+
+        server_module._state.pool.close_all()
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 regression: cross-repo footer excludes the targeted repo
+# ---------------------------------------------------------------------------
+
+
+class TestCrossRepoFooterExcludesTarget:
+    """The 'Also exists in other repos' / 'Hits also exist in' footers
+    must exclude the targeted repo, not just the local one."""
+
+    def test_foreign_symbol_matches_excludes_target_when_target_is_foreign(
+        self, tmp_path: Path
+    ) -> None:
+        """exclude_slug=ctx.slug correctly omits a foreign target from the
+        fan-out result."""
+        registry = tmp_path / 'registry'
+        local_repo = _make_repo_dir(tmp_path, 'local')
+        target_repo = _make_indexed_repo(tmp_path, 'target')
+        other_repo = _make_indexed_repo(tmp_path, 'other')
+        _write_registry_entry(registry, 'target', target_repo)
+        _write_registry_entry(registry, 'other', other_repo)
+
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        pool = MagicMock(spec=RepoPool)
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _fresh_report()
+
+        target_backend = MagicMock()
+        other_backend = MagicMock()
+
+        def _get(slug: str) -> Any:
+            if slug == 'target':
+                return target_backend
+            if slug == 'other':
+                return other_backend
+            raise RepoUnavailable(slug, 'unknown')
+
+        pool.get.side_effect = _get
+        target_backend.exact_name_search.return_value = [
+            _make_search_result('target', 'Foo')
+        ]
+        other_backend.exact_name_search.return_value = [
+            _make_search_result('other', 'Foo')
+        ]
+
+        # Exclude the targeted foreign repo - it must not appear in matches.
+        results = _foreign_symbol_matches(
+            pool, resolver, drift_cache, 'Foo', exclude_slug='target'
+        )
+        slugs = {slug for slug, _ in results}
+        assert 'target' not in slugs
+        assert 'other' in slugs
+
+    def test_foreign_query_hit_counts_excludes_target_when_target_is_foreign(
+        self, tmp_path: Path
+    ) -> None:
+        """exclude_slug=ctx.slug correctly omits a foreign target from query
+        hit counts."""
+        registry = tmp_path / 'registry'
+        local_repo = _make_repo_dir(tmp_path, 'local')
+        target_repo = _make_indexed_repo(tmp_path, 'target')
+        other_repo = _make_indexed_repo(tmp_path, 'other')
+        _write_registry_entry(registry, 'target', target_repo)
+        _write_registry_entry(registry, 'other', other_repo)
+
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        pool = MagicMock(spec=RepoPool)
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _fresh_report()
+
+        target_backend = MagicMock()
+        other_backend = MagicMock()
+        target_backend.fts_search.return_value = [
+            _make_search_result('target', 'foo')
+        ]
+        other_backend.fts_search.return_value = [
+            _make_search_result('other', 'foo')
+        ]
+
+        def _get(slug: str) -> Any:
+            if slug == 'target':
+                return target_backend
+            if slug == 'other':
+                return other_backend
+            raise RepoUnavailable(slug, 'unknown')
+
+        pool.get.side_effect = _get
+
+        results = _foreign_query_hit_counts(
+            pool, resolver, drift_cache, 'foo', exclude_slug='target'
+        )
+        slugs = {slug for slug, _ in results}
+        assert 'target' not in slugs
+        assert 'other' in slugs
