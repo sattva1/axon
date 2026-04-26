@@ -35,10 +35,12 @@ from axon.mcp.server import (
     _ServerState,
     _build_repo_context,
     _ensure_multi_repo,
+    call_tool,
 )
 from axon.mcp.tools import (
     _foreign_query_hit_counts,
     _foreign_symbol_matches,
+    _format_foreign_matches,
     _MAX_FOREIGN_COUNT_REPOS,
     handle_context,
     handle_impact,
@@ -110,6 +112,21 @@ def _stale_major_report() -> DriftReport:
     return DriftReport(
         level=DriftLevel.STALE_MAJOR,
         reason='test - forced stale',
+        last_indexed_at='',
+        head_sha=None,
+        head_sha_at_index=None,
+        files_changed_estimate=None,
+        files_indexed_estimate=None,
+        watcher_alive=False,
+        tier_used=None,
+    )
+
+
+def _stale_minor_report() -> DriftReport:
+    """Build a STALE_MINOR drift report for monkeypatching."""
+    return DriftReport(
+        level=DriftLevel.STALE_MINOR,
+        reason='HEAD unchanged but working tree is dirty',
         last_indexed_at='',
         head_sha=None,
         head_sha_at_index=None,
@@ -615,3 +632,122 @@ class TestPoolFanOut:
         )
         assert isinstance(result_ctx, str)
         assert 'STALE_MAJOR' in result_ctx
+
+
+# ---------------------------------------------------------------------------
+# Drift warning via _maybe_drift_warning / call_tool
+# ---------------------------------------------------------------------------
+
+
+class TestStaleMinerForeignWarning:
+    """Drift warning is prepended for foreign STALE_MINOR repos, not local."""
+
+    @pytest.mark.asyncio
+    async def test_stale_minor_foreign_repo_warning_prepended_via_dispatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Foreign STALE_MINOR repo: drift warning appears at top of response."""
+        registry = tmp_path / 'registry'
+        local_repo = _make_indexed_repo(tmp_path, 'local')
+        foreign_repo = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'local', local_repo)
+        _write_registry_entry(registry, 'foreign', foreign_repo)
+
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        pool = RepoPool(resolver)
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _stale_minor_report()
+
+        server_module._state.resolver = resolver
+        server_module._state.pool = pool
+        server_module._state.drift_cache = drift_cache
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+        server_module._state.storage = MagicMock()
+
+        response = await call_tool('axon_dead_code', {'repo': 'foreign'})
+        text = response[0].text
+
+        assert text.startswith('Note:'), (
+            f'Expected drift warning at start; got: {text[:120]!r}'
+        )
+        assert 'minor drift' in text.lower() or 'stale' in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_stale_minor_local_repo_no_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Local repo does not receive drift warning even when STALE_MINOR."""
+        registry = tmp_path / 'registry'
+        local_repo = _make_indexed_repo(tmp_path, 'local')
+        _write_registry_entry(registry, 'local', local_repo)
+
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        pool = RepoPool(resolver)
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _stale_minor_report()
+
+        server_module._state.resolver = resolver
+        server_module._state.pool = pool
+        server_module._state.drift_cache = drift_cache
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+
+        mock_storage = MagicMock()
+        mock_storage.get_dead_code.return_value = []
+        server_module._state.storage = mock_storage
+
+        response = await call_tool('axon_dead_code', {})
+        text = response[0].text
+
+        assert not text.startswith('Note:'), (
+            f'Unexpected drift warning on local repo; got: {text[:120]!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# _format_foreign_matches: redirect vs footer differ only in intro line
+# ---------------------------------------------------------------------------
+
+
+class TestFormatterConsistency:
+    """_format_foreign_matches redirect and footer share per-repo entry format."""
+
+    def test_foreign_matches_and_redirect_share_formatter(self) -> None:
+        """redirect=True and redirect=False differ only in the introductory line."""
+        match = SearchResult(
+            node_id='function:src/widget.py:Widget',
+            score=0.9,
+            node_name='Widget',
+            file_path='src/widget.py',
+            label='function',
+        )
+        matches = [('other-repo', [match])]
+
+        footer = _format_foreign_matches(matches, redirect=False)
+        redirect = _format_foreign_matches(matches, redirect=True)
+
+        # Strip leading/trailing whitespace per line and filter blanks to
+        # isolate content lines from structural padding differences.
+        footer_content = [line for line in footer.splitlines() if line.strip()]
+        redirect_content = [line for line in redirect.splitlines() if line.strip()]
+
+        # Both must produce the same number of content lines.
+        assert len(footer_content) == len(redirect_content)
+
+        # The introductory lines must differ (redirect phrasing vs footer).
+        assert footer_content[0] != redirect_content[0]
+
+        # All per-repo entry lines (after the intro) must be identical.
+        assert footer_content[1:] == redirect_content[1:]
+
+        # The per-repo entry line must include slug, name, label, and path.
+        entry_line = footer_content[1]
+        assert 'other-repo' in entry_line
+        assert 'Widget' in entry_line
+        assert 'function' in entry_line
+        assert 'src/widget.py' in entry_line

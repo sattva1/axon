@@ -33,6 +33,7 @@ from mcp.types import Resource, TextContent, Tool, ToolAnnotations
 from axon.core.drift import DriftCache, DriftLevel
 from axon.core.repos import RepoNotFound, RepoPool, RepoResolver
 from axon.core.storage.kuzu_backend import KuzuBackend
+from axon.mcp.freshness import render_with_drift_warning
 from axon.mcp.repo_context import RepoContext
 from axon.mcp.repo_routing import RoutingError, route_for_diff, route_for_path
 from axon.mcp.resources import get_dead_code_list, get_overview, get_schema
@@ -1061,6 +1062,47 @@ def _dispatch_tool(name: str, arguments: dict, ctx: RepoContext) -> str:
         return f'Unknown tool: {name}'
 
 
+def _maybe_drift_warning(result: str, ctx: RepoContext) -> str:
+    """Prepend a stale-minor drift warning when ctx is a foreign repo.
+
+    No-op for the local repo (the watcher handles staleness there via the
+    existing render_with_dead_code_warning/render_with_communities_warning
+    mechanisms). No-op when drift_cache is uninitialised or the probe fails.
+
+    Args:
+        result: Handler response string.
+        ctx: Per-call repo context.
+
+    Returns:
+        result unchanged for local repos or non-STALE_MINOR drift levels.
+        For foreign STALE_MINOR repos, a warning line is prepended.
+    """
+    if ctx.is_local or ctx.repo_path is None:
+        return result
+    drift_cache = _state.drift_cache
+    if drift_cache is None:
+        return result
+    try:
+        report = drift_cache.get_or_probe(ctx.repo_path)
+        if report.level == DriftLevel.STALE_MINOR:
+            decorated = report.__class__(
+                level=report.level,
+                reason=report.reason,
+                last_indexed_at=report.last_indexed_at,
+                head_sha=report.head_sha,
+                head_sha_at_index=report.head_sha_at_index,
+                files_changed_estimate=report.files_changed_estimate,
+                files_indexed_estimate=report.files_indexed_estimate,
+                watcher_alive=report.watcher_alive,
+                tier_used=report.tier_used,
+                slug=ctx.slug,
+            )
+            return render_with_drift_warning(decorated, result)
+    except Exception:
+        pass
+    return result
+
+
 async def _run_tool_with_fan_out(
     name: str, arguments: dict, ctx: RepoContext
 ) -> str:
@@ -1072,6 +1114,9 @@ async def _run_tool_with_fan_out(
 
     All fan-out I/O happens via ``asyncio.to_thread`` to keep blocking
     pool operations off the event loop.
+
+    For foreign repos that are STALE_MINOR, a drift warning is prepended to
+    the result by ``_maybe_drift_warning``.
 
     Args:
         name: MCP tool name.
@@ -1102,13 +1147,13 @@ async def _run_tool_with_fan_out(
         foreign_matches = await asyncio.to_thread(_get_foreign_matches)
 
         if name == 'axon_context':
-            return handle_context(
+            result = handle_context(
                 ctx,
                 arguments.get('symbol', ''),
                 foreign_matches=foreign_matches,
             )
         elif name == 'axon_impact':
-            return handle_impact(
+            result = handle_impact(
                 ctx,
                 arguments.get('symbol', ''),
                 depth=arguments.get('depth', 3),
@@ -1116,13 +1161,13 @@ async def _run_tool_with_fan_out(
                 foreign_matches=foreign_matches,
             )
         elif name == 'axon_explain':
-            return handle_explain(
+            result = handle_explain(
                 ctx,
                 arguments.get('symbol', ''),
                 foreign_matches=foreign_matches,
             )
         elif name == 'axon_call_path':
-            return handle_call_path(
+            result = handle_call_path(
                 ctx,
                 arguments.get('from_symbol', ''),
                 arguments.get('to_symbol', ''),
@@ -1130,12 +1175,15 @@ async def _run_tool_with_fan_out(
                 foreign_matches=foreign_matches,
             )
         elif name == 'axon_concurrent_with':
-            return handle_concurrent_with(
+            result = handle_concurrent_with(
                 ctx,
                 arguments.get('symbol', ''),
                 depth=arguments.get('depth', 3),
                 foreign_matches=foreign_matches,
             )
+        else:
+            result = _dispatch_tool(name, arguments, ctx)
+        return _maybe_drift_warning(result, ctx)
 
     if (
         name == 'axon_query'
@@ -1151,14 +1199,16 @@ async def _run_tool_with_fan_out(
             )
 
         foreign_hits = await asyncio.to_thread(_get_foreign_hits)
-        return handle_query(
+        result = handle_query(
             ctx,
             query,
             limit=arguments.get('limit', 20),
             foreign_hits=foreign_hits,
         )
+        return _maybe_drift_warning(result, ctx)
 
-    return _dispatch_tool(name, arguments, ctx)
+    result = _dispatch_tool(name, arguments, ctx)
+    return _maybe_drift_warning(result, ctx)
 
 
 @server.call_tool()

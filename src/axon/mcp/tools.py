@@ -288,7 +288,7 @@ def _foreign_query_hit_counts(
     return output
 
 
-def _format_local_alternates(alternates: list[SearchResult]) -> str:
+def _format_alternates(alternates: list[SearchResult]) -> str:
     """Format a list of alternate local symbol matches as a footer section.
 
     Args:
@@ -334,7 +334,7 @@ def _format_foreign_matches(
     return '\n'.join(lines)
 
 
-def _format_foreign_hit_counts(counts: list[tuple[str, int]]) -> str:
+def _format_query_hit_counts(counts: list[tuple[str, int]]) -> str:
     """Format a cross-repo FTS hit-count footer for axon_query responses.
 
     Args:
@@ -445,12 +445,12 @@ def handle_query(
     )
     if not results:
         base = f"No results found for '{query}'."
-        footer = _format_foreign_hit_counts(foreign_hits or [])
+        footer = _format_query_hit_counts(foreign_hits or [])
         return base + ('\n' + footer if footer else '')
 
     groups = _group_by_process(results, storage)
     body = _format_query_results(results, groups)
-    footer = _format_foreign_hit_counts(foreign_hits or [])
+    footer = _format_query_hit_counts(foreign_hits or [])
     if footer:
         body = body + '\n' + footer
     return body
@@ -739,7 +739,7 @@ def handle_context(
                 lines.append(f'  -> {imp}')
 
     # Cross-repo footers.
-    alternates_footer = _format_local_alternates(results[1:])
+    alternates_footer = _format_alternates(results[1:])
     if alternates_footer:
         lines.append(alternates_footer)
 

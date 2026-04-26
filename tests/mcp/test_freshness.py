@@ -4,14 +4,34 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from axon.core.drift import DriftLevel, DriftReport
 from axon.core.meta import MetaFile, update_meta
 from axon.mcp.freshness import (
     _parse_iso,
     render_with_communities_warning,
     render_with_dead_code_warning,
+    render_with_drift_warning,
     staleness_warning_communities,
     staleness_warning_dead_code,
 )
+
+
+def _make_report(
+    level: DriftLevel, reason: str = 'test reason', slug: str | None = None
+) -> DriftReport:
+    """Build a minimal DriftReport for the given level."""
+    return DriftReport(
+        level=level,
+        reason=reason,
+        last_indexed_at='',
+        head_sha=None,
+        head_sha_at_index=None,
+        files_changed_estimate=None,
+        files_indexed_estimate=None,
+        watcher_alive=False,
+        tier_used=None,
+        slug=slug,
+    )
 
 
 class TestParseIso:
@@ -225,3 +245,76 @@ class TestRenderWithCommunitiesWarning:
 
         assert 'axon analyze' in communities_result
         assert dead_code_result == body
+
+
+class TestRenderWithDriftWarning:
+    """render_with_drift_warning behaviour for all DriftLevel values."""
+
+    def test_noop_when_fresh(self) -> None:
+        """FRESH report leaves body unchanged."""
+        body = 'result body'
+        report = _make_report(DriftLevel.FRESH)
+        assert render_with_drift_warning(report, body) == body
+
+    def test_noop_when_stale_major(self) -> None:
+        """STALE_MAJOR report leaves body unchanged.
+
+        The dispatcher already returns a refusal string for STALE_MAJOR; the
+        renderer must not double-annotate the (never-reached) body.
+        """
+        body = 'result body'
+        report = _make_report(DriftLevel.STALE_MAJOR)
+        assert render_with_drift_warning(report, body) == body
+
+    def test_noop_when_unknown(self) -> None:
+        """UNKNOWN report leaves body unchanged."""
+        body = 'result body'
+        report = _make_report(DriftLevel.UNKNOWN)
+        assert render_with_drift_warning(report, body) == body
+
+    def test_prepends_when_stale_minor(self) -> None:
+        """STALE_MINOR report prepends a warning header separated from body."""
+        body = 'actual result'
+        report = _make_report(DriftLevel.STALE_MINOR, reason='dirty tree')
+        result = render_with_drift_warning(report, body)
+
+        assert result.endswith(body)
+        assert result != body
+        # Warning and body must be separated by a blank line.
+        assert '\n\n' in result
+        warning_part = result[: result.index('\n\n')]
+        assert (
+            'drift' in warning_part.lower() or 'minor' in warning_part.lower()
+        )
+
+    def test_includes_slug_when_set(self) -> None:
+        """Warning line quotes the slug when report.slug is set."""
+        body = 'result'
+        report = _make_report(
+            DriftLevel.STALE_MINOR, reason='sentinel modified', slug='my-repo'
+        )
+        result = render_with_drift_warning(report, body)
+
+        assert "'my-repo'" in result
+
+    def test_omits_slug_when_none(self) -> None:
+        """Warning still appears when slug is None, without a quoted slug token."""
+        body = 'result'
+        report = _make_report(
+            DriftLevel.STALE_MINOR, reason='sentinel modified', slug=None
+        )
+        result = render_with_drift_warning(report, body)
+
+        assert result != body
+        # No quoted token should appear in the warning portion.
+        warning_part = result[: result.index('\n\n')]
+        assert "'" not in warning_part
+
+    def test_reason_appears_in_warning(self) -> None:
+        """The drift reason string is included in the warning line."""
+        reason = 'HEAD advanced by 3 commits, 5 files changed'
+        body = 'result'
+        report = _make_report(DriftLevel.STALE_MINOR, reason=reason)
+        result = render_with_drift_warning(report, body)
+
+        assert reason in result

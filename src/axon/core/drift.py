@@ -63,6 +63,10 @@ class DriftReport:
 
     tier_used is the tier (0-3 in execution order) that produced the
     verdict, or None when level is UNKNOWN.
+
+    slug is optionally populated by call sites that know the repo slug,
+    allowing render_with_drift_warning to include it in the warning line.
+    It is never set by probe_drift or DriftCache - those remain slug-agnostic.
     """
 
     level: DriftLevel
@@ -74,6 +78,7 @@ class DriftReport:
     files_indexed_estimate: int | None
     watcher_alive: bool
     tier_used: int | None
+    slug: str | None = None
 
 
 def _get_head_sha(repo_path: Path) -> str | None:

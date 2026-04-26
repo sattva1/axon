@@ -325,6 +325,71 @@ context -> "Next: Use impact() if planning changes to this symbol."
 impact  -> "Tip: Review each affected symbol before making changes."
 ```
 
+### Multi-repo querying
+
+A single `axon serve --watch` session in repo A can also query other indexed
+repos on the same machine - no extra processes needed.
+
+**Discover available repos:**
+
+```
+axon_list_repos
+```
+
+Returns each registered repo with its slug, path, file/symbol counts, and
+per-repo status:
+
+```
+  1. my-service (LOCAL)
+     Path: /home/user/projects/my-service
+     Files: 412  Symbols: 3 201  Relationships: 18 740
+     Freshness: fresh  Watcher: alive  Reachable: yes
+
+  2. shared-lib
+     Path: /home/user/projects/shared-lib
+     Files: 89  Symbols: 640  Relationships: 2 100
+     Freshness: stale_minor  Watcher: dead  Reachable: yes
+```
+
+**Query a specific repo** by passing `repo=<slug>` to any multi-repo tool:
+
+```
+axon_context(symbol="AuthService", repo="shared-lib")
+axon_query(query="token validation", repo="shared-lib")
+axon_impact(symbol="BaseModel", repo="shared-lib")
+```
+
+**Redirect response** - when a symbol exists only in a foreign repo, the tool
+returns a redirect instead of "not found":
+
+```
+Symbol 'AuthService' not found in this repo.
+
+Also exists in other repos (pass repo=<slug> to query):
+  - shared-lib: AuthService (Class) src/auth/service.py
+```
+
+**Cross-repo footers** - symbol tools append an "Also exists in" footer when
+the symbol is also present in accessible foreign repos.
+
+**Stale-minor warning** - when a foreign repo shows minor drift (uncommitted
+edits, a few commits ahead), a one-liner is prepended to the response:
+
+```
+Note: target repo 'shared-lib' shows minor drift since last index
+(HEAD unchanged but working tree is dirty).
+Results may not reflect uncommitted edits.
+```
+
+**Stale-major refusal** - when a foreign repo is significantly out of date
+(>50 commits ahead, or >50% of files changed), queries are refused with a
+re-index hint rather than returning silently stale results:
+
+```
+Repo 'shared-lib' index is significantly out of date (STALE_MAJOR: ...).
+Re-run `axon analyze` in that repo and try again.
+```
+
 ### Resources
 
 | URI | Description |

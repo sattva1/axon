@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+from axon.core.drift import DriftLevel, DriftReport
 from axon.core.meta import MetaFile, load_meta
 
 _STALENESS_THRESHOLD_SECONDS = 60
@@ -84,3 +85,33 @@ def render_with_communities_warning(repo_path: Path | None, body: str) -> str:
     if repo_path is None:
         return body
     return staleness_warning_communities(load_meta(repo_path)) + body
+
+
+def render_with_drift_warning(report: DriftReport, body: str) -> str:
+    """Prepend a one-liner when report.level is STALE_MINOR.
+
+    No-op for FRESH, STALE_MAJOR, or UNKNOWN. The signature deliberately
+    takes a DriftReport (not a RepoContext) so this module stays free of
+    MCP-layer types and matches the existing render_with_* shape.
+
+    The report.slug field, when set, is included in the warning line to
+    identify which repo shows drift. Callers that know the slug should
+    decorate the report with it before passing it here.
+
+    Args:
+        report: Drift probe result for the target repo.
+        body: Handler response body to potentially prepend the warning to.
+
+    Returns:
+        Body unchanged when report.level is not STALE_MINOR. Otherwise,
+        a warning line followed by a blank line then the body.
+    """
+    if report.level != DriftLevel.STALE_MINOR:
+        return body
+    slug_part = f" '{report.slug}'" if report.slug else ''
+    warning = (
+        f'Note: target repo{slug_part} shows minor drift since last index'
+        f' ({report.reason}).\n'
+        f'Results may not reflect uncommitted edits.\n\n'
+    )
+    return warning + body
