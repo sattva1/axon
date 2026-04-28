@@ -17,10 +17,9 @@ from unittest.mock import patch
 import pytest
 
 from axon.core.drift import DriftCache
-from axon.core.repos import RepoPool, RepoResolver, RegistryEntry
+from axon.core.repos import RegistryEntry, RepoResolver
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.tools import handle_list_repos
-
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors the pattern from tests/core/test_repos.py)
@@ -61,7 +60,7 @@ def _write_registry_entry(
 def two_repo_setup(tmp_path: Path):
     """Create a registry with one local and one foreign indexed repo.
 
-    Returns (registry, local_repo, foreign_repo, resolver, pool, drift_cache).
+    Returns (registry, local_repo, foreign_repo, resolver, drift_cache).
     """
     registry = tmp_path / 'registry'
     local_repo = _make_indexed_repo(tmp_path, 'local-repo')
@@ -69,9 +68,8 @@ def two_repo_setup(tmp_path: Path):
     _write_registry_entry(registry, 'local-repo', local_repo)
     _write_registry_entry(registry, 'foreign-repo', foreign_repo)
     resolver = RepoResolver(registry_dir=registry, local_repo_path=local_repo)
-    pool = RepoPool(resolver)
     drift_cache = DriftCache()
-    return registry, local_repo, foreign_repo, resolver, pool, drift_cache
+    return registry, local_repo, foreign_repo, resolver, drift_cache
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +82,7 @@ class TestListReposUsesResolver:
 
     def test_list_known_is_called(self, two_repo_setup: tuple) -> None:
         """RepoResolver.list_known is called; Path.glob is not."""
-        _, _, _, resolver, pool, drift_cache = two_repo_setup
+        _, _, _, resolver, drift_cache = two_repo_setup
         list_known_calls: list[int] = []
         original_list_known = resolver.list_known
 
@@ -103,9 +101,7 @@ class TestListReposUsesResolver:
                 side_effect=AssertionError('Path.glob must not be called'),
             ),
         ):
-            handle_list_repos(
-                resolver=resolver, pool=pool, drift_cache=drift_cache
-            )
+            handle_list_repos(resolver=resolver, drift_cache=drift_cache)
 
         assert list_known_calls, 'resolver.list_known was not called'
 
@@ -115,32 +111,24 @@ class TestListReposOutput:
 
     def test_freshness_per_entry(self, two_repo_setup: tuple) -> None:
         """Output contains a Freshness line for each entry."""
-        _, _, _, resolver, pool, drift_cache = two_repo_setup
+        _, _, _, resolver, drift_cache = two_repo_setup
         result = handle_list_repos(
-            resolver=resolver,
-            pool=pool,
-            drift_cache=drift_cache,
-            local_slug='local-repo',
+            resolver=resolver, drift_cache=drift_cache, local_slug='local-repo'
         )
         assert result.count('Freshness:') == 2
 
     def test_local_entry_marked(self, two_repo_setup: tuple) -> None:
         """The local repo entry carries the (LOCAL) marker."""
-        _, _, _, resolver, pool, drift_cache = two_repo_setup
+        _, _, _, resolver, drift_cache = two_repo_setup
         result = handle_list_repos(
-            resolver=resolver,
-            pool=pool,
-            drift_cache=drift_cache,
-            local_slug='local-repo',
+            resolver=resolver, drift_cache=drift_cache, local_slug='local-repo'
         )
         assert '(LOCAL)' in result
 
     def test_usage_hint_footer(self, two_repo_setup: tuple) -> None:
         """Output ends with the repo=<slug> usage hint."""
-        _, _, _, resolver, pool, drift_cache = two_repo_setup
-        result = handle_list_repos(
-            resolver=resolver, pool=pool, drift_cache=drift_cache
-        )
+        _, _, _, resolver, drift_cache = two_repo_setup
+        result = handle_list_repos(resolver=resolver, drift_cache=drift_cache)
         assert 'repo=<slug>' in result
 
 
@@ -149,12 +137,9 @@ class TestListReposReachability:
 
     def test_reachable_yes_for_local(self, two_repo_setup: tuple) -> None:
         """Local entry shows Reachable: yes."""
-        _, local_repo, _, resolver, pool, drift_cache = two_repo_setup
+        _, local_repo, _, resolver, drift_cache = two_repo_setup
         result = handle_list_repos(
-            resolver=resolver,
-            pool=pool,
-            drift_cache=drift_cache,
-            local_slug='local-repo',
+            resolver=resolver, drift_cache=drift_cache, local_slug='local-repo'
         )
         # The local entry block appears before foreign entries; check presence.
         assert 'Reachable: yes' in result
@@ -176,12 +161,8 @@ class TestListReposReachability:
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = RepoPool(resolver)
         drift_cache = DriftCache()
         result = handle_list_repos(
-            resolver=resolver,
-            pool=pool,
-            drift_cache=drift_cache,
-            local_slug='local-repo',
+            resolver=resolver, drift_cache=drift_cache, local_slug='local-repo'
         )
         assert 'Reachable: no' in result

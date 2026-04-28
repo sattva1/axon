@@ -1,12 +1,12 @@
-"""Registry schema, slug allocation, repo resolver, pool, and qualified IDs.
+"""Registry schema, slug allocation, repo resolver, and qualified IDs.
 
 ``RegistryEntry`` is the single source of truth for the schema of
 ``~/.axon/repos/{slug}/meta.json``.  ``allocate_slug`` centralises the
 slug-allocation logic used during ``axon analyze`` and by the resolver when
 a local repo has not yet been registered.  ``RepoResolver`` enumerates
 known repos and resolves identifiers (slug, absolute or relative path).
-``RepoPool`` is a foreign-only, lazy, session-lifetime read-only
-``KuzuBackend`` pool consumed by the MCP dispatch layer.
+``open_foreign_backend`` is the single call site for foreign read-only
+``KuzuBackend`` opens consumed by the MCP dispatch layer.
 """
 
 from __future__ import annotations
@@ -15,11 +15,10 @@ import hashlib
 import json
 import logging
 import shutil
-import threading
-import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Final, Iterator
 
 from axon.core.storage.kuzu_backend import KuzuBackend
 
@@ -372,12 +371,12 @@ class RepoResolver:
 
 
 # ---------------------------------------------------------------------------
-# Pool exceptions
+# Exceptions
 # ---------------------------------------------------------------------------
 
 
 class RepoUnavailable(Exception):
-    """Raised by ``RepoPool.get`` when a foreign backend cannot be opened.
+    """Raised when a foreign backend cannot be opened.
 
     ``reason`` is a human-readable string suitable for inclusion in an MCP
     tool response.
@@ -390,151 +389,80 @@ class RepoUnavailable(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Connection pool
+# On-demand foreign backend
 # ---------------------------------------------------------------------------
 
+# Single source of truth for foreign-open retry policies.
+# Dispatch fast-fails so an interactive tool call never stalls > ~50 ms on
+# lock contention. The flush coordinator re-queues on failure and tolerates
+# the slower budget.
+_DISPATCH_OPEN_RETRIES: Final[int] = 1
+_DISPATCH_OPEN_RETRY_DELAY: Final[float] = 0.05
+_FLUSH_OPEN_RETRIES: Final[int] = 3
+_FLUSH_OPEN_RETRY_DELAY: Final[float] = 0.3
 
-DEFAULT_POOL_IDLE_TTL_SECONDS = 60.0
 
+@contextmanager
+def open_foreign_backend(
+    resolver: RepoResolver,
+    slug: str,
+    *,
+    max_retries: int = _DISPATCH_OPEN_RETRIES,
+    retry_delay: float = _DISPATCH_OPEN_RETRY_DELAY,
+) -> Iterator[KuzuBackend]:
+    """Open a foreign repo's read-only KuzuBackend on demand.
 
-class RepoPool:
-    """Foreign-only, lazy, idle-evicting read-only KuzuBackend pool.
+    Stateless - no caching, no idle TTL, no failure memoisation.
 
-    Each foreign repo is opened on first access and cached for repeat queries.
-    A handle that has not been used for ``idle_ttl_seconds`` is evicted on
-    the next ``get`` (lazy sweep) and any subsequent ``close_idle`` call.
+    Synchronous. In async contexts, wrap in asyncio.to_thread or use the
+    AsyncExitStack pattern in _build_repo_context. Fan-out helpers running
+    inside asyncio.to_thread call this directly.
 
-    Idle eviction is *not* a performance optimisation - it exists because
-    Kuzu's reader-writer lock prevents an external ``axon analyze`` from
-    opening a foreign DB read-write while we hold a read-only handle. The
-    TTL gives ``analyze`` a window to acquire the writer lock without us
-    fighting for it.
+    Args:
+        resolver: Resolver used to look up the slug's db_path.
+        slug: Foreign repo slug to open.
+        max_retries: Number of retries on lock contention.
+        retry_delay: Seconds between retries.
 
-    Failures are cached so repeated requests for an unavailable repo do not
-    retry the expensive ``KuzuBackend.initialize`` path within the same
-    session. Failures do *not* idle-evict - they remain sticky until
-    ``close_all`` clears them.
+    Yields:
+        Initialised read-only KuzuBackend for the given slug.
 
-    Invariant: ``get`` MUST be called from inside ``asyncio.to_thread`` in
-    async contexts to keep the blocking native DB open off the event loop.
-    The Phase 3 dispatch layer is the sole caller and upholds this invariant.
-
-    The local repo is excluded - callers should access the local writer or
-    standalone fallback path directly.
+    Raises:
+        RepoUnavailable: When the slug is the local repo, is unknown, or the
+            database cannot be opened.
     """
+    local = resolver.local()
+    if local is not None and slug == local.slug:
+        raise RepoUnavailable(
+            slug, 'local repo must be accessed via the local read path'
+        )
+    try:
+        entry = resolver.resolve_strict(slug)
+    except RepoNotFound:
+        raise RepoUnavailable(slug, 'not registered') from None
 
-    def __init__(
-        self,
-        resolver: RepoResolver,
-        *,
-        idle_ttl_seconds: float = DEFAULT_POOL_IDLE_TTL_SECONDS,
-    ) -> None:
-        self._resolver = resolver
-        self._backends: dict[str, KuzuBackend] = {}
-        self._last_used: dict[str, float] = {}
-        self._failures: dict[str, RepoUnavailable] = {}
-        self._idle_ttl = idle_ttl_seconds
-        self._lock = threading.Lock()
-
-    def _evict_idle_locked(self, now: float) -> None:
-        """Close and forget any backend idle longer than _idle_ttl.
-
-        Caller must hold self._lock.
-        """
-        stale_slugs = [
-            slug
-            for slug, last in self._last_used.items()
-            if (now - last) > self._idle_ttl
-        ]
-        for slug in stale_slugs:
-            backend = self._backends.pop(slug, None)
-            self._last_used.pop(slug, None)
-            if backend is not None:
-                try:
-                    backend.close()
-                except Exception:
-                    logger.debug(
-                        'Error closing idle backend %r', slug, exc_info=True
-                    )
-
-    def get(self, slug: str) -> KuzuBackend:
-        """Return the cached backend for *slug*, opening it on first access.
-
-        Raises ``RepoUnavailable`` when the repo cannot be resolved or the
-        database cannot be opened (``RuntimeError`` or ``OSError`` from
-        ``KuzuBackend.initialize`` are both wrapped).
-
-        Touches the requested slug's last-use timestamp. Stale handles for
-        *other* slugs are evicted lazily by this call.
-        """
-        now = time.monotonic()
-        with self._lock:
-            self._evict_idle_locked(now)
-
-            # Reject local slug with a clear message.
-            local = self._resolver.local()
-            if local is not None and slug == local.slug:
-                raise RepoUnavailable(
-                    slug,
-                    'local repo must be accessed via the session writer, '
-                    'not the foreign pool',
-                )
-
-            if slug in self._backends:
-                self._last_used[slug] = now
-                return self._backends[slug]
-
-            if slug in self._failures:
-                raise self._failures[slug]
-
-            try:
-                entry = self._resolver.resolve_strict(slug)
-            except RepoNotFound:
-                exc = RepoUnavailable(slug, 'not registered')
-                self._failures[slug] = exc
-                raise exc
-
-            backend = KuzuBackend()
-            try:
-                backend.initialize(
-                    entry.db_path,
-                    read_only=True,
-                    max_retries=3,
-                    retry_delay=0.3,
-                )
-            except (RuntimeError, OSError) as e:
-                exc = RepoUnavailable(slug, str(e))
-                self._failures[slug] = exc
-                raise exc
-
-            self._backends[slug] = backend
-            self._last_used[slug] = now
-            return backend
-
-    def close_idle(self) -> None:
-        """Close handles idle longer than the TTL. Public counterpart for
-        the internal lazy sweep, callable from a background timer."""
-        with self._lock:
-            self._evict_idle_locked(time.monotonic())
-
-    def known_foreign_slugs(self) -> list[str]:
-        """Slugs of all foreign repos currently visible in the registry."""
-        return [e.slug for e in self._resolver.list_foreign()]
-
-    def close_all(self) -> None:
-        """Close every cached backend and clear both the cache and failures map."""
-        with self._lock:
-            for backend in self._backends.values():
-                try:
-                    backend.close()
-                except Exception:
-                    logger.debug(
-                        'Error closing backend during pool teardown',
-                        exc_info=True,
-                    )
-            self._backends.clear()
-            self._last_used.clear()
-            self._failures.clear()
+    backend = KuzuBackend()
+    try:
+        backend.initialize(
+            entry.db_path,
+            read_only=True,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+        )
+    except (RuntimeError, OSError) as e:
+        raise RepoUnavailable(slug, str(e)) from e
+    try:
+        yield backend
+    finally:
+        # backend.close() is non-blocking - only Python reference drops -
+        # so it is safe to invoke from AsyncExitStack callbacks on the
+        # event loop.
+        try:
+            backend.close()
+        except Exception:
+            logger.debug(
+                'Error closing foreign backend %r', slug, exc_info=True
+            )
 
 
 # ---------------------------------------------------------------------------

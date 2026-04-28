@@ -1,5 +1,5 @@
 """Tests for repos.py: RegistryEntry, RepoEntry, allocate_slug, RepoResolver,
-RepoPool, qualify_node_id, and parse_qualified_id (Phase 2, multi-repo MCP).
+open_foreign_backend, qualify_node_id, and parse_qualified_id.
 """
 
 from __future__ import annotations
@@ -7,23 +7,27 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import time
+import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from axon.core.repos import (
+    _DISPATCH_OPEN_RETRIES,
+    _DISPATCH_OPEN_RETRY_DELAY,
+    _FLUSH_OPEN_RETRIES,
+    _FLUSH_OPEN_RETRY_DELAY,
     RegistryEntry,
     RepoNotFound,
-    RepoPool,
     RepoResolver,
     RepoUnavailable,
     allocate_slug,
+    open_foreign_backend,
     parse_qualified_id,
     qualify_node_id,
 )
 from axon.core.storage.kuzu_backend import KuzuBackend
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -315,163 +319,189 @@ class TestResolverList:
 
 
 # ---------------------------------------------------------------------------
-# RepoPool
+# open_foreign_backend
 # ---------------------------------------------------------------------------
 
 
-class TestRepoPool:
-    """RepoPool connection management and error handling."""
+class TestOpenForeignBackend:
+    """open_foreign_backend on-demand foreign backend open and error handling."""
 
-    def test_get_local_slug_raises_repo_unavailable(
+    def test_open_foreign_yields_initialized_backend_and_closes(
         self, tmp_path: Path
     ) -> None:
-        """pool.get(local_slug) raises RepoUnavailable with 'must use writer' message."""
+        """Context manager yields an open backend; _db and _conn are None after exit."""
+        registry = tmp_path / 'registry'
+        foreign = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'foreign', foreign)
+        resolver = RepoResolver(registry_dir=registry)
+
+        with open_foreign_backend(resolver, 'foreign') as backend:
+            assert backend._db is not None
+            assert backend._conn is not None
+
+        assert backend._db is None
+        assert backend._conn is None
+
+    def test_open_foreign_local_slug_raises_repo_unavailable(
+        self, tmp_path: Path
+    ) -> None:
+        """Passing the local slug raises RepoUnavailable about the local read path."""
         registry = tmp_path / 'registry'
         repo = _make_indexed_repo(tmp_path, 'local')
         _write_registry_entry(registry, 'local', repo)
         resolver = RepoResolver(registry_dir=registry, local_repo_path=repo)
-        pool = RepoPool(resolver)
-        with pytest.raises(RepoUnavailable, match='writer'):
-            pool.get('local')
-        pool.close_all()
 
-    def test_get_opens_read_only_and_caches(self, tmp_path: Path) -> None:
-        """First get opens the backend; second get returns the same instance."""
-        registry = tmp_path / 'registry'
-        foreign = _make_indexed_repo(tmp_path, 'foreign')
-        _write_registry_entry(registry, 'foreign', foreign)
-        resolver = RepoResolver(registry_dir=registry)
-        pool = RepoPool(resolver)
-        b1 = pool.get('foreign')
-        b2 = pool.get('foreign')
-        assert b1 is b2
-        pool.close_all()
+        with pytest.raises(
+            RepoUnavailable,
+            match='local repo must be accessed via the local read path',
+        ):
+            with open_foreign_backend(resolver, 'local'):
+                pass
 
-    def test_get_raises_repo_unavailable_on_unknown_slug(
+    def test_open_foreign_unknown_slug_raises_repo_unavailable(
         self, tmp_path: Path
     ) -> None:
-        """pool.get('never-registered') raises RepoUnavailable('not registered')."""
+        """Unregistered slug raises RepoUnavailable with reason 'not registered'."""
         registry = tmp_path / 'registry'
         resolver = RepoResolver(registry_dir=registry)
-        pool = RepoPool(resolver)
+
         with pytest.raises(RepoUnavailable, match='not registered'):
-            pool.get('never-registered')
+            with open_foreign_backend(resolver, 'ghost'):
+                pass
 
-    def test_get_raises_repo_unavailable_on_axon_dir_deleted(
+    def test_open_foreign_axon_dir_deleted_raises_repo_unavailable(
         self, tmp_path: Path
     ) -> None:
-        """Deleting .axon/kuzu after registration causes RepoUnavailable on get."""
+        """Delete the .axon dir post-register; open_foreign_backend raises RepoUnavailable."""
         registry = tmp_path / 'registry'
         foreign = _make_indexed_repo(tmp_path, 'foreign')
         _write_registry_entry(registry, 'foreign', foreign)
-        # Kuzu creates a single DB file (not a directory); remove it.
-        (foreign / '.axon' / 'kuzu').unlink(missing_ok=True)
+        # Remove the DB so initialize fails.
+        shutil.rmtree(foreign / '.axon', ignore_errors=True)
         resolver = RepoResolver(registry_dir=registry)
-        pool = RepoPool(resolver)
+
         with pytest.raises(RepoUnavailable) as exc_info:
-            pool.get('foreign')
+            with open_foreign_backend(resolver, 'foreign'):
+                pass
+
         assert exc_info.value.slug == 'foreign'
-        # Error message should surface the underlying OS/RuntimeError text.
-        assert exc_info.value.reason
 
-    def test_get_caches_failures(self, tmp_path: Path) -> None:
-        """Second pool.get for an unavailable repo returns the cached exception."""
-        registry = tmp_path / 'registry'
-        resolver = RepoResolver(registry_dir=registry)
-        pool = RepoPool(resolver)
-        try:
-            pool.get('ghost')
-        except RepoUnavailable:
-            pass
-        # Second call must raise the same exception object.
-        with pytest.raises(RepoUnavailable) as exc_info:
-            pool.get('ghost')
-        assert exc_info.value is pool._failures['ghost']
-
-    def test_close_all_releases_locks(self, tmp_path: Path) -> None:
-        """After close_all(), a fresh writer can open the same DB."""
-        registry = tmp_path / 'registry'
-        foreign = _make_indexed_repo(tmp_path, 'foreign')
-        _write_registry_entry(registry, 'foreign', foreign)
-        resolver = RepoResolver(registry_dir=registry)
-        pool = RepoPool(resolver)
-        pool.get('foreign')
-        pool.close_all()
-        # Should be able to open in write mode after the read-only handle is released.
-        writer = KuzuBackend()
-        writer.initialize(foreign / '.axon' / 'kuzu')
-        writer.close()
-
-    def test_idle_handle_evicted_on_next_get_of_other_slug(
+    def test_open_foreign_does_not_cache_handles_across_calls(
         self, tmp_path: Path
     ) -> None:
-        """A handle idle longer than idle_ttl_seconds is closed on the next
-        ``get`` for any slug, releasing its read-only lock so an external
-        writer can acquire the DB.
-        """
+        """Two successive opens for the same slug yield different KuzuBackend instances."""
         registry = tmp_path / 'registry'
-        idle = _make_indexed_repo(tmp_path, 'idle')
-        active = _make_indexed_repo(tmp_path, 'active')
-        _write_registry_entry(registry, 'idle', idle)
-        _write_registry_entry(registry, 'active', active)
+        foreign = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'foreign', foreign)
         resolver = RepoResolver(registry_dir=registry)
-        pool = RepoPool(resolver, idle_ttl_seconds=0.05)
 
-        idle_backend = pool.get('idle')
-        assert 'idle' in pool._backends
+        with open_foreign_backend(resolver, 'foreign') as b1:
+            id1 = id(b1)
 
-        # Wait past the TTL, then touch a different slug.
-        time.sleep(0.1)
-        pool.get('active')
+        with open_foreign_backend(resolver, 'foreign') as b2:
+            id2 = id(b2)
 
-        # The idle handle should have been evicted by the lazy sweep.
-        assert 'idle' not in pool._backends
-        # And its lock should now be released - a writer can open the DB.
-        writer = KuzuBackend()
-        writer.initialize(idle / '.axon' / 'kuzu')
-        writer.close()
-        # idle_backend is now closed; explicitly call close() to confirm
-        # double-close is safe (no exception).
-        idle_backend.close()
-        pool.close_all()
+        assert id1 != id2
 
-    def test_close_idle_releases_handles_explicitly(
+    def test_open_foreign_does_not_cache_failures_across_calls(
         self, tmp_path: Path
     ) -> None:
-        """close_idle() can be called externally to release stale handles
-        without waiting for the next get."""
+        """After a failed open, re-registering the repo makes the next call succeed."""
+        registry = tmp_path / 'registry'
+        # First attempt: no DB exists.
+        ghost = tmp_path / 'ghost'
+        ghost.mkdir()
+        (ghost / '.axon').mkdir()
+        _write_registry_entry(registry, 'ghost', ghost)
+        resolver = RepoResolver(registry_dir=registry)
+
+        with pytest.raises(RepoUnavailable):
+            with open_foreign_backend(resolver, 'ghost'):
+                pass
+
+        # Fix: create a real DB at the path.
+        real = _make_indexed_repo(tmp_path, 'real-ghost')
+        # Re-write registry entry to point to a real DB.
+        _write_registry_entry(registry, 'ghost', real)
+
+        # Second call must succeed (no sticky failure).
+        with open_foreign_backend(resolver, 'ghost') as backend:
+            assert backend._db is not None
+
+    def test_open_foreign_propagates_oserror_as_repo_unavailable(
+        self, tmp_path: Path
+    ) -> None:
+        """OSError from KuzuBackend.initialize surfaces as RepoUnavailable."""
         registry = tmp_path / 'registry'
         foreign = _make_indexed_repo(tmp_path, 'foreign')
         _write_registry_entry(registry, 'foreign', foreign)
         resolver = RepoResolver(registry_dir=registry)
-        pool = RepoPool(resolver, idle_ttl_seconds=0.05)
 
-        pool.get('foreign')
-        assert 'foreign' in pool._backends
+        with patch.object(
+            KuzuBackend, 'initialize', side_effect=OSError('disk error')
+        ):
+            with pytest.raises(RepoUnavailable, match='disk error'):
+                with open_foreign_backend(resolver, 'foreign'):
+                    pass
 
-        time.sleep(0.1)
-        pool.close_idle()
-
-        assert 'foreign' not in pool._backends
-        # Writer can now claim the DB.
-        writer = KuzuBackend()
-        writer.initialize(foreign / '.axon' / 'kuzu')
-        writer.close()
-        pool.close_all()
-
-    def test_get_within_ttl_keeps_handle_warm(self, tmp_path: Path) -> None:
-        """A handle re-fetched within the TTL stays open and returns the
-        same instance."""
+    def test_open_foreign_dispatch_retry_policy_fails_fast(
+        self, tmp_path: Path
+    ) -> None:
+        """Default max_retries and retry_delay match _DISPATCH constants."""
         registry = tmp_path / 'registry'
         foreign = _make_indexed_repo(tmp_path, 'foreign')
         _write_registry_entry(registry, 'foreign', foreign)
         resolver = RepoResolver(registry_dir=registry)
-        pool = RepoPool(resolver, idle_ttl_seconds=10.0)
 
-        b1 = pool.get('foreign')
-        b2 = pool.get('foreign')
-        assert b1 is b2
-        pool.close_all()
+        captured: dict = {}
+
+        original_initialize = KuzuBackend.initialize
+
+        def spy_initialize(
+            self: KuzuBackend, path: Path, **kwargs: object
+        ) -> None:
+            captured['max_retries'] = kwargs.get('max_retries')
+            captured['retry_delay'] = kwargs.get('retry_delay')
+            original_initialize(self, path, **kwargs)
+
+        with patch.object(KuzuBackend, 'initialize', spy_initialize):
+            with open_foreign_backend(resolver, 'foreign'):
+                pass
+
+        assert captured['max_retries'] == _DISPATCH_OPEN_RETRIES
+        assert captured['retry_delay'] == _DISPATCH_OPEN_RETRY_DELAY
+
+    def test_open_foreign_flush_retry_policy_used_with_explicit_kwargs(
+        self, tmp_path: Path
+    ) -> None:
+        """Explicit flush-policy kwargs reach KuzuBackend.initialize."""
+        registry = tmp_path / 'registry'
+        foreign = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'foreign', foreign)
+        resolver = RepoResolver(registry_dir=registry)
+
+        captured: dict = {}
+
+        original_initialize = KuzuBackend.initialize
+
+        def spy_initialize(
+            self: KuzuBackend, path: Path, **kwargs: object
+        ) -> None:
+            captured['max_retries'] = kwargs.get('max_retries')
+            captured['retry_delay'] = kwargs.get('retry_delay')
+            original_initialize(self, path, **kwargs)
+
+        with patch.object(KuzuBackend, 'initialize', spy_initialize):
+            with open_foreign_backend(
+                resolver,
+                'foreign',
+                max_retries=_FLUSH_OPEN_RETRIES,
+                retry_delay=_FLUSH_OPEN_RETRY_DELAY,
+            ):
+                pass
+
+        assert captured['max_retries'] == _FLUSH_OPEN_RETRIES
+        assert captured['retry_delay'] == _FLUSH_OPEN_RETRY_DELAY
 
 
 # ---------------------------------------------------------------------------

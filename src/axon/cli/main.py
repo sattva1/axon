@@ -17,7 +17,6 @@ import urllib.error
 import urllib.request
 import uuid
 import webbrowser
-
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +38,7 @@ from rich.progress import (
 
 from axon import __version__
 from axon.core.diff import diff_branches, format_diff
+from axon.core.drift import DriftCache, compute_drift_inputs
 from axon.core.embeddings.embedder import (
     _DEFAULT_MODEL,
     configure_coreml,
@@ -46,23 +46,21 @@ from axon.core.embeddings.embedder import (
     validate_coreml,
     validate_cuda,
 )
-from axon.core.drift import compute_drift_inputs
 from axon.core.host_meta import host_json_path, load_host_meta
 from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
 from axon.core.ingestion.watcher import ensure_current_embeddings, watch_repo
 from axon.core.meta import load_meta, now_iso, update_meta
-from axon.core.drift import DriftCache
 from axon.core.repos import (
-    default_registry_dir,
     RegistryEntry,
-    RepoPool,
     RepoResolver,
     allocate_slug,
+    default_registry_dir,
 )
 from axon.core.storage.base import EMBEDDING_DIMENSIONS
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp import tools as mcp_tools
-from axon.mcp.server import main as mcp_main, set_db_path, set_lock, set_storage
+from axon.mcp.server import main as mcp_main
+from axon.mcp.server import set_db_path, set_lock, set_storage
 from axon.runtime import AxonRuntime
 from axon.web import app as web_app_module
 
@@ -677,7 +675,7 @@ def _run_background_embeddings(
 
     Returns the number of embeddings generated.
     """
-    from axon.core.ingestion.pipeline import _run_embedding_phase, PipelineResult
+    from axon.core.ingestion.pipeline import PipelineResult, _run_embedding_phase
 
     report = progress_callback or (lambda _phase, _pct: None)
     bg_storage = KuzuBackend()
@@ -903,15 +901,11 @@ def list_repos() -> None:
     """List all indexed repositories."""
     local_repo_path = Path.cwd().resolve()
     resolver = RepoResolver(local_repo_path=local_repo_path)
-    pool = RepoPool(resolver)
     drift_cache = DriftCache()
     local_entry = resolver.local()
     local_slug = local_entry.slug if local_entry is not None else None
     result = mcp_tools.handle_list_repos(
-        resolver=resolver,
-        pool=pool,
-        drift_cache=drift_cache,
-        local_slug=local_slug,
+        resolver=resolver, drift_cache=drift_cache, local_slug=local_slug
     )
     console.print(result)
 

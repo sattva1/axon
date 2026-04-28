@@ -7,13 +7,16 @@ Coverage:
 - Fan-out helpers: _foreign_symbol_matches, _foreign_query_hit_counts
 - handle_context and handle_query with foreign repo footers
 - handle_impact with explicit repo= arg
-- Pool and drift filtering behaviour
+- Drift filtering behaviour
+- Phase 1: open_foreign_backend handle lifetime and isolation tests
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
+from contextlib import AsyncExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -23,30 +26,30 @@ import pytest
 import axon.mcp.server as server_module
 from axon.core.drift import DriftCache, DriftLevel, DriftReport
 from axon.core.repos import (
-    RepoPool,
+    RegistryEntry,
     RepoResolver,
     RepoUnavailable,
-    RegistryEntry,
+    open_foreign_backend,
 )
 from axon.core.storage.base import SearchResult
+from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.repo_context import RepoContext
 from axon.mcp.repo_routing import RoutingError, route_for_diff, route_for_path
 from axon.mcp.server import (
-    _ServerState,
     _build_repo_context,
     _ensure_multi_repo,
+    _ServerState,
     call_tool,
 )
 from axon.mcp.tools import (
+    _MAX_FOREIGN_COUNT_REPOS,
     _foreign_query_hit_counts,
     _foreign_symbol_matches,
     _format_foreign_matches,
-    _MAX_FOREIGN_COUNT_REPOS,
     handle_context,
     handle_impact,
     handle_query,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -178,27 +181,26 @@ class TestEnsureMultiRepo:
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = RepoPool(resolver)
         drift_cache = DriftCache()
         server_module._state.resolver = resolver
-        server_module._state.pool = pool
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
 
         mock_storage = MagicMock()
         server_module._state.storage = mock_storage
 
-        result = await _build_repo_context('axon_dead_code', {})
+        async with AsyncExitStack() as stack:
+            result = await _build_repo_context('axon_dead_code', {}, stack)
 
         assert isinstance(result, RepoContext)
         assert result.is_local is True
         assert result.storage is mock_storage
 
     @pytest.mark.asyncio
-    async def test_dispatch_resolves_repo_arg_to_foreign_pool(
+    async def test_dispatch_resolves_repo_arg_to_foreign(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When repo=<slug> is given, the foreign pool entry is returned as ctx."""
+        """When repo=<slug> is given, the foreign backend is returned as ctx."""
         registry = tmp_path / 'registry'
         local_repo = _make_indexed_repo(tmp_path, 'local')
         foreign_repo = _make_indexed_repo(tmp_path, 'foreign')
@@ -209,10 +211,8 @@ class TestEnsureMultiRepo:
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = RepoPool(resolver)
         drift_cache = DriftCache()
         server_module._state.resolver = resolver
-        server_module._state.pool = pool
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
 
@@ -220,9 +220,10 @@ class TestEnsureMultiRepo:
             drift_cache, 'get_or_probe', lambda _: _fresh_report()
         )
 
-        result = await _build_repo_context(
-            'axon_context', {'symbol': 'Foo', 'repo': 'foreign'}
-        )
+        async with AsyncExitStack() as stack:
+            result = await _build_repo_context(
+                'axon_context', {'symbol': 'Foo', 'repo': 'foreign'}, stack
+            )
 
         assert isinstance(result, RepoContext)
         assert result.is_local is False
@@ -254,7 +255,6 @@ class TestEnsureMultiRepo:
             f'RepoResolver.__init__ called {init_count} times; expected 1'
         )
         assert server_module._state.resolver is not None
-        assert server_module._state.pool is not None
 
 
 # ---------------------------------------------------------------------------
@@ -501,29 +501,31 @@ class TestHandleQueryMultiRepo:
         _write_registry_entry(registry, 'local', local_repo)
 
         # Register more foreign repos than the cap.
-        foreign_repos = []
         for i in range(_MAX_FOREIGN_COUNT_REPOS + 3):
-            repo = _make_repo_dir(tmp_path, f'foreign_{i}')
+            repo = _make_indexed_repo(tmp_path, f'foreign_{i}')
             _write_registry_entry(registry, f'foreign_{i}', repo)
-            foreign_repos.append(repo)
 
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = MagicMock(spec=RepoPool)
         drift_cache = MagicMock(spec=DriftCache)
-
-        # All foreign repos return fresh and have hits.
         drift_cache.get_or_probe.return_value = _fresh_report()
+
         mock_backend = MagicMock()
         mock_backend.fts_search.return_value = [
             _make_search_result('foreign', 'foo')
         ]
-        pool.get.return_value = mock_backend
 
-        results = _foreign_query_hit_counts(
-            pool, resolver, drift_cache, 'foo', exclude_slug='local'
-        )
+        @contextmanager
+        def _fake_open(res: Any, slug: str, **kwargs: Any):
+            yield mock_backend
+
+        with patch(
+            'axon.mcp.tools.open_foreign_backend', side_effect=_fake_open
+        ):
+            results = _foreign_query_hit_counts(
+                resolver, drift_cache, 'foo', exclude_slug='local'
+            )
 
         assert len(results) <= _MAX_FOREIGN_COUNT_REPOS
 
@@ -563,39 +565,39 @@ class TestHandleImpactMultiRepo:
 
 
 # ---------------------------------------------------------------------------
-# Pool fan-out: skips unavailable and STALE_MAJOR foreign repos
+# Fan-out: skips unavailable and STALE_MAJOR foreign repos
 # ---------------------------------------------------------------------------
 
 
-class TestPoolFanOut:
+class TestFanOut:
     """Fan-out helpers filter out unavailable and STALE_MAJOR repos silently."""
 
-    def test_pool_skips_unavailable_foreign_repos_silently(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_skips_unavailable_foreign_repos_silently(
+        self, tmp_path: Path
     ) -> None:
         """_foreign_symbol_matches does not propagate RepoUnavailable errors."""
         registry = tmp_path / 'registry'
         local_repo = _make_repo_dir(tmp_path, 'local')
-        foreign_repo = _make_repo_dir(tmp_path, 'foreign')
+        # Register a foreign repo path that has no real DB - open will fail.
+        ghost_repo = tmp_path / 'ghost'
+        ghost_repo.mkdir()
         _write_registry_entry(registry, 'local', local_repo)
-        _write_registry_entry(registry, 'foreign', foreign_repo)
+        _write_registry_entry(registry, 'ghost', ghost_repo)
 
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = MagicMock(spec=RepoPool)
         drift_cache = MagicMock(spec=DriftCache)
         drift_cache.get_or_probe.return_value = _fresh_report()
-        pool.get.side_effect = RepoUnavailable('foreign', 'test error')
 
         # Must not raise - silently returns empty.
         result = _foreign_symbol_matches(
-            pool, resolver, drift_cache, 'Foo', exclude_slug='local'
+            resolver, drift_cache, 'Foo', exclude_slug='local'
         )
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_pool_skips_stale_major_foreign_in_lookups_but_refuses_at_target(
+    async def test_skips_stale_major_foreign_in_lookups_but_refuses_at_target(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """STALE_MAJOR foreign repos excluded from fan-out; refused when targeted."""
@@ -608,28 +610,25 @@ class TestPoolFanOut:
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = MagicMock(spec=RepoPool)
         drift_cache = MagicMock(spec=DriftCache)
         drift_cache.get_or_probe.return_value = _stale_major_report()
 
         # Fan-out: STALE_MAJOR silently excluded.
         result = _foreign_symbol_matches(
-            pool, resolver, drift_cache, 'Foo', exclude_slug='local'
+            resolver, drift_cache, 'Foo', exclude_slug='local'
         )
         assert result == []
-        # The pool was never asked for the stale repo.
-        pool.get.assert_not_called()
 
         # Targeted: _build_repo_context must produce a refusal string.
         server_module._state.resolver = resolver
-        server_module._state.pool = pool
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
         server_module._state.storage = MagicMock()
 
-        result_ctx = await _build_repo_context(
-            'axon_context', {'symbol': 'Foo', 'repo': 'stale'}
-        )
+        async with AsyncExitStack() as stack:
+            result_ctx = await _build_repo_context(
+                'axon_context', {'symbol': 'Foo', 'repo': 'stale'}, stack
+            )
         assert isinstance(result_ctx, str)
         assert 'STALE_MAJOR' in result_ctx
 
@@ -657,12 +656,10 @@ class TestStaleMinerForeignWarning:
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = RepoPool(resolver)
         drift_cache = MagicMock(spec=DriftCache)
         drift_cache.get_or_probe.return_value = _stale_minor_report()
 
         server_module._state.resolver = resolver
-        server_module._state.pool = pool
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
         server_module._state.storage = MagicMock()
@@ -688,12 +685,10 @@ class TestStaleMinerForeignWarning:
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = RepoPool(resolver)
         drift_cache = MagicMock(spec=DriftCache)
         drift_cache.get_or_probe.return_value = _stale_minor_report()
 
         server_module._state.resolver = resolver
-        server_module._state.pool = pool
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
 
@@ -779,7 +774,6 @@ class TestPathKeyedNormalization:
             registry_dir=registry, local_repo_path=local_repo
         )
         server_module._state.resolver = resolver
-        server_module._state.pool = RepoPool(resolver)
         server_module._state.drift_cache = MagicMock(spec=DriftCache)
         server_module._state.drift_cache.get_or_probe.return_value = (
             _fresh_report()
@@ -791,15 +785,18 @@ class TestPathKeyedNormalization:
         target_file.write_text('', encoding='utf-8')
 
         arguments = {'file_path': str(target_file)}
-        ctx_or_refusal = asyncio.run(
-            _build_repo_context('axon_file_context', arguments)
-        )
+
+        async def _run() -> RepoContext | str:
+            async with AsyncExitStack() as stack:
+                return await _build_repo_context(
+                    'axon_file_context', arguments, stack
+                )
+
+        ctx_or_refusal = asyncio.run(_run())
         assert isinstance(ctx_or_refusal, RepoContext)
         assert ctx_or_refusal.slug == 'foreign'
         # The arguments dict was mutated in place.
         assert arguments['file_path'] == 'src/widget.py'
-
-        server_module._state.pool.close_all()
 
     def test_relative_path_passes_through_unchanged(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -815,7 +812,6 @@ class TestPathKeyedNormalization:
             registry_dir=registry, local_repo_path=local_repo
         )
         server_module._state.resolver = resolver
-        server_module._state.pool = RepoPool(resolver)
         server_module._state.drift_cache = MagicMock(spec=DriftCache)
         server_module._state.drift_cache.get_or_probe.return_value = (
             _fresh_report()
@@ -823,14 +819,17 @@ class TestPathKeyedNormalization:
         server_module._state.local_slug = 'local'
 
         arguments = {'file_path': 'src/widget.py'}
-        ctx_or_refusal = asyncio.run(
-            _build_repo_context('axon_file_context', arguments)
-        )
+
+        async def _run() -> RepoContext | str:
+            async with AsyncExitStack() as stack:
+                return await _build_repo_context(
+                    'axon_file_context', arguments, stack
+                )
+
+        ctx_or_refusal = asyncio.run(_run())
         assert isinstance(ctx_or_refusal, RepoContext)
         # Path unchanged.
         assert arguments['file_path'] == 'src/widget.py'
-
-        server_module._state.pool.close_all()
 
 
 # ---------------------------------------------------------------------------
@@ -857,32 +856,38 @@ class TestCrossRepoFooterExcludesTarget:
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = MagicMock(spec=RepoPool)
         drift_cache = MagicMock(spec=DriftCache)
         drift_cache.get_or_probe.return_value = _fresh_report()
 
-        target_backend = MagicMock()
-        other_backend = MagicMock()
-
-        def _get(slug: str) -> Any:
-            if slug == 'target':
-                return target_backend
-            if slug == 'other':
-                return other_backend
-            raise RepoUnavailable(slug, 'unknown')
-
-        pool.get.side_effect = _get
-        target_backend.exact_name_search.return_value = [
+        target_mock = MagicMock()
+        other_mock = MagicMock()
+        target_mock.exact_name_search.return_value = [
             _make_search_result('target', 'Foo')
         ]
-        other_backend.exact_name_search.return_value = [
+        other_mock.exact_name_search.return_value = [
             _make_search_result('other', 'Foo')
         ]
 
-        # Exclude the targeted foreign repo - it must not appear in matches.
-        results = _foreign_symbol_matches(
-            pool, resolver, drift_cache, 'Foo', exclude_slug='target'
-        )
+        # Use a context manager mock so open_foreign_backend works.
+        def _fake_open(res: Any, slug: str, **kwargs: Any) -> Any:
+            @contextmanager
+            def _cm():
+                if slug == 'target':
+                    yield target_mock
+                elif slug == 'other':
+                    yield other_mock
+                else:
+                    raise RepoUnavailable(slug, 'unknown')
+
+            return _cm()
+
+        with patch(
+            'axon.mcp.tools.open_foreign_backend', side_effect=_fake_open
+        ):
+            results = _foreign_symbol_matches(
+                resolver, drift_cache, 'Foo', exclude_slug='target'
+            )
+
         slugs = {slug for slug, _ in results}
         assert 'target' not in slugs
         assert 'other' in slugs
@@ -902,31 +907,220 @@ class TestCrossRepoFooterExcludesTarget:
         resolver = RepoResolver(
             registry_dir=registry, local_repo_path=local_repo
         )
-        pool = MagicMock(spec=RepoPool)
         drift_cache = MagicMock(spec=DriftCache)
         drift_cache.get_or_probe.return_value = _fresh_report()
 
-        target_backend = MagicMock()
-        other_backend = MagicMock()
-        target_backend.fts_search.return_value = [
+        target_mock = MagicMock()
+        other_mock = MagicMock()
+        target_mock.fts_search.return_value = [
             _make_search_result('target', 'foo')
         ]
-        other_backend.fts_search.return_value = [
+        other_mock.fts_search.return_value = [
             _make_search_result('other', 'foo')
         ]
 
-        def _get(slug: str) -> Any:
-            if slug == 'target':
-                return target_backend
-            if slug == 'other':
-                return other_backend
-            raise RepoUnavailable(slug, 'unknown')
+        def _fake_open(res: Any, slug: str, **kwargs: Any) -> Any:
+            @contextmanager
+            def _cm():
+                if slug == 'target':
+                    yield target_mock
+                elif slug == 'other':
+                    yield other_mock
+                else:
+                    raise RepoUnavailable(slug, 'unknown')
 
-        pool.get.side_effect = _get
+            return _cm()
 
-        results = _foreign_query_hit_counts(
-            pool, resolver, drift_cache, 'foo', exclude_slug='target'
-        )
+        with patch(
+            'axon.mcp.tools.open_foreign_backend', side_effect=_fake_open
+        ):
+            results = _foreign_query_hit_counts(
+                resolver, drift_cache, 'foo', exclude_slug='target'
+            )
+
         slugs = {slug for slug, _ in results}
         assert 'target' not in slugs
         assert 'other' in slugs
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: open_foreign_backend handle lifetime and isolation
+# ---------------------------------------------------------------------------
+
+
+class TestForeignHandleLifetime:
+    """open_foreign_backend handles are released promptly and not shared."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_releases_foreign_handle_on_stack_exit(
+        self, tmp_path: Path
+    ) -> None:
+        """After the dispatch stack exits, the foreign handle is released.
+
+        Proof: a fresh open_foreign_backend call after dispatch succeeds
+        (no lock leak prevents re-acquisition).
+        """
+        registry = tmp_path / 'registry'
+        local_repo = _make_repo_dir(tmp_path, 'local')
+        foreign_repo = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'local', local_repo)
+        _write_registry_entry(registry, 'foreign', foreign_repo)
+
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _fresh_report()
+
+        server_module._state.repo_path = local_repo
+        server_module._state.resolver = resolver
+        server_module._state.drift_cache = drift_cache
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+        server_module._state.storage = MagicMock()
+
+        # Dispatch opens the foreign handle inside its own AsyncExitStack.
+        response = await call_tool('axon_dead_code', {'repo': 'foreign'})
+        assert response
+
+        # After dispatch returns, the stack is exited and the handle closed.
+        # A fresh open must succeed (no lingering RO lock blocking re-entry).
+        with open_foreign_backend(resolver, 'foreign') as backend:
+            assert backend._db is not None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_dispatch_does_not_share_foreign_handle(
+        self, tmp_path: Path
+    ) -> None:
+        """Two concurrent call_tool invocations for the same foreign slug each
+        get their own KuzuBackend instance."""
+        registry = tmp_path / 'registry'
+        local_repo = _make_repo_dir(tmp_path, 'local')
+        foreign_repo = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'local', local_repo)
+        _write_registry_entry(registry, 'foreign', foreign_repo)
+
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _fresh_report()
+
+        server_module._state.repo_path = local_repo
+        server_module._state.resolver = resolver
+        server_module._state.drift_cache = drift_cache
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+        server_module._state.storage = MagicMock()
+
+        backend_ids: list[int] = []
+        original_initialize = KuzuBackend.initialize
+
+        def capturing_initialize(
+            self: KuzuBackend, *args: Any, **kwargs: Any
+        ) -> None:
+            backend_ids.append(id(self))
+            original_initialize(self, *args, **kwargs)
+
+        with patch.object(KuzuBackend, 'initialize', capturing_initialize):
+            await asyncio.gather(
+                call_tool('axon_dead_code', {'repo': 'foreign'}),
+                call_tool('axon_dead_code', {'repo': 'foreign'}),
+            )
+
+        # Each dispatch must have opened its own backend.
+        assert len(backend_ids) >= 2
+        assert len(set(backend_ids)) >= 2, (
+            'Both dispatches used the same KuzuBackend instance'
+        )
+
+    @pytest.mark.asyncio
+    async def test_axon_analyze_can_acquire_rw_during_session_after_foreign_dispatch_completes(
+        self, tmp_path: Path
+    ) -> None:
+        """After a foreign RO dispatch closes, the same process can open RW.
+
+        Simulates axon analyze acquiring write access after a read-only MCP
+        dispatch has finished and released its handle.
+        """
+        registry = tmp_path / 'registry'
+        local_repo = _make_repo_dir(tmp_path, 'local')
+        foreign_repo = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'local', local_repo)
+        _write_registry_entry(registry, 'foreign', foreign_repo)
+
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _fresh_report()
+
+        server_module._state.repo_path = local_repo
+        server_module._state.resolver = resolver
+        server_module._state.drift_cache = drift_cache
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+        server_module._state.storage = MagicMock()
+
+        # Open RO via dispatch, then let it close.
+        await call_tool('axon_dead_code', {'repo': 'foreign'})
+
+        # After dispatch, open RW from the same process.
+        rw_backend = KuzuBackend()
+        rw_backend.initialize(foreign_repo / '.axon' / 'kuzu', read_only=False)
+        assert rw_backend._db is not None
+        rw_backend.close()
+
+    @pytest.mark.asyncio
+    async def test_fan_out_open_does_not_block_event_loop(
+        self, tmp_path: Path
+    ) -> None:
+        """Fan-out inside asyncio.to_thread does not stall the event loop.
+
+        A concurrent asyncio task must be able to increment a counter while
+        the fan-out open is sleeping, proving fan-out runs off the event loop.
+        """
+        registry = tmp_path / 'registry'
+        local_repo = _make_repo_dir(tmp_path, 'local')
+        foreign_repo = _make_indexed_repo(tmp_path, 'foreign')
+        _write_registry_entry(registry, 'local', local_repo)
+        _write_registry_entry(registry, 'foreign', foreign_repo)
+
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _fresh_report()
+
+        counter = [0]
+        sleep_seconds = 0.1
+
+        original_initialize = KuzuBackend.initialize
+
+        def slow_initialize(
+            self: KuzuBackend, *args: Any, **kwargs: Any
+        ) -> None:
+            # Blocking sleep inside the to_thread worker.
+            time.sleep(sleep_seconds)
+            original_initialize(self, *args, **kwargs)
+
+        async def increment_forever() -> None:
+            while True:
+                await asyncio.sleep(0)
+                counter[0] += 1
+
+        async def run_fan_out() -> None:
+            def _work() -> None:
+                with open_foreign_backend(resolver, 'foreign'):
+                    pass
+
+            await asyncio.to_thread(_work)
+
+        with patch.object(KuzuBackend, 'initialize', slow_initialize):
+            task = asyncio.ensure_future(increment_forever())
+            try:
+                await run_fan_out()
+            finally:
+                task.cancel()
+
+        # The counter must have advanced while the blocking open was happening.
+        assert counter[0] > 0, (
+            'Event loop was blocked - counter did not advance during fan-out open'
+        )

@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -31,7 +31,12 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import Resource, TextContent, Tool, ToolAnnotations
 
 from axon.core.drift import DriftCache, DriftLevel
-from axon.core.repos import RepoNotFound, RepoPool, RepoResolver
+from axon.core.repos import (
+    RepoNotFound,
+    RepoResolver,
+    RepoUnavailable,
+    open_foreign_backend,
+)
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.freshness import render_with_drift_warning
 from axon.mcp.repo_context import RepoContext
@@ -71,9 +76,8 @@ class _ServerState:
     lock: asyncio.Lock | None = None
     db_path: Path | None = None
     repo_path: Path | None = None
-    # Phase 3 multi-repo additions:
+    # Multi-repo additions:
     resolver: RepoResolver | None = None
-    pool: RepoPool | None = None
     drift_cache: DriftCache | None = None
     local_slug: str | None = None
     # Initialised lazily on first _dispatch_tool call, never at import time.
@@ -221,15 +225,36 @@ async def _ensure_multi_repo() -> None:
         resolver = RepoResolver(local_repo_path=local_repo_path)
         local_entry = resolver.local()
         _state.resolver = resolver
-        _state.pool = RepoPool(resolver)
         _state.drift_cache = DriftCache()
         _state.local_slug = (
             local_entry.slug if local_entry is not None else None
         )
 
 
+async def _enter_foreign_in_stack(
+    resolver: RepoResolver, slug: str, stack: AsyncExitStack
+) -> KuzuBackend:
+    """Open a foreign backend and register its cleanup on *stack*.
+
+    Bridges the synchronous open_foreign_backend context manager into the
+    async dispatch stack so the handle lifetime matches the tool call.
+
+    Args:
+        resolver: Resolver used to look up the slug.
+        slug: Foreign repo slug to open.
+        stack: AsyncExitStack that owns the handle lifetime.
+
+    Returns:
+        Initialised read-only KuzuBackend for the given slug.
+    """
+    cm = open_foreign_backend(resolver, slug)
+    backend = await asyncio.to_thread(cm.__enter__)
+    stack.callback(lambda: cm.__exit__(None, None, None))
+    return backend
+
+
 async def _build_repo_context(
-    tool_name: str, arguments: dict
+    tool_name: str, arguments: dict, stack: AsyncExitStack
 ) -> RepoContext | str:
     """Resolve the target repo and return a RepoContext for handler dispatch.
 
@@ -240,6 +265,7 @@ async def _build_repo_context(
     Args:
         tool_name: Name of the MCP tool being dispatched.
         arguments: Raw tool arguments dict.
+        stack: AsyncExitStack that owns opened foreign backend lifetimes.
 
     Returns:
         RepoContext on success, or a string body for early refusal.
@@ -247,12 +273,9 @@ async def _build_repo_context(
     await _ensure_multi_repo()
 
     resolver = _state.resolver
-    pool = _state.pool
     drift_cache = _state.drift_cache
     local_slug = _state.local_slug
-    assert (
-        resolver is not None and pool is not None and drift_cache is not None
-    )
+    assert resolver is not None and drift_cache is not None
 
     # Resolve the target repo entry.
     explicit_repo: str | None = arguments.get('repo')
@@ -329,8 +352,10 @@ async def _build_repo_context(
             storage = None  # type: ignore[assignment]
     else:
         try:
-            storage = await asyncio.to_thread(pool.get, entry.slug)
-        except Exception as exc:
+            storage = await _enter_foreign_in_stack(
+                resolver, entry.slug, stack
+            )
+        except RepoUnavailable as exc:
             return f"Repo '{entry.slug}' unavailable: {exc}"
 
     return RepoContext(
@@ -1014,7 +1039,6 @@ def _dispatch_tool(name: str, arguments: dict, ctx: RepoContext) -> str:
     if name == 'axon_list_repos':
         return handle_list_repos(
             resolver=_state.resolver,  # type: ignore[arg-type]
-            pool=_state.pool,  # type: ignore[arg-type]
             drift_cache=_state.drift_cache,  # type: ignore[arg-type]
             local_slug=_state.local_slug,
         )
@@ -1116,7 +1140,7 @@ def _maybe_drift_warning(result: str, ctx: RepoContext) -> str:
 
 
 async def _run_tool_with_fan_out(
-    name: str, arguments: dict, ctx: RepoContext
+    name: str, arguments: dict, ctx: RepoContext, stack: AsyncExitStack
 ) -> str:
     """Run a tool handler, optionally injecting cross-repo fan-out data.
 
@@ -1125,7 +1149,7 @@ async def _run_tool_with_fan_out(
     ``axon_query``, computes foreign hit counts similarly.
 
     All fan-out I/O happens via ``asyncio.to_thread`` to keep blocking
-    pool operations off the event loop.
+    opens off the event loop.
 
     For foreign repos that are STALE_MINOR, a drift warning is prepended to
     the result by ``_maybe_drift_warning``.
@@ -1134,18 +1158,18 @@ async def _run_tool_with_fan_out(
         name: MCP tool name.
         arguments: Raw tool arguments dict.
         ctx: Resolved per-call repo context.
+        stack: AsyncExitStack from the enclosing call_tool frame (unused by
+            fan-out opens, which manage their own short-lived handles).
 
     Returns:
         Handler result string with cross-repo footers appended where applicable.
     """
     resolver = _state.resolver
-    pool = _state.pool
     drift_cache = _state.drift_cache
 
     if (
         name in _SYMBOL_KEYED_TOOLS
         and resolver is not None
-        and pool is not None
         and drift_cache is not None
     ):
         symbol = arguments.get('symbol') or arguments.get('from_symbol', '')
@@ -1155,7 +1179,7 @@ async def _run_tool_with_fan_out(
             # local repo); otherwise its own matches show up in the
             # "Also exists in other repos" footer.
             return _foreign_symbol_matches(
-                pool, resolver, drift_cache, symbol, exclude_slug=ctx.slug
+                resolver, drift_cache, symbol, exclude_slug=ctx.slug
             )
 
         foreign_matches = await asyncio.to_thread(_get_foreign_matches)
@@ -1202,7 +1226,6 @@ async def _run_tool_with_fan_out(
     if (
         name == 'axon_query'
         and resolver is not None
-        and pool is not None
         and drift_cache is not None
     ):
         query = arguments.get('query', '')
@@ -1210,7 +1233,7 @@ async def _run_tool_with_fan_out(
         def _get_foreign_hits() -> list:
             # Exclude the targeted repo, not just the local repo.
             return _foreign_query_hit_counts(
-                pool, resolver, drift_cache, query, exclude_slug=ctx.slug
+                resolver, drift_cache, query, exclude_slug=ctx.slug
             )
 
         foreign_hits = await asyncio.to_thread(_get_foreign_hits)
@@ -1230,91 +1253,96 @@ async def _run_tool_with_fan_out(
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Dispatch a tool call to the appropriate handler."""
     try:
-        if name == 'axon_list_repos':
-            await _ensure_multi_repo()
-            result = await asyncio.to_thread(
-                handle_list_repos,
-                resolver=_state.resolver,  # type: ignore[arg-type]
-                pool=_state.pool,  # type: ignore[arg-type]
-                drift_cache=_state.drift_cache,  # type: ignore[arg-type]
-                local_slug=_state.local_slug,
-            )
-            return [TextContent(type='text', text=result)]
+        async with AsyncExitStack() as stack:
+            if name == 'axon_list_repos':
+                await _ensure_multi_repo()
+                result = await asyncio.to_thread(
+                    handle_list_repos,
+                    resolver=_state.resolver,  # type: ignore[arg-type]
+                    drift_cache=_state.drift_cache,  # type: ignore[arg-type]
+                    local_slug=_state.local_slug,
+                )
+                return [TextContent(type='text', text=result)]
 
-        # Build repo context via multi-repo aware resolver.
-        ctx_or_refusal = await _build_repo_context(name, arguments)
-        if isinstance(ctx_or_refusal, str):
-            return [TextContent(type='text', text=ctx_or_refusal)]
+            # Build repo context via multi-repo aware resolver.
+            ctx_or_refusal = await _build_repo_context(name, arguments, stack)
+            if isinstance(ctx_or_refusal, str):
+                return [TextContent(type='text', text=ctx_or_refusal)]
 
-        ctx: RepoContext = ctx_or_refusal
+            ctx: RepoContext = ctx_or_refusal
 
-        if ctx.storage is None:
-            # Standalone axon mcp mode - open a fresh read-only connection
-            # for the local repo and re-wrap in a RepoContext.
+            if ctx.storage is None:
+                # Standalone axon mcp mode - open a fresh read-only connection
+                # for the local repo and re-wrap in a RepoContext.
 
-            if name == 'axon_cypher':
-                def _run_readonly() -> str:
-                    with _open_storage() as st:
-                        real_ctx = RepoContext(
-                            storage=st,
-                            slug=ctx.slug,
-                            is_local=ctx.is_local,
-                            repo_path=ctx.repo_path,
-                            local_slug=ctx.local_slug,
-                        )
-                        return _dispatch_tool(name, arguments, real_ctx)
+                if name == 'axon_cypher':
+                    def _run_readonly() -> str:
+                        with _open_storage() as st:
+                            real_ctx = RepoContext(
+                                storage=st,
+                                slug=ctx.slug,
+                                is_local=ctx.is_local,
+                                repo_path=ctx.repo_path,
+                                local_slug=ctx.local_slug,
+                            )
+                            return _dispatch_tool(name, arguments, real_ctx)
 
-                result = await asyncio.to_thread(_run_readonly)
+                    result = await asyncio.to_thread(_run_readonly)
 
-            else:
-                def _run_rw() -> str:
-                    with _open_storage() as st:
-                        real_ctx = RepoContext(
-                            storage=st,
-                            slug=ctx.slug,
-                            is_local=ctx.is_local,
-                            repo_path=ctx.repo_path,
-                            local_slug=ctx.local_slug,
-                        )
-                        return _dispatch_tool(name, arguments, real_ctx)
+                else:
+                    def _run_rw() -> str:
+                        with _open_storage() as st:
+                            real_ctx = RepoContext(
+                                storage=st,
+                                slug=ctx.slug,
+                                is_local=ctx.is_local,
+                                repo_path=ctx.repo_path,
+                                local_slug=ctx.local_slug,
+                            )
+                            return _dispatch_tool(name, arguments, real_ctx)
 
-                result = await asyncio.to_thread(_run_rw)
-        elif name == 'axon_cypher':
-            # Cypher always runs against a read-only connection for the local
-            # repo. For foreign repos the pool already opens read-only; for
-            # the injected writer we open a fresh read-only connection.
+                    result = await asyncio.to_thread(_run_rw)
+            elif name == 'axon_cypher':
+                # Cypher always runs against a read-only connection for the
+                # local repo. For foreign repos open_foreign_backend already
+                # opens read-only; for the injected writer we open a fresh
+                # read-only connection.
 
-            if ctx.is_local and _state.storage is not None:
-                def _run_cypher_local() -> str:
-                    with _open_storage() as st:
-                        real_ctx = RepoContext(
-                            storage=st,
-                            slug=ctx.slug,
-                            is_local=ctx.is_local,
-                            repo_path=ctx.repo_path,
-                            local_slug=ctx.local_slug,
-                        )
-                        return handle_cypher(
-                            real_ctx, arguments.get('query', '')
-                        )
+                if ctx.is_local and _state.storage is not None:
+                    def _run_cypher_local() -> str:
+                        with _open_storage() as st:
+                            real_ctx = RepoContext(
+                                storage=st,
+                                slug=ctx.slug,
+                                is_local=ctx.is_local,
+                                repo_path=ctx.repo_path,
+                                local_slug=ctx.local_slug,
+                            )
+                            return handle_cypher(
+                                real_ctx, arguments.get('query', '')
+                            )
 
-                result = await asyncio.to_thread(_run_cypher_local)
-            else:
-                if ctx.is_local and _state.lock is not None:
-                    async with _state.lock:
+                    result = await asyncio.to_thread(_run_cypher_local)
+                else:
+                    if ctx.is_local and _state.lock is not None:
+                        async with _state.lock:
+                            result = await asyncio.to_thread(
+                                _dispatch_tool, name, arguments, ctx
+                            )
+                    else:
                         result = await asyncio.to_thread(
                             _dispatch_tool, name, arguments, ctx
                         )
-                else:
-                    result = await asyncio.to_thread(
-                        _dispatch_tool, name, arguments, ctx
-                    )
-        else:
-            if ctx.is_local and _state.lock is not None:
-                async with _state.lock:
-                    result = await _run_tool_with_fan_out(name, arguments, ctx)
             else:
-                result = await _run_tool_with_fan_out(name, arguments, ctx)
+                if ctx.is_local and _state.lock is not None:
+                    async with _state.lock:
+                        result = await _run_tool_with_fan_out(
+                            name, arguments, ctx, stack
+                        )
+                else:
+                    result = await _run_tool_with_fan_out(
+                        name, arguments, ctx, stack
+                    )
 
     except Exception:
         ref = _new_ref_id()

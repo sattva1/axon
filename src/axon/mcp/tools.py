@@ -27,7 +27,7 @@ from axon.core.ingestion.test_classifier import (
     load_pytest_config,
 )
 from axon.core.meta import load_meta
-from axon.core.repos import RepoPool, RepoResolver, RepoUnavailable
+from axon.core.repos import RepoResolver, RepoUnavailable, open_foreign_backend
 from axon.core.search.hybrid import hybrid_search
 from axon.core.storage.base import SearchResult, StorageBackend
 from axon.core.storage.kuzu_backend import escape_cypher as _escape_cypher
@@ -94,20 +94,18 @@ _MAX_FOREIGN_COUNT_REPOS = 5
 def handle_list_repos(
     *,
     resolver: RepoResolver,
-    pool: RepoPool,
     drift_cache: DriftCache,
     local_slug: str | None = None,
 ) -> str:
-    """List indexed repositories using the resolver/pool/drift_cache.
+    """List indexed repositories using the resolver and drift_cache.
 
     For each entry returned by ``resolver.list_known()`` the function reads
     per-repo stats from ``.axon/meta.json`` via ``load_meta``, probes drift
-    via ``drift_cache.get_or_probe``, and checks reachability via ``pool.get``
-    for foreign repos.
+    via ``drift_cache.get_or_probe``, and checks reachability via a one-shot
+    ``open_foreign_backend`` probe for foreign repos.
 
     Args:
         resolver: Resolver that enumerates known repos.
-        pool: Connection pool used to probe foreign-repo reachability.
         drift_cache: Cache of drift reports keyed by repo path.
         local_slug: Slug of the local repo - used for the (LOCAL) marker.
             When None, no entry is marked local.
@@ -149,12 +147,13 @@ def handle_list_repos(
             freshness = 'unknown'
             watcher = 'unknown'
 
-        # Reachability: local is always reachable; foreign via pool.
+        # Reachability: local is always reachable; foreign via one-shot open.
         if is_local:
             reachable = 'yes'
         else:
             try:
-                pool.get(entry.slug)
+                with open_foreign_backend(resolver, entry.slug):
+                    pass
                 reachable = 'yes'
             except (RepoUnavailable, Exception):
                 reachable = 'no'
@@ -179,7 +178,6 @@ def handle_list_repos(
 
 
 def _foreign_symbol_matches(
-    pool: RepoPool,
     resolver: RepoResolver,
     drift_cache: DriftCache,
     symbol: str,
@@ -189,17 +187,20 @@ def _foreign_symbol_matches(
 ) -> list[tuple[str, list[SearchResult]]]:
     """Look up *symbol* in every accessible foreign repo.
 
-    Repos that cannot be opened (``RepoUnavailable``) and repos whose drift
-    level is ``STALE_MAJOR`` are skipped silently.  The local repo is
-    excluded via *exclude_slug*.
+    Open + close one foreign backend per visited slug. Runs inside
+    asyncio.to_thread (caller responsibility). Fan-out backends are
+    independent short-lived opens; they are NOT registered on the dispatch
+    AsyncExitStack and do not share with the targeted-repo handle.
+
+    Repos that cannot be opened and repos whose drift level is STALE_MAJOR
+    are skipped silently. The targeted repo is excluded via *exclude_slug*.
 
     Args:
-        pool: Foreign-repo connection pool.
         resolver: Resolver used to enumerate foreign repos.
         drift_cache: Cache of drift reports keyed by repo path.
         symbol: Symbol name to search for.
         per_repo_limit: Maximum results to return per repo.
-        exclude_slug: Slug of the repo to exclude (typically the local repo).
+        exclude_slug: Slug of the repo to exclude from fan-out.
 
     Returns:
         List of (slug, results) pairs, one per repo that has matches.
@@ -216,12 +217,11 @@ def _foreign_symbol_matches(
         if report.level == DriftLevel.STALE_MAJOR:
             continue
         try:
-            backend = pool.get(entry.slug)
-        except RepoUnavailable:
-            continue
-        try:
-            results = _resolve_symbol(backend, symbol, top_k=per_repo_limit)
-        except Exception:
+            with open_foreign_backend(resolver, entry.slug) as backend:
+                results = _resolve_symbol(
+                    backend, symbol, top_k=per_repo_limit
+                )
+        except (RepoUnavailable, Exception):
             continue
         if results:
             output.append((entry.slug, results))
@@ -229,7 +229,6 @@ def _foreign_symbol_matches(
 
 
 def _foreign_query_hit_counts(
-    pool: RepoPool,
     resolver: RepoResolver,
     drift_cache: DriftCache,
     query: str,
@@ -238,20 +237,20 @@ def _foreign_query_hit_counts(
 ) -> list[tuple[str, int]]:
     """Return FTS hit counts for *query* across foreign repos.
 
-    At most ``_MAX_FOREIGN_COUNT_REPOS`` foreign repos are queried.  Repos
+    Open + close one foreign backend per visited slug. Runs inside
+    asyncio.to_thread (caller responsibility). Fan-out backends are
+    independent short-lived opens not registered on the dispatch stack.
+
+    At most ``_MAX_FOREIGN_COUNT_REPOS`` foreign repos are queried. Repos
     are selected from ``resolver.list_foreign()`` in their natural order;
     repos beyond the cap, repos that cannot be opened, and STALE_MAJOR
-    repos are skipped.  Only repos with >0 hits are included in the result.
-
-    Each foreign repo is probed synchronously.  The caller may wrap this
-    in ``asyncio.to_thread`` if the event loop must remain unblocked.
+    repos are skipped. Only repos with >0 hits are included in the result.
 
     Args:
-        pool: Foreign-repo connection pool.
         resolver: Resolver used to enumerate foreign repos.
         drift_cache: Cache of drift reports keyed by repo path.
         query: FTS query string.
-        exclude_slug: Slug of the repo to exclude (typically the local repo).
+        exclude_slug: Slug of the repo to exclude from fan-out.
 
     Returns:
         List of (slug, hit_count) pairs for repos with >0 hits.
@@ -270,18 +269,15 @@ def _foreign_query_hit_counts(
         if report.level == DriftLevel.STALE_MAJOR:
             continue
         try:
-            backend = pool.get(entry.slug)
-        except RepoUnavailable:
-            continue
-        checked += 1
-        try:
-            # Two-pass: check existence cheaply, then get rough count.
-            quick = backend.fts_search(query, limit=1)
-            if not quick:
-                continue
-            results_wide = backend.fts_search(query, limit=50)
-            count = len(results_wide)
-        except Exception:
+            with open_foreign_backend(resolver, entry.slug) as backend:
+                checked += 1
+                # Two-pass: check existence cheaply, then get rough count.
+                quick = backend.fts_search(query, limit=1)
+                if not quick:
+                    continue
+                results_wide = backend.fts_search(query, limit=50)
+                count = len(results_wide)
+        except (RepoUnavailable, Exception):
             continue
         if count > 0:
             output.append((entry.slug, count))

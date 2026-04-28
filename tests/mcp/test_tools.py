@@ -14,7 +14,7 @@ from axon.core.graph.model import (
     NodeLabel,
     RelType,
 )
-from axon.core.repos import RepoPool, RepoResolver, RegistryEntry
+from axon.core.repos import RegistryEntry, RepoResolver
 from axon.core.storage.base import SearchResult
 from axon.mcp.resources import get_dead_code_list, get_overview, get_schema
 from axon.mcp.tools import (
@@ -144,10 +144,9 @@ class TestHandleListRepos:
         # Resolver with no local path returns only registered entries;
         # empty registry -> empty list -> no-repos message.
         resolver = RepoResolver(registry_dir=registry)
-        pool = RepoPool(resolver)
         drift_cache = DriftCache()
         result = handle_list_repos(
-            resolver=resolver, pool=pool, drift_cache=drift_cache
+            resolver=resolver, drift_cache=drift_cache
         )
         assert 'No indexed repositories found' in result
 
@@ -167,11 +166,9 @@ class TestHandleListRepos:
         )
         _write_registry_entry(registry, 'my-project', repo)
         resolver = RepoResolver(registry_dir=registry, local_repo_path=repo)
-        pool = RepoPool(resolver)
         drift_cache = DriftCache()
         result = handle_list_repos(
             resolver=resolver,
-            pool=pool,
             drift_cache=drift_cache,
             local_slug='my-project',
         )
@@ -187,11 +184,9 @@ class TestHandleListRepos:
         repo.mkdir()
         _write_registry_entry(registry, 'my-project', repo)
         resolver = RepoResolver(registry_dir=registry, local_repo_path=repo)
-        pool = RepoPool(resolver)
         drift_cache = DriftCache()
         result = handle_list_repos(
             resolver=resolver,
-            pool=pool,
             drift_cache=drift_cache,
             local_slug='my-project',
         )
