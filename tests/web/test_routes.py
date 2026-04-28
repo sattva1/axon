@@ -24,9 +24,10 @@ def _make_app(
     """Build a FastAPI app with a mocked storage backend.
 
     Instead of calling ``create_app`` (which needs a real KuzuDB path),
-    this replicates the app assembly from ``app.py`` but injects a mock
-    storage directly.
+    this replicates the app assembly from ``app.py`` but overrides the
+    storage_ro dependency to inject a mock directly.
     """
+    from axon.web.dependencies import storage_ro
     from axon.web.routes.analysis import router as analysis_router
     from axon.web.routes.cypher import router as cypher_router
     from axon.web.routes.diff import router as diff_router
@@ -38,13 +39,20 @@ def _make_app(
     from axon.web.routes.search import router as search_router
 
     app = FastAPI()
-    app.state.storage = storage
+    # Sentinel db_path - never opened because storage_ro is overridden below.
+    app.state.db_path = Path('/dev/null')
     app.state.repo_path = repo_path
     app.state.event_listeners = None
     app.state.watch = watch
-    app.state.host_url = "http://127.0.0.1:8420"
-    app.state.mcp_url = "http://127.0.0.1:8420/mcp"
-    app.state.mode = "host" if watch else "standalone"
+    app.state.host_url = 'http://127.0.0.1:8420'
+    app.state.mcp_url = 'http://127.0.0.1:8420/mcp'
+    app.state.mode = 'host' if watch else 'standalone'
+
+    # Override the storage dependency so no real DB open is attempted.
+    async def _mock_storage_ro():
+        yield storage
+
+    app.dependency_overrides[storage_ro] = _mock_storage_ro
 
     app.include_router(graph_router)
     app.include_router(host_router)
@@ -607,14 +615,21 @@ class TestCypherEndpoint:
         )
         assert response.status_code == 400
 
-    def test_write_keyword_in_comment_allowed(self, client: TestClient) -> None:
-        mock_storage = client.app.state.storage
-        mock_storage.execute_raw.return_value = [["ok"]]
-        response = client.post("/cypher", json={"query": "MATCH (n) /* CREATE */ RETURN n"})
+    def test_write_keyword_in_comment_allowed(
+        self, client: TestClient, mock_storage: MagicMock
+    ) -> None:
+        mock_storage.execute_raw.return_value = [['ok']]
+        response = client.post(
+            '/cypher', json={'query': 'MATCH (n) /* CREATE */ RETURN n'}
+        )
         assert response.status_code == 200
 
-    def test_write_keyword_outside_comment_blocked(self, client: TestClient) -> None:
-        response = client.post("/cypher", json={"query": "/* harmless */ CREATE (n:Test)"})
+    def test_write_keyword_outside_comment_blocked(
+        self, client: TestClient
+    ) -> None:
+        response = client.post(
+            '/cypher', json={'query': '/* harmless */ CREATE (n:Test)'}
+        )
         assert response.status_code == 400
 
     def test_write_query_blocked_remove(self, client: TestClient) -> None:

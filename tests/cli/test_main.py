@@ -656,17 +656,16 @@ class TestRegisterInGlobalRegistry:
         assert (tmp_path / ".axon" / "repos" / "myapp" / "meta.json").exists()
 
 
-class TestSetDbPath:
-    def test_set_db_path_is_returned_by_resolve(
+class TestSetRepoPath:
+    def test_set_repo_path_is_reflected_by_resolve(
         self, monkeypatch: 'pytest.MonkeyPatch', tmp_path: Path
     ) -> None:
-        """set_db_path() injects the path used by _resolve_db_path()."""
+        """set_repo_path() injects the path used by _resolve_db_path()."""
         from axon.mcp.server import _ServerState
 
         monkeypatch.setattr(_mcp_server, '_state', _ServerState())
-        custom = tmp_path / '.axon' / 'kuzu'
-        _mcp_server.set_db_path(custom)
-        assert _mcp_server._resolve_db_path() == custom
+        _mcp_server.set_repo_path(tmp_path)
+        assert _mcp_server._resolve_db_path() == tmp_path / '.axon' / 'kuzu'
 
 
 class TestStartHostBackground:

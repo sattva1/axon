@@ -1,12 +1,15 @@
-"""Graph API routes — full graph, node detail, overview stats."""
+"""Graph API routes -- full graph, node detail, overview stats."""
 
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from axon.core.graph.model import GraphNode, GraphRelationship
+from axon.core.storage.kuzu_backend import KuzuBackend
+from axon.web.dependencies import storage_ro
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +47,11 @@ def _serialize_edge(rel: GraphRelationship) -> dict:
     }
 
 
-@router.get("/graph")
-def get_graph(request: Request) -> dict:
+@router.get('/graph')
+def get_graph(
+    request: Request, storage: Annotated[KuzuBackend, Depends(storage_ro)]
+) -> dict:
     """Load the full knowledge graph and serialize all nodes and edges."""
-    storage = request.app.state.storage
     try:
         graph = storage.load_graph()
     except Exception as exc:
@@ -60,13 +64,15 @@ def get_graph(request: Request) -> dict:
     return {"nodes": nodes, "edges": edges, "total": len(nodes)}
 
 
-@router.get("/node/{node_id:path}")
-def get_node(node_id: str, request: Request) -> dict:
+@router.get('/node/{node_id:path}')
+def get_node(
+    node_id: str,
+    request: Request,
+    storage: Annotated[KuzuBackend, Depends(storage_ro)],
+) -> dict:
     """Get a single node with its callers, callees, type refs, and process memberships."""
     if len(node_id) > 500:
-        raise HTTPException(status_code=400, detail="Node ID too long")
-
-    storage = request.app.state.storage
+        raise HTTPException(status_code=400, detail='Node ID too long')
 
     node = storage.get_node(node_id)
     if node is None:
@@ -95,10 +101,11 @@ def get_node(node_id: str, request: Request) -> dict:
     }
 
 
-@router.get("/overview")
-def get_overview(request: Request) -> dict:
+@router.get('/overview')
+def get_overview(
+    request: Request, storage: Annotated[KuzuBackend, Depends(storage_ro)]
+) -> dict:
     """Return aggregate counts of nodes by label, edges by type, and totals."""
-    storage = request.app.state.storage
 
     nodes_by_label: dict[str, int] = {}
     total_nodes = 0

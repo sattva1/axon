@@ -1,8 +1,8 @@
 """Tests for the _ServerState injection API in axon.mcp.server.
 
-All tests treat the public API (set_storage / set_lock / set_db_path /
-_resolve_db_path / _with_storage) as the observable surface. Only the
-autouse reset fixture touches _state directly, for isolation purposes.
+All tests treat the public API (set_repo_path / _resolve_db_path /
+_with_storage) as the observable surface. Only the autouse reset fixture
+touches _state directly, for isolation purposes.
 """
 
 from __future__ import annotations
@@ -28,9 +28,7 @@ from axon.mcp.server import (
     _ServerState,
     _with_storage,
     call_tool,
-    set_db_path,
-    set_lock,
-    set_storage,
+    set_repo_path,
 )
 
 
@@ -42,43 +40,31 @@ def reset_state() -> None:
     server_module._state = _ServerState()
 
 
-class TestSetStorage:
-    async def test_with_storage_ignores_injected_backend(
-        self, tmp_path: Path
-    ) -> None:
-        """set_storage no longer affects _with_storage - reads are per-call.
-
-        Phase 2 removed the _state.storage read branch from _with_storage.
-        Even when a mock is injected, _with_storage always opens a fresh RO
-        connection, so the injected mock is never passed to the probe.
-        """
+class TestWithStorage:
+    async def test_with_storage_opens_per_call(self, tmp_path: Path) -> None:
+        """_with_storage always opens a fresh RO connection per call."""
         db_path = tmp_path / '.axon' / 'kuzu'
         (tmp_path / '.axon').mkdir(parents=True)
         rw = KuzuBackend()
         rw.initialize(db_path, read_only=False)
         rw.close()
 
-        mock_storage = MagicMock()
-        set_storage(mock_storage)
-        set_db_path(db_path)
+        set_repo_path(tmp_path)
 
         seen: list[object] = []
         await _with_storage(lambda st: seen.append(st) or 'ok')
 
         assert len(seen) == 1
-        assert seen[0] is not mock_storage
         assert isinstance(seen[0], KuzuBackend)
 
-
-class TestSetLock:
-    async def test_with_storage_does_not_serialize_via_lock(
+    async def test_with_storage_concurrent_calls_are_not_serialized(
         self, tmp_path: Path
     ) -> None:
-        """Phase 2: _with_storage no longer acquires _state.lock.
+        """Phase 3: _with_storage does not serialize concurrent calls via a lock.
 
-        Two concurrent _with_storage calls are allowed to run concurrently -
-        the timeline must interleave (or at least both run without deadlock).
-        A real DB is needed because _with_storage always opens RO per call.
+        Two concurrent _with_storage calls must be able to interleave --
+        both start before either finishes. A real DB is needed because
+        _with_storage always opens RO per call.
         """
         db_path = tmp_path / '.axon' / 'kuzu'
         (tmp_path / '.axon').mkdir(parents=True)
@@ -86,9 +72,7 @@ class TestSetLock:
         rw.initialize(db_path, read_only=False)
         rw.close()
 
-        set_db_path(db_path)
-        lock = asyncio.Lock()
-        set_lock(lock)
+        set_repo_path(tmp_path)
 
         timeline: list[str] = []
 
@@ -103,21 +87,22 @@ class TestSetLock:
 
         await asyncio.gather(_probe('A'), _probe('B'))
 
-        # Without lock serialization the calls run concurrently - the timeline
-        # must interleave: both start before either finishes.
         assert timeline not in (
             ['A:start', 'A:end', 'B:start', 'B:end'],
             ['B:start', 'B:end', 'A:start', 'A:end'],
         ), 'Expected concurrent execution but calls were serialized'
 
 
-class TestSetDbPath:
-    def test_overrides_default(self, tmp_path: Path) -> None:
-        """set_db_path makes _resolve_db_path return the injected path."""
-        custom = tmp_path / 'custom' / 'db'
-        set_db_path(custom)
+class TestSetRepoPath:
+    def test_set_repo_path_stores_it(self, tmp_path: Path) -> None:
+        """set_repo_path stores the repo path on _state."""
+        set_repo_path(tmp_path)
+        assert server_module._state.repo_path == tmp_path
 
-        assert _resolve_db_path() == custom
+    def test_resolve_db_path_uses_set_repo_path(self, tmp_path: Path) -> None:
+        """_resolve_db_path derives db_path from set repo_path."""
+        set_repo_path(tmp_path)
+        assert _resolve_db_path() == tmp_path / '.axon' / 'kuzu'
 
     def test_resolve_db_path_defaults_to_cwd_when_unset(self) -> None:
         """_resolve_db_path returns cwd/.axon/kuzu when no path was injected."""
@@ -133,9 +118,11 @@ class TestCallToolSanitization:
     ) -> None:
         """Exception detail is replaced with a ref-linked generic message.
 
-        Phase 2 removed the _state.storage read path. The exception is
-        triggered by monkeypatching _build_repo_context to raise so the
-        catch-all in call_tool is exercised without needing a real DB.
+        The exception is triggered by monkeypatching _build_repo_context to
+        raise so the catch-all in call_tool is exercised without needing a
+        real DB.
+
+
 
         """
         async def _exploding_build(
@@ -170,35 +157,26 @@ class TestCypherReadOnlyEnforcement:
     """axon_cypher is routed through a fresh read-only KuzuDB connection.
 
     Even when WRITE_KEYWORDS is bypassed, the DB layer rejects writes because
-    the connection is opened with read_only=True regardless of any injected
-    read-write storage backend.
+    the connection is opened with read_only=True.
     """
 
-    async def test_db_layer_rejects_write_even_if_rw_storage_injected(
+    async def test_db_layer_rejects_write_even_with_rw_path(
         self,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """DB-layer read-only blocks writes even when rw storage is injected."""
-        # Arrange: initialize a real KuzuDB with schema so _open_storage can
-        # open a read-only connection against it. Do NOT pre-create the
-        # directory - KuzuDB creates its own DB files at the given path.
+        """DB-layer read-only blocks writes even when rw DB exists."""
         db_path = tmp_path / '.axon' / 'kuzu'
         (tmp_path / '.axon').mkdir(parents=True)
         rw_storage = KuzuBackend()
         rw_storage.initialize(db_path, read_only=False)
+        rw_storage.close()
 
-        # Inject the rw storage and point _open_storage at the same path.
-        set_storage(rw_storage)
-        set_db_path(db_path)
+        set_repo_path(tmp_path)
 
-        # Bypass the user-friendly WRITE_KEYWORDS regex denylist so the query
-        # reaches the DB layer. The DB layer is the definitive enforcement point.
-        # Patch on tools_module because tools.py imports WRITE_KEYWORDS by name.
         monkeypatch.setattr(tools_module, 'WRITE_KEYWORDS', re.compile('$^'))
 
-        # Act: submit a write query via the public call_tool interface.
         with caplog.at_level('ERROR'):
             result = await call_tool(
                 'axon_cypher',
@@ -206,14 +184,10 @@ class TestCypherReadOnlyEnforcement:
             )
         text = result[0].text
 
-        # Assert: write was rejected - the error is surfaced as a sanitized
-        # message with a ref id (either from handle_cypher or the catch-all).
         assert 'should_not_write' not in text
         assert 'Cypher query failed' in text or 'Internal error' in text
         assert 'ref ' in text
 
-        # Verify the node was never persisted - re-open a fresh read-only
-        # connection and confirm no matching node exists.
         check_storage = KuzuBackend()
         check_storage.initialize(db_path, read_only=True)
         try:
@@ -223,24 +197,16 @@ class TestCypherReadOnlyEnforcement:
             assert rows == []
         finally:
             check_storage.close()
-            rw_storage.close()
 
 
 class TestDispatchToolSignature:
-    """Regression tests for _dispatch_tool signature and repo_path plumbing.
-
-    Phase 3 changed the signature from _dispatch_tool(name, args, storage,
-    repo_path=...) to _dispatch_tool(name, args, ctx: RepoContext). These
-    tests use make_ctx to build the context and verify the handler receives
-    ctx.repo_path correctly.
-    """
+    """Regression tests for _dispatch_tool signature and repo_path plumbing."""
 
     def test_list_repos_works_without_repo_path(
         self, tmp_path: Path, make_ctx: Any
     ) -> None:
         """axon_list_repos dispatches via _state resolver/drift_cache."""
         mock_storage = MagicMock()
-        # Inject the multi-repo state that _dispatch_tool reads directly.
         registry = tmp_path / 'registry'
         registry.mkdir()
         local = tmp_path / 'local'
@@ -258,8 +224,6 @@ class TestDispatchToolSignature:
         repo = Path('/tmp/repo')
         captured: list[Path | None] = []
 
-        # Patch in server_module because that's where the name is bound after
-        # the 'from axon.mcp.tools import handle_test_impact' import.
         with patch.object(
             server_module,
             'handle_test_impact',
@@ -299,23 +263,6 @@ class TestDispatchToolSignature:
         assert captured == [None]
 
 
-class TestSetStorageRepoPath:
-    """set_storage repo_path plumbing into _ServerState."""
-
-    def test_set_storage_without_repo_path_defaults_none(self) -> None:
-        """Calling set_storage without repo_path leaves _state.repo_path as None."""
-        mock_storage = MagicMock()
-        set_storage(mock_storage)
-        assert server_module._state.repo_path is None
-
-    def test_set_storage_with_repo_path_stores_it(self) -> None:
-        """Calling set_storage with repo_path stores it on _state."""
-        mock_storage = MagicMock()
-        repo = Path('/some/repo')
-        set_storage(mock_storage, repo)
-        assert server_module._state.repo_path == repo
-
-
 def _write_registry_entry(
     registry_dir: Path, slug: str, repo_path: Path
 ) -> None:
@@ -337,17 +284,16 @@ def _write_registry_entry(
 
 
 class TestStateStorageUnusedByDispatch:
-    """_state.storage is no longer read by the dispatch path (Phase 2)."""
+    """_state.storage is no longer present; dispatch opens per-call (Phase 3)."""
 
     @pytest.mark.asyncio
     async def test_state_storage_is_no_longer_read_by_dispatch(
         self, tmp_path: Path
     ) -> None:
-        """Dispatch succeeds even when _state.storage is a sentinel that raises.
+        """Dispatch succeeds with no storage field on _state (Phase 3 removed it).
 
-        Phase 2 made dispatch always open RO per call. If _state.storage were
-        still consulted, the sentinel would raise AttributeError on any access
-        and the test would fail.
+        _ServerState no longer has a storage field. Dispatch always opens RO
+        per call via _build_repo_context.
         """
         registry = tmp_path / 'registry'
         local_repo = tmp_path / 'myrepo'
@@ -365,18 +311,7 @@ class TestStateStorageUnusedByDispatch:
         server_module._state.drift_cache = DriftCache()
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
 
-        # A sentinel that raises on any attribute access or call.
-        class _RaisingSentinel:
-            def __getattr__(self, name: str) -> None:
-                raise AttributeError(
-                    f'_state.storage was accessed via .{name} - '
-                    'dispatch must not touch this field in Phase 2'
-                )
-
-        server_module._state.storage = _RaisingSentinel()  # type: ignore[assignment]
-
         result = await call_tool('axon_dead_code', {})
 
-        # Dispatch must have completed without the sentinel raising.
         assert result
         assert 'Internal error' not in result[0].text

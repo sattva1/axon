@@ -1,14 +1,17 @@
-"""Search API route — hybrid search across the knowledge graph."""
+"""Search API route -- hybrid search across the knowledge graph."""
 
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from axon.core.embeddings.embedder import embed_query
 from axon.core.search.hybrid import hybrid_search
+from axon.core.storage.kuzu_backend import KuzuBackend
+from axon.web.dependencies import storage_ro
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +25,13 @@ class SearchRequest(BaseModel):
     limit: int = Field(default=20, ge=1, le=200)
 
 
-@router.post("/search")
-def search(body: SearchRequest, request: Request) -> dict:
+@router.post('/search')
+def search(
+    body: SearchRequest,
+    request: Request,
+    storage: Annotated[KuzuBackend, Depends(storage_ro)],
+) -> dict:
     """Run hybrid search (FTS + optional vector) and return results."""
-    storage = request.app.state.storage
 
     query_embedding = embed_query(body.query)
     if query_embedding is None:

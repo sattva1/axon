@@ -1,4 +1,4 @@
-"""Analysis API routes — impact, dead code, coupling, communities, health, reindex."""
+"""Analysis API routes -- impact, dead code, coupling, communities, health, reindex."""
 
 from __future__ import annotations
 
@@ -6,11 +6,15 @@ import asyncio
 import logging
 import threading
 from collections import defaultdict
+from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from axon.core.ingestion.pipeline import run_pipeline
+from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.resources import get_dead_code_symbols
+from axon.web.dependencies import storage_ro
 from axon.web.routes.graph import _serialize_node
 
 logger = logging.getLogger(__name__)
@@ -21,10 +25,14 @@ router = APIRouter(tags=["analysis"])
 _reindex_lock = threading.Lock()
 
 
-@router.get("/impact/{node_id:path}")
-def get_impact(node_id: str, request: Request, depth: int = Query(default=3, ge=1, le=5)) -> dict:
+@router.get('/impact/{node_id:path}')
+def get_impact(
+    node_id: str,
+    request: Request,
+    storage: Annotated[KuzuBackend, Depends(storage_ro)],
+    depth: int = Query(default=3, ge=1, le=5),
+) -> dict:
     """Analyse the blast radius of a node by traversing callers up to *depth* hops."""
-    storage = request.app.state.storage
 
     node = storage.get_node(node_id)
     if node is None:
@@ -43,10 +51,11 @@ def get_impact(node_id: str, request: Request, depth: int = Query(default=3, ge=
     }
 
 
-@router.get("/dead-code")
-def get_dead_code(request: Request) -> dict:
+@router.get('/dead-code')
+def get_dead_code(
+    request: Request, storage: Annotated[KuzuBackend, Depends(storage_ro)]
+) -> dict:
     """List all symbols flagged as dead code, grouped by file."""
-    storage = request.app.state.storage
 
     try:
         rows = get_dead_code_symbols(storage)
@@ -60,19 +69,18 @@ def get_dead_code(request: Request) -> dict:
     by_file: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         _, name, file_path, start_line, node_type = row
-        by_file[file_path].append({
-            "name": name,
-            "type": str(node_type),
-            "line": start_line,
-        })
+        by_file[file_path].append(
+            {'name': name, 'type': str(node_type), 'line': start_line}
+        )
 
-    return {"total": len(rows), "byFile": dict(by_file)}
+    return {'total': len(rows), 'byFile': dict(by_file)}
 
 
-@router.get("/coupling")
-def get_coupling(request: Request) -> dict:
+@router.get('/coupling')
+def get_coupling(
+    request: Request, storage: Annotated[KuzuBackend, Depends(storage_ro)]
+) -> dict:
     """Return temporal coupling pairs between files."""
-    storage = request.app.state.storage
 
     try:
         rows = storage.execute_raw(
@@ -86,20 +94,23 @@ def get_coupling(request: Request) -> dict:
     pairs = []
     for row in rows or []:
         _, file_a, _, file_b, strength, co_changes = row
-        pairs.append({
-            "fileA": file_a,
-            "fileB": file_b,
-            "strength": strength,
-            "coChanges": co_changes,
-        })
+        pairs.append(
+            {
+                'fileA': file_a,
+                'fileB': file_b,
+                'strength': strength,
+                'coChanges': co_changes,
+            }
+        )
 
-    return {"pairs": pairs}
+    return {'pairs': pairs}
 
 
-@router.get("/communities")
-def get_communities(request: Request) -> dict:
+@router.get('/communities')
+def get_communities(
+    request: Request, storage: Annotated[KuzuBackend, Depends(storage_ro)]
+) -> dict:
     """Return community clusters with their member nodes."""
-    storage = request.app.state.storage
 
     has_cohesion = True
     try:
@@ -131,21 +142,26 @@ def get_communities(request: Request) -> dict:
         else:
             cid, cname, member_ids = row
             cohesion_val = None
-        communities.append({
-            "id": cid,
-            "name": cname,
-            "memberCount": len(member_ids) if member_ids else 0,
-            "cohesion": round(cohesion_val, 4) if cohesion_val is not None else None,
-            "members": member_ids or [],
-        })
+        communities.append(
+            {
+                'id': cid,
+                'name': cname,
+                'memberCount': len(member_ids) if member_ids else 0,
+                'cohesion': round(cohesion_val, 4)
+                if cohesion_val is not None
+                else None,
+                'members': member_ids or [],
+            }
+        )
 
-    return {"communities": communities}
+    return {'communities': communities}
 
 
-@router.get("/health")
-def get_health(request: Request) -> dict:
+@router.get('/health')
+def get_health(
+    request: Request, storage: Annotated[KuzuBackend, Depends(storage_ro)]
+) -> dict:
     """Compute a composite codebase health score from multiple dimensions."""
-    storage = request.app.state.storage
 
     breakdown: dict[str, float] = {}
 
@@ -247,15 +263,18 @@ def get_health(request: Request) -> dict:
 async def trigger_reindex(request: Request) -> dict:
     """Trigger a full reindex in a background thread.
 
-    Only available when the app is started in watch mode (storage is read-write).
+    Only available when the app is started in watch mode.
     """
     repo_path = request.app.state.repo_path
     if repo_path is None:
         raise HTTPException(status_code=400, detail="No repo_path configured")
 
     if not request.app.state.watch:
-        raise HTTPException(status_code=400, detail="Reindex only available in watch mode")
+        raise HTTPException(
+            status_code=400, detail='Reindex only available in watch mode'
+        )
 
+    db_path: Path = request.app.state.db_path
     event_listeners = request.app.state.event_listeners
     loop = asyncio.get_running_loop()
 
@@ -274,17 +293,26 @@ async def trigger_reindex(request: Request) -> dict:
 
     def _run_reindex() -> None:
         success = False
+        storage = KuzuBackend()
         try:
-            _broadcast({"type": "reindex_start", "data": {}})
-            storage = request.app.state.storage
+            _broadcast({'type': 'reindex_start', 'data': {}})
+            storage.initialize(db_path)
             run_pipeline(repo_path, storage=storage)
-            logger.info("Reindex completed for %s", repo_path)
+            logger.info('Reindex completed for %s', repo_path)
             success = True
         except Exception:
-            logger.error("Reindex failed", exc_info=True)
+            logger.error('Reindex failed', exc_info=True)
         finally:
+            storage.close()
             _reindex_lock.release()
-            _broadcast({"type": "reindex_complete" if success else "reindex_failed", "data": {}})
+            _broadcast(
+                {
+                    'type': 'reindex_complete'
+                    if success
+                    else 'reindex_failed',
+                    'data': {},
+                }
+            )
 
     thread = threading.Thread(target=_run_reindex, daemon=True)
     thread.start()

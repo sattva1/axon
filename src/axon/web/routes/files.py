@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+
+from axon.core.storage.kuzu_backend import KuzuBackend
+from axon.web.dependencies import storage_ro
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +56,11 @@ def _detect_language(file_path: str) -> str:
     return _EXTENSION_LANGUAGE.get(suffix, "")
 
 
-@router.get("/tree")
-def get_tree(request: Request) -> dict:
+@router.get('/tree')
+def get_tree(
+    request: Request, storage: Annotated[KuzuBackend, Depends(storage_ro)]
+) -> dict:
     """Build a nested folder tree from File and Folder nodes in the graph."""
-    storage = request.app.state.storage
 
     try:
         file_rows = storage.execute_raw(

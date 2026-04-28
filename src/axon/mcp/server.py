@@ -74,9 +74,6 @@ server = Server('axon')
 
 @dataclass(slots=True)
 class _ServerState:
-    storage: KuzuBackend | None = None
-    lock: asyncio.Lock | None = None
-    db_path: Path | None = None
     repo_path: Path | None = None
     # Multi-repo additions:
     resolver: RepoResolver | None = None
@@ -90,51 +87,41 @@ _state = _ServerState()
 
 
 def _resolve_db_path() -> Path:
-    if _state.db_path is None:
-        _state.db_path = Path.cwd() / '.axon' / 'kuzu'
-    return _state.db_path
+    repo_path = _state.repo_path or Path.cwd()
+    return repo_path / '.axon' / 'kuzu'
 
 
-def set_storage(storage: KuzuBackend, repo_path: Path | None = None) -> None:
-    """Inject a pre-initialised storage backend (e.g. from ``axon serve --watch``).
+def set_repo_path(repo_path: Path) -> None:
+    """Set the repository root path for standalone MCP server mode.
+
+    Derives the db_path as repo_path / '.axon' / 'kuzu' on demand.
+    Must be called before the server handles any tool requests.
 
     Args:
-        storage: Initialised storage backend to inject.
-        repo_path: Absolute path to the repository root. When provided,
-            freshness checks and hunk-executable filtering are enabled.
-            Existing callers that omit this argument keep working unchanged.
+        repo_path: Absolute path to the repository root.
     """
-    _state.storage = storage
     _state.repo_path = repo_path
-
-
-def set_lock(lock: asyncio.Lock) -> None:
-    """Inject a shared lock for coordinating storage access with the file watcher."""
-    _state.lock = lock
-
-
-def set_db_path(path: Path) -> None:
-    """Inject a custom database path for standalone MCP server mode.
-
-    Must be called before the server handles any tool requests (i.e., before
-    entering the event loop in ``main()``).
-    """
-    _state.db_path = path
 
 
 @contextmanager
 def _open_storage() -> Iterator[KuzuBackend]:
     """Open a short-lived read-only connection for a single tool/resource call.
 
-    Used when no persistent storage was injected (read-only fallback mode).
     Each call gets a fresh connection that sees the latest on-disk data and
     releases the file lock immediately after the query completes.
     """
     db_path = _resolve_db_path()
     if not db_path.exists():
-        raise FileNotFoundError(f"No .axon/kuzu directory in {db_path.parent.parent}")
+        raise FileNotFoundError(
+            f'No .axon/kuzu directory in {db_path.parent.parent}'
+        )
     storage = KuzuBackend()
-    storage.initialize(db_path, read_only=True, max_retries=3, retry_delay=0.3)
+    storage.initialize(
+        db_path,
+        read_only=True,
+        max_retries=_DISPATCH_OPEN_RETRIES,
+        retry_delay=_DISPATCH_OPEN_RETRY_DELAY,
+    )
     try:
         yield storage
     finally:
@@ -169,7 +156,12 @@ def _open_storage_blocking() -> KuzuBackend:
             f'No .axon/kuzu directory in {db_path.parent.parent}'
         )
     storage = KuzuBackend()
-    storage.initialize(db_path, read_only=True, max_retries=3, retry_delay=0.3)
+    storage.initialize(
+        db_path,
+        read_only=True,
+        max_retries=_DISPATCH_OPEN_RETRIES,
+        retry_delay=_DISPATCH_OPEN_RETRY_DELAY,
+    )
     return storage
 
 
@@ -177,8 +169,7 @@ async def _with_storage(fn: Callable[[KuzuBackend], str]) -> str:
     """Run *fn* against a fresh read-only storage connection.
 
     Always opens per call so the file lock is released immediately after
-    the query completes, regardless of whether a watcher writer is wired
-    into _state.storage.
+    the query completes.
     """
     storage = await asyncio.to_thread(_open_storage_blocking)
     try:

@@ -19,7 +19,6 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.routing import Route
 
-from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.server import create_streamable_http_app
 from axon.runtime import AxonRuntime
 from axon.web.routes.analysis import router as analysis_router
@@ -61,15 +60,13 @@ def create_app(
         A ready-to-run FastAPI instance.
     """
     if runtime is None:
-        storage = KuzuBackend()
-        storage.initialize(db_path, read_only=True)
         runtime = AxonRuntime(
-            storage=storage,
+            storage=None,
             repo_path=repo_path,
             watch=watch,
             host_url=host_url,
             mcp_url=mcp_url,
-            owns_storage=True,
+            owns_storage=False,
         )
     else:
         runtime.repo_path = repo_path if repo_path is not None else runtime.repo_path
@@ -91,9 +88,6 @@ def create_app(
                 yield
         else:
             yield
-        if runtime.owns_storage:
-            runtime.storage.close()
-            logger.info("Storage backend closed")
 
     app = FastAPI(
         title="Axon Web UI",
@@ -103,7 +97,7 @@ def create_app(
     )
 
     app.state.runtime = runtime
-    app.state.storage = runtime.storage
+    app.state.db_path = db_path
     app.state.repo_path = runtime.repo_path
     app.state.event_listeners = runtime.event_listeners
     app.state.watch = runtime.watch

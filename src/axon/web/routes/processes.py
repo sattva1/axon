@@ -1,20 +1,25 @@
-"""Process routes — list discovered execution processes with their steps."""
+"""Process routes -- list discovered execution processes with their steps."""
 
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from axon.core.storage.kuzu_backend import KuzuBackend
+from axon.web.dependencies import storage_ro
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["processes"])
 
 
-@router.get("/processes")
-def get_processes(request: Request) -> dict:
+@router.get('/processes')
+def get_processes(
+    request: Request, storage: Annotated[KuzuBackend, Depends(storage_ro)]
+) -> dict:
     """Query all Process nodes and their ordered steps."""
-    storage = request.app.state.storage
 
     try:
         rows = storage.execute_raw(

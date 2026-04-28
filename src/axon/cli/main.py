@@ -48,7 +48,9 @@ from axon.core.embeddings.embedder import (
 )
 from axon.core.host_meta import host_json_path, load_host_meta
 from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
-from axon.core.ingestion.watcher import ensure_current_embeddings, watch_repo
+from axon.core.ingestion.reindex import ensure_current_embeddings
+from axon.core.ingestion.watcher import watch_repo
+from axon.core.ingestion.watcher_flush import FlushPolicy
 from axon.core.meta import load_meta, now_iso, update_meta
 from axon.core.repos import (
     RegistryEntry,
@@ -60,7 +62,7 @@ from axon.core.storage.base import EMBEDDING_DIMENSIONS
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp import tools as mcp_tools
 from axon.mcp.server import main as mcp_main
-from axon.mcp.server import set_db_path, set_lock, set_storage
+from axon.mcp.server import set_repo_path
 from axon.runtime import AxonRuntime
 from axon.web import app as web_app_module
 
@@ -568,6 +570,7 @@ def _run_shared_host(
     expose_ui: bool,
     already_running_message: str,
     auto_index: bool = True,
+    flush_interval: float = 5.0,
 ) -> None:
     """Run the shared Axon host with configurable UX messaging."""
     live_host = _get_live_host_info(repo_path)
@@ -577,20 +580,22 @@ def _run_shared_host(
             webbrowser.open(live_host["host_url"])
         return
 
-    storage, _, db_path = _initialize_writable_storage(repo_path, auto_index=auto_index)
+    storage, _, db_path = _initialize_writable_storage(
+        repo_path, auto_index=auto_index
+    )
+    # First-time index is complete; release the RW handle before starting the watcher.
+    storage.close()
+    set_repo_path(repo_path)
+
     host_url, mcp_url = _build_host_urls(bind, port)
-    lock = asyncio.Lock()
     runtime = AxonRuntime(
-        storage=storage,
+        storage=None,
         repo_path=repo_path,
         watch=watch,
-        lock=lock,
         host_url=host_url,
         mcp_url=mcp_url,
-        owns_storage=True,
+        owns_storage=False,
     )
-    set_storage(storage, repo_path)
-    set_lock(lock)
 
     web_app = web_app_module.create_app(
         db_path=db_path,
@@ -608,13 +613,15 @@ def _run_shared_host(
         threading.Timer(1.0, lambda: webbrowser.open(host_url)).start()
 
     if announce_ui:
-        console.print(f"[bold green]Axon UI[/bold green] running at {host_url}")
+        console.print(
+            f'[bold green]Axon UI[/bold green] running at {host_url}'
+        )
     if announce_mcp:
-        console.print(f"[dim]HTTP MCP endpoint:[/dim] {mcp_url}")
+        console.print(f'[dim]HTTP MCP endpoint:[/dim] {mcp_url}')
     if watch:
-        console.print("[dim]File watching enabled[/dim]")
+        console.print('[dim]File watching enabled[/dim]')
     if dev:
-        console.print("[dim]Dev mode — proxying to Vite on :5173[/dim]")
+        console.print('[dim]Dev mode -- proxying to Vite on :5173[/dim]')
 
     _write_host_meta(repo_path, host_url, mcp_url, port, ui_enabled=expose_ui)
 
@@ -651,7 +658,14 @@ def _run_shared_host(
 
         tasks = [_serve()]
         if watch:
-            tasks.append(watch_repo(repo_path, storage, stop_event=stop, lock=lock))
+            tasks.append(
+                watch_repo(
+                    repo_path,
+                    db_path,
+                    stop_event=stop,
+                    flush_policy=FlushPolicy(interval_seconds=flush_interval),
+                )
+            )
         if managed:
             tasks.append(_managed_shutdown())
         await asyncio.gather(*tasks)
@@ -662,7 +676,6 @@ def _run_shared_host(
         pass
     finally:
         _clear_host_meta(repo_path)
-        storage.close()
 
 
 def _run_background_embeddings(
@@ -1050,11 +1063,16 @@ def watch(
         '--global-refresh-interval',
         help=(
             "Periodic global-phase refresh interval (e.g., '30s', '5m', '1h'). "
-            'Default: off — warnings only.'
+            'Default: off.'
         ),
     ),
+    flush_interval: float = typer.Option(
+        5.0,
+        '--flush-interval',
+        help='Seconds between batched index flushes (default 5.0).',
+    ),
 ) -> None:
-    """Watch mode — re-index on file changes."""
+    """Watch mode -- re-index on file changes."""
     repo_path = path.resolve()
     if not repo_path.is_dir():
         console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
@@ -1065,20 +1083,23 @@ def watch(
         if global_refresh_interval
         else None
     )
-    storage, axon_dir, db_path = _initialize_writable_storage(repo_path)
+    storage, _, db_path = _initialize_writable_storage(repo_path)
+    # Release RW handle before starting the batched-flush watcher.
+    storage.close()
     console.print(
         f'[bold]Watching[/bold] {repo_path} for changes (Ctrl+C to stop)'
     )
     try:
         asyncio.run(
             watch_repo(
-                repo_path, storage, global_refresh_interval_seconds=interval_s
+                repo_path,
+                db_path,
+                global_refresh_interval_seconds=interval_s,
+                flush_policy=FlushPolicy(interval_seconds=flush_interval),
             )
         )
     except KeyboardInterrupt:
         console.print('\n[bold]Watch stopped.[/bold]')
-    finally:
-        storage.close()
 
 
 @app.command()
@@ -1105,9 +1126,9 @@ def mcp(
     """Start MCP server (stdio transport)."""
     repo_path = path.resolve()
     if not repo_path.is_dir():
-        console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
+        console.print(f'[red]Error:[/red] {repo_path} is not a directory.')
         raise typer.Exit(code=1)
-    set_db_path(repo_path / ".axon" / "kuzu")
+    set_repo_path(repo_path)
     asyncio.run(mcp_main())
 
 
@@ -1133,8 +1154,13 @@ def host(
     ),
     coreml: bool = typer.Option(
         False,
-        "--coreml",
-        help="Use CoreML GPU acceleration for embedding generation (Apple Silicon).",
+        '--coreml',
+        help='Use CoreML GPU acceleration for embedding generation (Apple Silicon).',
+    ),
+    flush_interval: float = typer.Option(
+        5.0,
+        '--flush-interval',
+        help='Seconds between batched index flushes (default 5.0).',
     ),
 ) -> None:
     """Run the shared Axon host for UI and multi-session HTTP MCP clients."""
@@ -1155,7 +1181,8 @@ def host(
         announce_ui=True,
         announce_mcp=True,
         expose_ui=not managed,
-        already_running_message="[yellow]Axon host already running[/yellow] at {url}",
+        already_running_message='[yellow]Axon host already running[/yellow] at {url}',
+        flush_interval=flush_interval,
     )
 
 
@@ -1172,8 +1199,13 @@ def serve(
     ),
     coreml: bool = typer.Option(
         False,
-        "--coreml",
-        help="Use CoreML GPU acceleration for embedding generation (Apple Silicon).",
+        '--coreml',
+        help='Use CoreML GPU acceleration for embedding generation (Apple Silicon).',
+    ),
+    flush_interval: float = typer.Option(
+        5.0,
+        '--flush-interval',
+        help='Seconds between batched index flushes (default 5.0).',
     ),
 ) -> None:
     """Start MCP server, optionally with live file watching."""
@@ -1182,7 +1214,7 @@ def serve(
         console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
         raise typer.Exit(code=1)
     _configure_and_validate_accelerator(cuda, coreml)
-    set_db_path(repo_path / ".axon" / "kuzu")
+    set_repo_path(repo_path)
     if not watch:
         # Print ready message to stderr (stdout is the MCP stdio transport).
         print("MCP server ready (stdio)", file=sys.stderr, flush=True)
@@ -1269,12 +1301,16 @@ def ui(
         )
         return
 
-    storage, _, db_path = _initialize_writable_storage(repo_path, auto_index=False)
+    storage, _, db_path = _initialize_writable_storage(
+        repo_path, auto_index=False
+    )
+    # Release RW handle; watcher opens per flush.
+    storage.close()
     runtime = AxonRuntime(
-        storage=storage,
+        storage=None,
         repo_path=repo_path,
         watch=watch_files,
-        owns_storage=True,
+        owns_storage=False,
     )
 
     web_app = web_app_module.create_app(
@@ -1289,11 +1325,16 @@ def ui(
         url = f"http://localhost:{port}"
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
-    console.print(f"[bold green]Axon UI[/bold green] running at http://localhost:{port}")
+    console.print(
+        f'[bold green]Axon UI[/bold green] running at http://localhost:{port}'
+    )
     if watch_files:
-        console.print("[dim]File watching enabled — graph updates on save[/dim]")
+        console.print(
+            '[dim]File watching enabled -- graph updates on save[/dim]'
+        )
     if dev:
-        console.print("[dim]Dev mode — proxying to Vite on :5173[/dim]")
+        console.print('[dim]Dev mode -- proxying to Vite on :5173[/dim]')
+
 
     if watch_files:
         async def _run() -> None:
@@ -1308,8 +1349,7 @@ def ui(
                 stop.set()
 
             await asyncio.gather(
-                _serve(),
-                watch_repo(repo_path, web_app.state.storage, stop_event=stop),
+                _serve(), watch_repo(repo_path, db_path, stop_event=stop)
             )
 
         try:

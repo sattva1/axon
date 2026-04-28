@@ -14,7 +14,7 @@ from axon.core.storage.base import StorageBackend
 class AxonRuntime:
     """Shared runtime container for web and MCP surfaces."""
 
-    storage: StorageBackend
+    storage: StorageBackend | None
     repo_path: Path | None = None
     watch: bool = False
     lock: asyncio.Lock | None = None

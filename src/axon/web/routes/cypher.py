@@ -1,15 +1,18 @@
-"""Cypher query execution route — read-only raw Cypher against the graph."""
+"""Cypher query execution route -- read-only raw Cypher against the graph."""
 
 from __future__ import annotations
 
 import logging
 import re
 import time
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from axon.core.cypher_guard import WRITE_KEYWORDS, sanitize_cypher
+from axon.core.storage.kuzu_backend import KuzuBackend
+from axon.web.dependencies import storage_ro
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +48,13 @@ def _extract_return_columns(query: str) -> list[str]:
     return columns
 
 
-@router.post("/cypher")
-def execute_cypher(body: CypherRequest, request: Request) -> dict:
+@router.post('/cypher')
+def execute_cypher(
+    body: CypherRequest,
+    request: Request,
+    storage: Annotated[KuzuBackend, Depends(storage_ro)],
+) -> dict:
     """Execute a read-only Cypher query and return structured results."""
-    storage = request.app.state.storage
 
     cleaned = sanitize_cypher(body.query)
     if WRITE_KEYWORDS.search(cleaned):

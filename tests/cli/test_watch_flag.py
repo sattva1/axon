@@ -138,7 +138,7 @@ class TestWatchGlobalRefreshIntervalFlag:
 
         captured_kwargs: dict = {}
 
-        async def fake_watch_repo(repo, storage, **kwargs):
+        async def fake_watch_repo(repo, db_path, **kwargs):
             captured_kwargs.update(kwargs)
 
         with patch('axon.cli.main._initialize_writable_storage') as mock_init:

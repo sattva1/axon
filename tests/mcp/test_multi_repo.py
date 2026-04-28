@@ -9,7 +9,7 @@ Coverage:
 - handle_impact with explicit repo= arg
 - Drift filtering behaviour
 - Phase 1: open_foreign_backend handle lifetime and isolation tests
-- Phase 2: per-call local opens, lock bypass, _state.storage ignored
+- Phase 2: per-call local opens, no shared lock, per-call open verified
 """
 
 from __future__ import annotations
@@ -42,8 +42,7 @@ from axon.mcp.server import (
     _ServerState,
     _with_storage,
     call_tool,
-    set_db_path,
-    set_storage,
+    set_repo_path,
 )
 from axon.mcp.tools import (
     _MAX_FOREIGN_COUNT_REPOS,
@@ -628,7 +627,6 @@ class TestFanOut:
         server_module._state.resolver = resolver
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
-        server_module._state.storage = MagicMock()
 
         async with AsyncExitStack() as stack:
             result_ctx = await _build_repo_context(
@@ -667,7 +665,6 @@ class TestStaleMinerForeignWarning:
         server_module._state.resolver = resolver
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
-        server_module._state.storage = MagicMock()
 
         response = await call_tool('axon_dead_code', {'repo': 'foreign'})
         text = response[0].text
@@ -696,10 +693,6 @@ class TestStaleMinerForeignWarning:
         server_module._state.resolver = resolver
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
-
-        mock_storage = MagicMock()
-        mock_storage.get_dead_code.return_value = []
-        server_module._state.storage = mock_storage
 
         response = await call_tool('axon_dead_code', {})
         text = response[0].text
@@ -981,7 +974,6 @@ class TestForeignHandleLifetime:
         server_module._state.resolver = resolver
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
-        server_module._state.storage = MagicMock()
 
         # Dispatch opens the foreign handle inside its own AsyncExitStack.
         response = await call_tool('axon_dead_code', {'repo': 'foreign'})
@@ -1014,7 +1006,6 @@ class TestForeignHandleLifetime:
         server_module._state.resolver = resolver
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
-        server_module._state.storage = MagicMock()
 
         backend_ids: list[int] = []
         original_initialize = KuzuBackend.initialize
@@ -1062,7 +1053,6 @@ class TestForeignHandleLifetime:
         server_module._state.resolver = resolver
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
-        server_module._state.storage = MagicMock()
 
         # Open RO via dispatch, then let it close.
         await call_tool('axon_dead_code', {'repo': 'foreign'})
@@ -1132,7 +1122,7 @@ class TestForeignHandleLifetime:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: per-call local opens, lock bypass, _state.storage ignored
+# Phase 2: per-call local opens, no shared lock
 # ---------------------------------------------------------------------------
 
 
@@ -1143,10 +1133,10 @@ class TestPhase2LocalPerCallOpen:
     async def test_dispatch_local_opens_per_call_in_standalone_mode(
         self, tmp_path: Path
     ) -> None:
-        """Dispatch opens a fresh KuzuBackend even when _state.storage is None.
+        """Dispatch opens a fresh KuzuBackend per call in standalone mode.
 
-        Standalone mode: no watcher, _state.storage never set. Each call_tool
-        invocation must open and close its own RO handle.
+        Standalone mode: no watcher running. Each call_tool invocation must
+        open and close its own RO handle.
         """
         registry = tmp_path / 'registry'
         local_repo = _make_indexed_repo(tmp_path, 'myrepo')
@@ -1159,7 +1149,6 @@ class TestPhase2LocalPerCallOpen:
         server_module._state.resolver = resolver
         server_module._state.drift_cache = DriftCache()
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
-        # _state.storage intentionally left as None.
 
         initialize_calls: list[int] = []
         original_initialize = KuzuBackend.initialize
@@ -1178,14 +1167,13 @@ class TestPhase2LocalPerCallOpen:
         assert len(initialize_calls) >= 1
 
     @pytest.mark.asyncio
-    async def test_dispatch_local_does_not_acquire_state_lock_for_reads(
+    async def test_dispatch_local_does_not_serialize_concurrent_reads(
         self, tmp_path: Path
     ) -> None:
-        """Two concurrent call_tool calls against local do not serialize via lock.
+        """Two concurrent call_tool calls against local both complete.
 
-        Phase 2 removed the _state.lock acquisition from reads. The proof:
-        inject a pre-acquired asyncio.Lock as _state.lock. If call_tool tried
-        to acquire it, both concurrent calls would deadlock. Both must complete.
+        Per-call RO opens mean there is no shared lock serialising reads.
+        Both concurrent calls must complete within the timeout.
         """
         registry = tmp_path / 'registry'
         local_repo = _make_indexed_repo(tmp_path, 'myrepo')
@@ -1198,11 +1186,6 @@ class TestPhase2LocalPerCallOpen:
         server_module._state.resolver = resolver
         server_module._state.drift_cache = DriftCache()
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
-
-        # Pre-acquire the lock so any attempt to acquire it would deadlock.
-        held_lock = asyncio.Lock()
-        await held_lock.acquire()
-        server_module._state.lock = held_lock
 
         # Both calls must complete without deadlocking (5 s timeout).
         results = await asyncio.wait_for(
@@ -1250,29 +1233,21 @@ class TestPhase2LocalPerCallOpen:
         rw_backend.close()
 
     @pytest.mark.asyncio
-    async def test_read_resource_opens_per_call_not_via_state_storage(
-        self, tmp_path: Path
-    ) -> None:
-        """_with_storage ignores _state.storage and always opens RO per call.
+    async def test_read_resource_opens_per_call(self, tmp_path: Path) -> None:
+        """_with_storage always opens a fresh RO KuzuBackend per call.
 
-        Set _state.storage to a sentinel that raises on any method call.
-        _with_storage must succeed because it never touches _state.storage.
+        No shared state is involved - each invocation opens, uses, and
+        closes its own handle.
         """
-        db_path = tmp_path / '.axon' / 'kuzu'
-        (tmp_path / '.axon').mkdir(parents=True)
+        repo_path = tmp_path / 'myrepo'
+        repo_path.mkdir()
+        db_path = repo_path / '.axon' / 'kuzu'
+        (repo_path / '.axon').mkdir(parents=True)
         rw = KuzuBackend()
         rw.initialize(db_path, read_only=False)
         rw.close()
 
-        class _RaisingSentinel:
-            def __getattr__(self, name: str) -> None:
-                raise AttributeError(
-                    f'_state.storage was accessed via .{name} - '
-                    '_with_storage must not touch this field in Phase 2'
-                )
-
-        set_storage(_RaisingSentinel())  # type: ignore[arg-type]
-        set_db_path(db_path)
+        set_repo_path(repo_path)
 
         seen: list[object] = []
         result = await _with_storage(lambda st: seen.append(st) or 'ok')

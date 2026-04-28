@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from axon.core.embeddings.embedder import _DEFAULT_MODEL
-from axon.core.ingestion.watcher import ensure_current_embeddings
+from axon.core.ingestion.reindex import ensure_current_embeddings
 
 
 def test_needs_reembed_model_mismatch() -> None:
@@ -37,7 +37,10 @@ def test_ensure_current_embeddings_reembeds_and_updates_meta(tmp_path) -> None:
     storage = MagicMock()
     storage.load_graph.return_value = object()
 
-    with patch("axon.core.ingestion.watcher.embed_graph", return_value={"node-1": [0.1, 0.2]}):
+    with patch(
+        'axon.core.ingestion.reindex.embed_graph',
+        return_value={'node-1': [0.1, 0.2]},
+    ):
         migrated = ensure_current_embeddings(storage, repo_path)
 
     assert migrated is True
