@@ -9,6 +9,7 @@ Coverage:
 - handle_impact with explicit repo= arg
 - Drift filtering behaviour
 - Phase 1: open_foreign_backend handle lifetime and isolation tests
+- Phase 2: per-call local opens, lock bypass, _state.storage ignored
 """
 
 from __future__ import annotations
@@ -39,7 +40,10 @@ from axon.mcp.server import (
     _build_repo_context,
     _ensure_multi_repo,
     _ServerState,
+    _with_storage,
     call_tool,
+    set_db_path,
+    set_storage,
 )
 from axon.mcp.tools import (
     _MAX_FOREIGN_COUNT_REPOS,
@@ -171,9 +175,13 @@ class TestEnsureMultiRepo:
     async def test_dispatch_defaults_to_local_when_repo_absent(
         self, tmp_path: Path
     ) -> None:
-        """Without an explicit repo= arg, _build_repo_context returns local ctx."""
+        """Without an explicit repo= arg, _build_repo_context returns local ctx.
+
+        Phase 2: dispatch opens a fresh RO KuzuBackend per call, so the repo
+        must have an initialised DB before dispatch runs.
+        """
         registry = tmp_path / 'registry'
-        local_repo = _make_repo_dir(tmp_path, 'myrepo')
+        local_repo = _make_indexed_repo(tmp_path, 'myrepo')
         _write_registry_entry(registry, 'myrepo', local_repo)
 
         server_module._state.repo_path = local_repo
@@ -186,15 +194,12 @@ class TestEnsureMultiRepo:
         server_module._state.drift_cache = drift_cache
         server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
 
-        mock_storage = MagicMock()
-        server_module._state.storage = mock_storage
-
         async with AsyncExitStack() as stack:
             result = await _build_repo_context('axon_dead_code', {}, stack)
 
         assert isinstance(result, RepoContext)
         assert result.is_local is True
-        assert result.storage is mock_storage
+        assert isinstance(result.storage, KuzuBackend)
 
     @pytest.mark.asyncio
     async def test_dispatch_resolves_repo_arg_to_foreign(
@@ -1124,3 +1129,154 @@ class TestForeignHandleLifetime:
         assert counter[0] > 0, (
             'Event loop was blocked - counter did not advance during fan-out open'
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: per-call local opens, lock bypass, _state.storage ignored
+# ---------------------------------------------------------------------------
+
+
+class TestPhase2LocalPerCallOpen:
+    """Phase 2: local dispatch opens a fresh RO KuzuBackend per call."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_local_opens_per_call_in_standalone_mode(
+        self, tmp_path: Path
+    ) -> None:
+        """Dispatch opens a fresh KuzuBackend even when _state.storage is None.
+
+        Standalone mode: no watcher, _state.storage never set. Each call_tool
+        invocation must open and close its own RO handle.
+        """
+        registry = tmp_path / 'registry'
+        local_repo = _make_indexed_repo(tmp_path, 'myrepo')
+        _write_registry_entry(registry, 'myrepo', local_repo)
+
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        server_module._state.resolver = resolver
+        server_module._state.drift_cache = DriftCache()
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+        # _state.storage intentionally left as None.
+
+        initialize_calls: list[int] = []
+        original_initialize = KuzuBackend.initialize
+
+        def counting_initialize(
+            self: KuzuBackend, *args: Any, **kwargs: Any
+        ) -> None:
+            initialize_calls.append(id(self))
+            original_initialize(self, *args, **kwargs)
+
+        with patch.object(KuzuBackend, 'initialize', counting_initialize):
+            response = await call_tool('axon_dead_code', {})
+
+        assert response
+        # At least one fresh KuzuBackend was opened during the call.
+        assert len(initialize_calls) >= 1
+
+    @pytest.mark.asyncio
+    async def test_dispatch_local_does_not_acquire_state_lock_for_reads(
+        self, tmp_path: Path
+    ) -> None:
+        """Two concurrent call_tool calls against local do not serialize via lock.
+
+        Phase 2 removed the _state.lock acquisition from reads. The proof:
+        inject a pre-acquired asyncio.Lock as _state.lock. If call_tool tried
+        to acquire it, both concurrent calls would deadlock. Both must complete.
+        """
+        registry = tmp_path / 'registry'
+        local_repo = _make_indexed_repo(tmp_path, 'myrepo')
+        _write_registry_entry(registry, 'myrepo', local_repo)
+
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        server_module._state.resolver = resolver
+        server_module._state.drift_cache = DriftCache()
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+
+        # Pre-acquire the lock so any attempt to acquire it would deadlock.
+        held_lock = asyncio.Lock()
+        await held_lock.acquire()
+        server_module._state.lock = held_lock
+
+        # Both calls must complete without deadlocking (5 s timeout).
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                call_tool('axon_dead_code', {}),
+                call_tool('axon_dead_code', {}),
+            ),
+            timeout=5.0,
+        )
+
+        assert len(results) == 2
+        for response in results:
+            assert 'Internal error' not in response[0].text
+
+    @pytest.mark.asyncio
+    async def test_axon_analyze_can_acquire_rw_during_session_when_watcher_absent(
+        self, tmp_path: Path
+    ) -> None:
+        """A fresh RW open succeeds in the same process when no watcher holds the lock.
+
+        Phase 2 means MCP dispatch never holds a long-lived RO handle. After
+        dispatch completes, another component (axon analyze) can freely acquire
+        RW on the same DB.
+        """
+        registry = tmp_path / 'registry'
+        local_repo = _make_indexed_repo(tmp_path, 'myrepo')
+        _write_registry_entry(registry, 'myrepo', local_repo)
+
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        server_module._state.resolver = resolver
+        server_module._state.drift_cache = DriftCache()
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+
+        # Run a dispatch to confirm it opens and closes cleanly.
+        await call_tool('axon_dead_code', {})
+
+        # After dispatch, the per-call RO handle is released. RW open must succeed.
+        db_path = local_repo / '.axon' / 'kuzu'
+        rw_backend = KuzuBackend()
+        rw_backend.initialize(db_path, read_only=False)
+        assert rw_backend._db is not None
+        rw_backend.close()
+
+    @pytest.mark.asyncio
+    async def test_read_resource_opens_per_call_not_via_state_storage(
+        self, tmp_path: Path
+    ) -> None:
+        """_with_storage ignores _state.storage and always opens RO per call.
+
+        Set _state.storage to a sentinel that raises on any method call.
+        _with_storage must succeed because it never touches _state.storage.
+        """
+        db_path = tmp_path / '.axon' / 'kuzu'
+        (tmp_path / '.axon').mkdir(parents=True)
+        rw = KuzuBackend()
+        rw.initialize(db_path, read_only=False)
+        rw.close()
+
+        class _RaisingSentinel:
+            def __getattr__(self, name: str) -> None:
+                raise AttributeError(
+                    f'_state.storage was accessed via .{name} - '
+                    '_with_storage must not touch this field in Phase 2'
+                )
+
+        set_storage(_RaisingSentinel())  # type: ignore[arg-type]
+        set_db_path(db_path)
+
+        seen: list[object] = []
+        result = await _with_storage(lambda st: seen.append(st) or 'ok')
+
+        assert result == 'ok'
+        assert len(seen) == 1
+        assert isinstance(seen[0], KuzuBackend)

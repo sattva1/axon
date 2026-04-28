@@ -32,6 +32,8 @@ from mcp.types import Resource, TextContent, Tool, ToolAnnotations
 
 from axon.core.drift import DriftCache, DriftLevel
 from axon.core.repos import (
+    _DISPATCH_OPEN_RETRIES,
+    _DISPATCH_OPEN_RETRY_DELAY,
     RepoNotFound,
     RepoResolver,
     RepoUnavailable,
@@ -139,37 +141,50 @@ def _open_storage() -> Iterator[KuzuBackend]:
         storage.close()
 
 
-async def _with_readonly_storage(fn: Callable[[KuzuBackend], str]) -> str:
-    """Run *fn* against a fresh read-only storage connection.
+def _safe_close(backend: KuzuBackend | None) -> None:
+    """Close a KuzuBackend, swallowing any exception.
 
-    Used for user-submitted Cypher. Enforces read-only at the DB layer,
-    regardless of whether a read-write backend is injected via set_storage().
-
+    Safe to call from AsyncExitStack.callback on the event loop - backend.close
+    is non-blocking (Python reference drop only). Defensive against None so
+    callers need not guard before registering the callback.
     """
-    def _run() -> str:
-        with _open_storage() as st:
-            return fn(st)
+    if backend is None:
+        return
+    try:
+        backend.close()
+    except Exception:
+        logger.debug('Error closing backend', exc_info=True)
 
-    return await asyncio.to_thread(_run)
+
+def _open_storage_blocking() -> KuzuBackend:
+    """Open and return a fresh read-only KuzuBackend for the local repo.
+
+    Caller owns the lifetime and must call _safe_close when done. Used by
+    _with_storage so the open and close can be awaited separately via
+    asyncio.to_thread.
+    """
+    db_path = _resolve_db_path()
+    if not db_path.exists():
+        raise FileNotFoundError(
+            f'No .axon/kuzu directory in {db_path.parent.parent}'
+        )
+    storage = KuzuBackend()
+    storage.initialize(db_path, read_only=True, max_retries=3, retry_delay=0.3)
+    return storage
 
 
 async def _with_storage(fn: Callable[[KuzuBackend], str]) -> str:
-    """Run *fn* against the appropriate storage backend.
+    """Run *fn* against a fresh read-only storage connection.
 
-    Uses the injected persistent backend when available (with optional
-    async lock), otherwise opens a short-lived read-only connection.
+    Always opens per call so the file lock is released immediately after
+    the query completes, regardless of whether a watcher writer is wired
+    into _state.storage.
     """
-    if _state.storage is not None:
-        if _state.lock is not None:
-            async with _state.lock:
-                return await asyncio.to_thread(fn, _state.storage)
-        return await asyncio.to_thread(fn, _state.storage)
-
-    def _run() -> str:
-        with _open_storage() as st:
-            return fn(st)
-
-    return await asyncio.to_thread(_run)
+    storage = await asyncio.to_thread(_open_storage_blocking)
+    try:
+        return await asyncio.to_thread(fn, storage)
+    finally:
+        await asyncio.to_thread(_safe_close, storage)
 
 
 # ---------------------------------------------------------------------------
@@ -340,16 +355,23 @@ async def _build_repo_context(
         except Exception:
             pass  # If drift probe fails, proceed optimistically.
 
-    # Build storage.
+    # Build storage - always open read-only per call.
     if is_local:
-        if _state.storage is not None:
-            storage = _state.storage
-        else:
-            # Standalone axon mcp mode - open a fresh read-only connection.
-            # The handler must be called within a _open_storage() context;
-            # we return None here and handle the open in call_tool.
-            # To avoid complexity we return a sentinel instead.
-            storage = None  # type: ignore[assignment]
+        local_db_path = entry.db_path
+
+        def _open_local_blocking() -> KuzuBackend:
+            backend = KuzuBackend()
+            backend.initialize(
+                local_db_path,
+                read_only=True,
+                max_retries=_DISPATCH_OPEN_RETRIES,
+                retry_delay=_DISPATCH_OPEN_RETRY_DELAY,
+            )
+            return backend
+
+        backend = await asyncio.to_thread(_open_local_blocking)
+        stack.callback(lambda: _safe_close(backend))
+        storage = backend
     else:
         try:
             storage = await _enter_foreign_in_stack(
@@ -1271,78 +1293,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             ctx: RepoContext = ctx_or_refusal
 
-            if ctx.storage is None:
-                # Standalone axon mcp mode - open a fresh read-only connection
-                # for the local repo and re-wrap in a RepoContext.
-
-                if name == 'axon_cypher':
-                    def _run_readonly() -> str:
-                        with _open_storage() as st:
-                            real_ctx = RepoContext(
-                                storage=st,
-                                slug=ctx.slug,
-                                is_local=ctx.is_local,
-                                repo_path=ctx.repo_path,
-                                local_slug=ctx.local_slug,
-                            )
-                            return _dispatch_tool(name, arguments, real_ctx)
-
-                    result = await asyncio.to_thread(_run_readonly)
-
-                else:
-                    def _run_rw() -> str:
-                        with _open_storage() as st:
-                            real_ctx = RepoContext(
-                                storage=st,
-                                slug=ctx.slug,
-                                is_local=ctx.is_local,
-                                repo_path=ctx.repo_path,
-                                local_slug=ctx.local_slug,
-                            )
-                            return _dispatch_tool(name, arguments, real_ctx)
-
-                    result = await asyncio.to_thread(_run_rw)
-            elif name == 'axon_cypher':
-                # Cypher always runs against a read-only connection for the
-                # local repo. For foreign repos open_foreign_backend already
-                # opens read-only; for the injected writer we open a fresh
-                # read-only connection.
-
-                if ctx.is_local and _state.storage is not None:
-                    def _run_cypher_local() -> str:
-                        with _open_storage() as st:
-                            real_ctx = RepoContext(
-                                storage=st,
-                                slug=ctx.slug,
-                                is_local=ctx.is_local,
-                                repo_path=ctx.repo_path,
-                                local_slug=ctx.local_slug,
-                            )
-                            return handle_cypher(
-                                real_ctx, arguments.get('query', '')
-                            )
-
-                    result = await asyncio.to_thread(_run_cypher_local)
-                else:
-                    if ctx.is_local and _state.lock is not None:
-                        async with _state.lock:
-                            result = await asyncio.to_thread(
-                                _dispatch_tool, name, arguments, ctx
-                            )
-                    else:
-                        result = await asyncio.to_thread(
-                            _dispatch_tool, name, arguments, ctx
-                        )
-            else:
-                if ctx.is_local and _state.lock is not None:
-                    async with _state.lock:
-                        result = await _run_tool_with_fan_out(
-                            name, arguments, ctx, stack
-                        )
-                else:
-                    result = await _run_tool_with_fan_out(
-                        name, arguments, ctx, stack
-                    )
+            result = await _run_tool_with_fan_out(name, arguments, ctx, stack)
 
     except Exception:
         ref = _new_ref_id()

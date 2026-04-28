@@ -8,6 +8,7 @@ autouse reset fixture touches _state directly, for isolation purposes.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from pathlib import Path
@@ -19,7 +20,7 @@ import pytest
 import axon.mcp.server as server_module
 import axon.mcp.tools as tools_module
 from axon.core.drift import DriftCache
-from axon.core.repos import RepoResolver
+from axon.core.repos import RegistryEntry, RepoResolver
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp.server import (
     _dispatch_tool,
@@ -42,32 +43,51 @@ def reset_state() -> None:
 
 
 class TestSetStorage:
-    async def test_makes_handler_use_injected_backend(self) -> None:
-        """set_storage causes _with_storage to pass the mock to the probe."""
+    async def test_with_storage_ignores_injected_backend(
+        self, tmp_path: Path
+    ) -> None:
+        """set_storage no longer affects _with_storage - reads are per-call.
+
+        Phase 2 removed the _state.storage read branch from _with_storage.
+        Even when a mock is injected, _with_storage always opens a fresh RO
+        connection, so the injected mock is never passed to the probe.
+        """
+        db_path = tmp_path / '.axon' / 'kuzu'
+        (tmp_path / '.axon').mkdir(parents=True)
+        rw = KuzuBackend()
+        rw.initialize(db_path, read_only=False)
+        rw.close()
+
         mock_storage = MagicMock()
         set_storage(mock_storage)
+        set_db_path(db_path)
 
         seen: list[object] = []
         await _with_storage(lambda st: seen.append(st) or 'ok')
 
         assert len(seen) == 1
-        assert seen[0] is mock_storage
+        assert seen[0] is not mock_storage
+        assert isinstance(seen[0], KuzuBackend)
 
 
 class TestSetLock:
-    async def test_serializes_concurrent_calls(self) -> None:
-        """set_lock causes _with_storage calls to serialize through the lock.
+    async def test_with_storage_does_not_serialize_via_lock(
+        self, tmp_path: Path
+    ) -> None:
+        """Phase 2: _with_storage no longer acquires _state.lock.
 
-        _with_storage calls fn synchronously inside asyncio.to_thread, so the
-        probe must be a plain sync callable. A short sleep in the thread makes
-        the interleaving observable: without the lock the two threads would run
-        concurrently and the timeline would interleave; with the lock held
-        across the thread call the first call completes before the second even
-        starts (from the event-loop's perspective the lock is released only
-        after to_thread returns).
+        Two concurrent _with_storage calls are allowed to run concurrently -
+        the timeline must interleave (or at least both run without deadlock).
+        A real DB is needed because _with_storage always opens RO per call.
         """
+        db_path = tmp_path / '.axon' / 'kuzu'
+        (tmp_path / '.axon').mkdir(parents=True)
+        rw = KuzuBackend()
+        rw.initialize(db_path, read_only=False)
+        rw.close()
+
+        set_db_path(db_path)
         lock = asyncio.Lock()
-        set_storage(MagicMock())
         set_lock(lock)
 
         timeline: list[str] = []
@@ -83,12 +103,12 @@ class TestSetLock:
 
         await asyncio.gather(_probe('A'), _probe('B'))
 
-        # With a lock the calls must not interleave: one must finish before the
-        # other starts.
-        assert timeline in (
+        # Without lock serialization the calls run concurrently - the timeline
+        # must interleave: both start before either finishes.
+        assert timeline not in (
             ['A:start', 'A:end', 'B:start', 'B:end'],
             ['B:start', 'B:end', 'A:start', 'A:end'],
-        )
+        ), 'Expected concurrent execution but calls were serialized'
 
 
 class TestSetDbPath:
@@ -111,14 +131,24 @@ class TestCallToolSanitization:
     async def test_call_tool_sanitizes_unhandled_exception(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Exception detail is replaced with a ref-linked generic message."""
-        mock_storage = MagicMock()
-        mock_storage.fts_search.side_effect = RuntimeError(
-            '/etc/secret/internal-path'
-        )
-        set_storage(mock_storage)
+        """Exception detail is replaced with a ref-linked generic message.
 
-        with caplog.at_level('ERROR'):
+        Phase 2 removed the _state.storage read path. The exception is
+        triggered by monkeypatching _build_repo_context to raise so the
+        catch-all in call_tool is exercised without needing a real DB.
+
+        """
+        async def _exploding_build(
+            tool_name: str, arguments: dict, stack: object
+        ) -> object:
+            raise RuntimeError('/etc/secret/internal-path')
+
+        with (
+            patch.object(
+                server_module, '_build_repo_context', _exploding_build
+            ),
+            caplog.at_level('ERROR'),
+        ):
             result = await call_tool('axon_query', {'query': 'x'})
 
         text = result[0].text
@@ -284,3 +314,69 @@ class TestSetStorageRepoPath:
         repo = Path('/some/repo')
         set_storage(mock_storage, repo)
         assert server_module._state.repo_path == repo
+
+
+def _write_registry_entry(
+    registry_dir: Path, slug: str, repo_path: Path
+) -> None:
+    """Write a minimal RegistryEntry meta.json for a given slug."""
+    slot = registry_dir / slug
+    slot.mkdir(parents=True, exist_ok=True)
+    entry = RegistryEntry(
+        name=repo_path.name,
+        path=str(repo_path),
+        slug=slug,
+        last_indexed_at='2024-01-01T00:00:00',
+        stats={},
+        embedding_model='',
+        embedding_dimensions=0,
+    )
+    (slot / 'meta.json').write_text(
+        json.dumps(entry.to_json()), encoding='utf-8'
+    )
+
+
+class TestStateStorageUnusedByDispatch:
+    """_state.storage is no longer read by the dispatch path (Phase 2)."""
+
+    @pytest.mark.asyncio
+    async def test_state_storage_is_no_longer_read_by_dispatch(
+        self, tmp_path: Path
+    ) -> None:
+        """Dispatch succeeds even when _state.storage is a sentinel that raises.
+
+        Phase 2 made dispatch always open RO per call. If _state.storage were
+        still consulted, the sentinel would raise AttributeError on any access
+        and the test would fail.
+        """
+        registry = tmp_path / 'registry'
+        local_repo = tmp_path / 'myrepo'
+        (local_repo / '.axon').mkdir(parents=True)
+        rw = KuzuBackend()
+        rw.initialize(local_repo / '.axon' / 'kuzu', read_only=False)
+        rw.close()
+        _write_registry_entry(registry, 'myrepo', local_repo)
+
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        server_module._state.resolver = resolver
+        server_module._state.drift_cache = DriftCache()
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+
+        # A sentinel that raises on any attribute access or call.
+        class _RaisingSentinel:
+            def __getattr__(self, name: str) -> None:
+                raise AttributeError(
+                    f'_state.storage was accessed via .{name} - '
+                    'dispatch must not touch this field in Phase 2'
+                )
+
+        server_module._state.storage = _RaisingSentinel()  # type: ignore[assignment]
+
+        result = await call_tool('axon_dead_code', {})
+
+        # Dispatch must have completed without the sentinel raising.
+        assert result
+        assert 'Internal error' not in result[0].text
