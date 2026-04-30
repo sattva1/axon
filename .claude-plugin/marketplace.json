@@ -1,0 +1,30 @@
+{
+  "name": "axon-marketplace",
+  "owner": {
+    "name": "Vladislav Miller",
+    "email": "vlad.v.miller@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "axon",
+      "source": "./claude-plugin",
+      "description": "Code knowledge graph for AI agents. Bundles the Axon MCP server with a routing skill that teaches agents to reach for axon_* before grep/find/Read sweeps.",
+      "version": "1.0.1",
+      "author": {
+        "name": "Vladislav Miller",
+        "email": "vlad.v.miller@gmail.com"
+      },
+      "homepage": "https://github.com/sattva1/axon",
+      "license": "MIT",
+      "keywords": [
+        "code-graph",
+        "knowledge-graph",
+        "code-intelligence",
+        "mcp",
+        "static-analysis",
+        "call-graph",
+        "impact-analysis"
+      ]
+    }
+  ]
+}
