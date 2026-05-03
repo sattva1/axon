@@ -202,7 +202,23 @@ def _parse_iso(ts: str) -> float | None:
 def _probe_tier0(
     repo_path: Path, meta: MetaFile, now: float
 ) -> DriftReport | None:
-    """Tier 0: host.json existence + last_incremental_at recency."""
+    """Tier 0: host.json existence + last_incremental_at recency + HEAD match.
+
+    Guard ordering (deliberate):
+    1. host-alive check first; on failure return None (fall through).
+    2. last_incremental_at recency check; on failure return None.
+    3. Call _get_head_sha. If None (not a git repo), return FRESH - non-git
+       repos with an active watcher have no HEAD to compare and are treated
+       as FRESH by policy.
+    4. If _get_head_sha returns a sha and meta.head_sha_at_index is empty
+       (legacy meta without drift tracking), return None so Tier 1/2/3
+       can produce a verdict.
+    5. If live sha != stored sha, return None - Tier 1 produces the actual
+       STALE verdict. The watcher writes head_sha_at_index only after a
+       successful commit_transition flush, so equality proves the watcher
+       has caught up to the current HEAD.
+    6. If live sha == stored sha, return FRESH.
+    """
     if not is_host_alive_fast(repo_path):
         return None
 
@@ -214,7 +230,12 @@ def _probe_tier0(
     if incremental_ts is None:
         return None
 
-    if (now - incremental_ts) <= LIVE_WATCHER_RECENCY_SECONDS:
+    if (now - incremental_ts) > LIVE_WATCHER_RECENCY_SECONDS:
+        return None
+
+    live_sha = _get_head_sha(repo_path)
+    if live_sha is None:
+        # Non-git repo with active watcher - no HEAD to compare; policy is FRESH.
         return DriftReport(
             level=DriftLevel.FRESH,
             reason='live watcher updated index recently',
@@ -226,7 +247,27 @@ def _probe_tier0(
             watcher_alive=True,
             tier_used=0,
         )
-    return None
+
+    stored_sha = meta.head_sha_at_index
+    if not stored_sha:
+        # Legacy meta without drift tracking - fall through to Tier 1+.
+        return None
+
+    if live_sha != stored_sha:
+        # Watcher has not yet flushed the new HEAD; fall through to Tier 1.
+        return None
+
+    return DriftReport(
+        level=DriftLevel.FRESH,
+        reason='live watcher updated index recently',
+        last_indexed_at=meta.last_indexed_at,
+        head_sha=live_sha,
+        head_sha_at_index=stored_sha,
+        files_changed_estimate=None,
+        files_indexed_estimate=meta.indexed_file_count or None,
+        watcher_alive=True,
+        tier_used=0,
+    )
 
 
 def _probe_tier1(repo_path: Path, meta: MetaFile) -> DriftReport | None:
@@ -235,18 +276,8 @@ def _probe_tier1(repo_path: Path, meta: MetaFile) -> DriftReport | None:
     if not stored_sha:
         return None
 
-    try:
-        live_sha_result = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if live_sha_result.returncode != 0:
-            return None
-        live_sha = live_sha_result.stdout.strip()
-    except Exception:
+    live_sha = _get_head_sha(repo_path)
+    if live_sha is None:
         return None
 
     if live_sha == stored_sha:
@@ -279,6 +310,34 @@ def _probe_tier1(repo_path: Path, meta: MetaFile) -> DriftReport | None:
         return DriftReport(
             level=DriftLevel.STALE_MINOR,
             reason='HEAD unchanged but working tree is dirty',
+            last_indexed_at=meta.last_indexed_at,
+            head_sha=live_sha,
+            head_sha_at_index=stored_sha,
+            files_changed_estimate=None,
+            files_indexed_estimate=meta.indexed_file_count or None,
+            watcher_alive=False,
+            tier_used=1,
+        )
+
+    # Check whether stored_sha is an ancestor of live_sha. git reset --hard,
+    # rebase, or diverged branch switches leave stored_sha unreachable from
+    # live_sha, making rev-list --count return 0 (misleadingly small diff).
+    try:
+        ancestor_result = subprocess.run(
+            ['git', 'merge-base', '--is-ancestor', stored_sha, live_sha],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        is_ancestor = ancestor_result.returncode == 0
+    except Exception:
+        is_ancestor = False
+
+    if not is_ancestor:
+        return DriftReport(
+            level=DriftLevel.STALE_MAJOR,
+            reason='HEAD diverged from indexed sha (non-ancestor)',
             last_indexed_at=meta.last_indexed_at,
             head_sha=live_sha,
             head_sha_at_index=stored_sha,

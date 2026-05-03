@@ -61,6 +61,7 @@ from axon.core.repos import (
 from axon.core.storage.base import EMBEDDING_DIMENSIONS
 from axon.core.storage.kuzu_backend import KuzuBackend
 from axon.mcp import tools as mcp_tools
+from axon.mcp.server import _state as mcp_server_state
 from axon.mcp.server import main as mcp_main
 from axon.mcp.server import set_repo_path
 from axon.runtime import AxonRuntime
@@ -656,6 +657,11 @@ def _run_shared_host(
                     idle_started_at = None
                 await asyncio.sleep(0.5)
 
+        def _on_commit_transition(p: Path) -> None:
+            cache = mcp_server_state.drift_cache
+            if cache is not None:
+                cache.invalidate(p)
+
         tasks = [_serve()]
         if watch:
             tasks.append(
@@ -664,6 +670,7 @@ def _run_shared_host(
                     db_path,
                     stop_event=stop,
                     flush_policy=FlushPolicy(interval_seconds=flush_interval),
+                    on_commit_transition=_on_commit_transition,
                 )
             )
         if managed:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from watchfiles import Change
@@ -459,6 +459,164 @@ class TestFlushCoordinatorCommitTransition:
             mock_ri.return_value = (3, {'src/f0.py', 'src/f1.py', 'src/f2.py'})
             mock_backend_cls.return_value.get_file_index.return_value = {}
 
+            await coordinator._maybe_flush()
+
+        incremental_writes = [
+            c for c in update_meta_calls if 'last_incremental_at' in c
+        ]
+        assert len(incremental_writes) == 1
+
+
+# ---------------------------------------------------------------------------
+# FlushCoordinator on_commit_transition callback tests
+# ---------------------------------------------------------------------------
+
+
+class TestOnCommitTransitionCallback:
+    """on_commit_transition callback wiring in _flush_batch_blocking."""
+
+    def _make_coordinator_with_callback(
+        self, tmp_path: Path, callback: object, initial_sha: str = 'sha1'
+    ) -> FlushCoordinator:
+        """Build a FlushCoordinator with a callback and a known initial commit."""
+        policy = FlushPolicy(
+            interval_seconds=0.0, max_queue_size=1, quiet_period_seconds=0.0
+        )
+        queue = ChangeQueue()
+        lock = asyncio.Lock()
+        db_path = tmp_path / 'kuzu'
+        with patch(
+            'axon.core.ingestion.watcher_flush.get_head_sha',
+            return_value=initial_sha,
+        ):
+            coordinator = FlushCoordinator(
+                repo_path=tmp_path,
+                db_path=db_path,
+                queue=queue,
+                gitignore_patterns=None,
+                policy=policy,
+                global_lock=lock,
+                on_commit_transition=callback,
+            )
+        return coordinator
+
+    async def test_called_when_commit_transition_true(
+        self, tmp_path: Path
+    ) -> None:
+        """Callback is invoked once with repo_path on a commit-transition flush."""
+        callback = MagicMock()
+        coordinator = self._make_coordinator_with_callback(
+            tmp_path, callback, initial_sha='sha1'
+        )
+        coordinator._queue.push(Change.modified, Path('/repo/src/x.py'))
+        # Ensure _last_known_commit differs from the current HEAD to force a
+        # commit transition.
+        coordinator._last_known_commit = 'sha1'
+
+        with (
+            patch(
+                'axon.core.ingestion.watcher_flush.get_head_sha',
+                return_value='sha2',
+            ),
+            patch(
+                'axon.core.ingestion.watcher_flush.run_incremental_global_phases'
+            ),
+            patch(
+                'axon.core.ingestion.watcher_flush.reindex_files'
+            ) as mock_ri,
+            patch('axon.core.ingestion.watcher_flush.update_meta'),
+            patch(
+                'axon.core.ingestion.watcher_flush.compute_drift_inputs',
+                return_value={},
+            ),
+            patch(
+                'axon.core.ingestion.watcher_flush.KuzuBackend'
+            ) as mock_backend_cls,
+        ):
+            mock_ri.return_value = (1, {'src/x.py'})
+            mock_backend_cls.return_value.get_file_index.return_value = {}
+
+            await coordinator._maybe_flush()
+
+        callback.assert_called_once_with(tmp_path)
+
+    async def test_not_called_when_commit_transition_false(
+        self, tmp_path: Path
+    ) -> None:
+        """Callback is not invoked when the HEAD sha is unchanged."""
+        callback = MagicMock()
+        coordinator = self._make_coordinator_with_callback(
+            tmp_path, callback, initial_sha='sha1'
+        )
+        coordinator._queue.push(Change.modified, Path('/repo/src/x.py'))
+        coordinator._last_known_commit = 'sha1'
+
+        with (
+            patch(
+                'axon.core.ingestion.watcher_flush.get_head_sha',
+                return_value='sha1',
+            ),
+            patch(
+                'axon.core.ingestion.watcher_flush.run_incremental_global_phases'
+            ),
+            patch(
+                'axon.core.ingestion.watcher_flush.reindex_files'
+            ) as mock_ri,
+            patch('axon.core.ingestion.watcher_flush.update_meta'),
+            patch(
+                'axon.core.ingestion.watcher_flush.KuzuBackend'
+            ) as mock_backend_cls,
+        ):
+            mock_ri.return_value = (1, {'src/x.py'})
+            mock_backend_cls.return_value.get_file_index.return_value = {}
+
+            await coordinator._maybe_flush()
+
+        callback.assert_not_called()
+
+    async def test_exception_swallowed_and_update_meta_still_runs(
+        self, tmp_path: Path
+    ) -> None:
+        """Callback exception is swallowed; last_incremental_at is still written."""
+        callback = MagicMock(side_effect=RuntimeError('boom'))
+        coordinator = self._make_coordinator_with_callback(
+            tmp_path, callback, initial_sha='sha1'
+        )
+        coordinator._queue.push(Change.modified, Path('/repo/src/x.py'))
+        coordinator._last_known_commit = 'sha1'
+
+        update_meta_calls: list[dict] = []
+
+        def tracking_update_meta(repo_root: Path, **fields) -> None:
+            update_meta_calls.append(fields)
+
+        with (
+            patch(
+                'axon.core.ingestion.watcher_flush.get_head_sha',
+                return_value='sha2',
+            ),
+            patch(
+                'axon.core.ingestion.watcher_flush.run_incremental_global_phases'
+            ),
+            patch(
+                'axon.core.ingestion.watcher_flush.reindex_files'
+            ) as mock_ri,
+            patch(
+                'axon.core.ingestion.watcher_flush.update_meta',
+                side_effect=tracking_update_meta,
+            ),
+            patch(
+                'axon.core.ingestion.watcher_flush.compute_drift_inputs',
+                return_value={},
+            ),
+            patch(
+                'axon.core.ingestion.watcher_flush.KuzuBackend'
+            ) as mock_backend_cls,
+        ):
+            mock_ri.return_value = (1, {'src/x.py'})
+            mock_backend_cls.return_value.get_file_index.return_value = {}
+
+            # Must not raise even though callback raises RuntimeError.
             await coordinator._maybe_flush()
 
         incremental_writes = [

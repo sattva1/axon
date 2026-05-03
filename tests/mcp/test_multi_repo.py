@@ -641,8 +641,38 @@ class TestFanOut:
 # ---------------------------------------------------------------------------
 
 
+def _stale_major_report_alive() -> DriftReport:
+    """Build a STALE_MAJOR drift report with watcher_alive=True."""
+    return DriftReport(
+        level=DriftLevel.STALE_MAJOR,
+        reason='HEAD diverged from indexed sha (non-ancestor)',
+        last_indexed_at='',
+        head_sha=None,
+        head_sha_at_index=None,
+        files_changed_estimate=None,
+        files_indexed_estimate=None,
+        watcher_alive=True,
+        tier_used=None,
+    )
+
+
+def _stale_major_report_dead() -> DriftReport:
+    """Build a STALE_MAJOR drift report with watcher_alive=False."""
+    return DriftReport(
+        level=DriftLevel.STALE_MAJOR,
+        reason='HEAD diverged from indexed sha (non-ancestor)',
+        last_indexed_at='',
+        head_sha=None,
+        head_sha_at_index=None,
+        files_changed_estimate=None,
+        files_indexed_estimate=None,
+        watcher_alive=False,
+        tier_used=None,
+    )
+
+
 class TestStaleMinerForeignWarning:
-    """Drift warning is prepended for foreign STALE_MINOR repos, not local."""
+    """Drift warning is prepended for STALE_MINOR and STALE_MAJOR repos."""
 
     @pytest.mark.asyncio
     async def test_stale_minor_foreign_repo_warning_prepended_via_dispatch(
@@ -675,10 +705,10 @@ class TestStaleMinerForeignWarning:
         assert 'minor drift' in text.lower() or 'stale' in text.lower()
 
     @pytest.mark.asyncio
-    async def test_stale_minor_local_repo_no_warning(
+    async def test_stale_minor_local_repo_warning_prepended(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Local repo does not receive drift warning even when STALE_MINOR."""
+        """Local STALE_MINOR repo: drift warning is now prepended."""
         registry = tmp_path / 'registry'
         local_repo = _make_indexed_repo(tmp_path, 'local')
         _write_registry_entry(registry, 'local', local_repo)
@@ -697,9 +727,66 @@ class TestStaleMinerForeignWarning:
         response = await call_tool('axon_dead_code', {})
         text = response[0].text
 
-        assert not text.startswith('Note:'), (
-            f'Unexpected drift warning on local repo; got: {text[:120]!r}'
+        assert text.startswith('Note:'), (
+            f'Expected drift warning on local repo; got: {text[:120]!r}'
         )
+        assert 'minor drift' in text.lower() or 'stale' in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_stale_major_local_repo_warning_prepended_watcher_alive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Local STALE_MAJOR with live watcher: 'catching up' warning prepended."""
+        registry = tmp_path / 'registry'
+        local_repo = _make_indexed_repo(tmp_path, 'local')
+        _write_registry_entry(registry, 'local', local_repo)
+
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _stale_major_report_alive()
+
+        server_module._state.resolver = resolver
+        server_module._state.drift_cache = drift_cache
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+
+        response = await call_tool('axon_dead_code', {})
+        text = response[0].text
+
+        assert text.startswith('Note:'), (
+            f'Expected drift warning on local STALE_MAJOR repo; got: {text[:120]!r}'
+        )
+        assert 'catching up' in text
+
+    @pytest.mark.asyncio
+    async def test_stale_major_local_repo_warning_prepended_watcher_dead(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Local STALE_MAJOR with dead watcher: 'axon analyze' warning prepended."""
+        registry = tmp_path / 'registry'
+        local_repo = _make_indexed_repo(tmp_path, 'local')
+        _write_registry_entry(registry, 'local', local_repo)
+
+        server_module._state.repo_path = local_repo
+        resolver = RepoResolver(
+            registry_dir=registry, local_repo_path=local_repo
+        )
+        drift_cache = MagicMock(spec=DriftCache)
+        drift_cache.get_or_probe.return_value = _stale_major_report_dead()
+
+        server_module._state.resolver = resolver
+        server_module._state.drift_cache = drift_cache
+        server_module._state.local_slug = resolver.local().slug  # type: ignore[union-attr]
+
+        response = await call_tool('axon_dead_code', {})
+        text = response[0].text
+
+        assert text.startswith('Note:'), (
+            f'Expected drift warning on local STALE_MAJOR repo; got: {text[:120]!r}'
+        )
+        assert '`axon analyze`' in text
 
 
 # ---------------------------------------------------------------------------

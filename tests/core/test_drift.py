@@ -7,6 +7,7 @@ import os
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -87,6 +88,15 @@ def _write_host_json(repo_path: Path, last_incremental_at: str) -> None:
         json.dumps({'last_incremental_at': last_incremental_at}),
         encoding='utf-8',
     )
+
+
+@pytest.fixture()
+def git_repo(tmp_path: Path) -> Path:
+    """Minimal git repo with .axon/ gitignored and a single committed file."""
+    (tmp_path / '.gitignore').write_text('.axon/\n', encoding='utf-8')
+    (tmp_path / 'main.py').write_text('pass\n', encoding='utf-8')
+    _init_git_repo(tmp_path)
+    return tmp_path
 
 
 # ---------------------------------------------------------------------------
@@ -183,23 +193,22 @@ class TestComputeDriftInputs:
 
 
 class TestProbeTier0:
-    def test_short_circuits_when_watcher_recent(self, tmp_path: Path) -> None:
-        """FRESH result with tier_used=0 when host.json + recent last_incremental_at."""
-        from datetime import datetime, timezone
-
+    def test_short_circuits_when_watcher_recent(self, git_repo: Path) -> None:
+        """FRESH result with tier_used=0 when host.json, recent watcher, and HEAD matches."""
         now_ts = datetime.now(timezone.utc).isoformat()
-        _write_host_json(tmp_path, now_ts)
-        update_meta(tmp_path, last_incremental_at=now_ts)
+        live_head = _git(['rev-parse', 'HEAD'], git_repo).stdout.strip()
+        _write_host_json(git_repo, now_ts)
+        update_meta(
+            git_repo, last_incremental_at=now_ts, head_sha_at_index=live_head
+        )
 
-        report = probe_drift(tmp_path)
+        report = probe_drift(git_repo)
         assert report.level == DriftLevel.FRESH
         assert report.tier_used == 0
         assert report.watcher_alive is True
 
     def test_skipped_when_no_host_json(self, tmp_path: Path) -> None:
         """Falls through Tier 0 when host.json is absent."""
-        from datetime import datetime, timezone
-
         now_ts = datetime.now(timezone.utc).isoformat()
         update_meta(tmp_path, last_incremental_at=now_ts)
         # No host.json written -> Tier 0 must not fire.
@@ -209,8 +218,6 @@ class TestProbeTier0:
 
     def test_skipped_when_last_incremental_old(self, tmp_path: Path) -> None:
         """Falls through Tier 0 when last_incremental_at is older than recency limit."""
-        from datetime import datetime, timezone, timedelta
-
         old_ts = (
             datetime.now(timezone.utc)
             - timedelta(seconds=LIVE_WATCHER_RECENCY_SECONDS + 60)
@@ -221,6 +228,61 @@ class TestProbeTier0:
         report = probe_drift(tmp_path)
         assert report.tier_used != 0
 
+    def test_falls_through_when_head_diverges_with_recent_watcher(
+        self, git_repo: Path
+    ) -> None:
+        """Tier 0 falls through when HEAD diverged since indexed sha."""
+        now_ts = datetime.now(timezone.utc).isoformat()
+        _write_host_json(git_repo, now_ts)
+        update_meta(
+            git_repo,
+            last_incremental_at=now_ts,
+            head_sha_at_index='deadbeef00000000000000000000000000000000',
+        )
+
+        report = probe_drift(git_repo)
+        assert report.tier_used != 0
+        assert report.level in (DriftLevel.STALE_MINOR, DriftLevel.STALE_MAJOR)
+
+    def test_fresh_when_watcher_recent_and_head_matches(
+        self, git_repo: Path
+    ) -> None:
+        """FRESH at tier_used=0 when watcher is recent and stored sha matches live HEAD."""
+        now_ts = datetime.now(timezone.utc).isoformat()
+        live_head = _git(['rev-parse', 'HEAD'], git_repo).stdout.strip()
+        _write_host_json(git_repo, now_ts)
+        update_meta(
+            git_repo, last_incremental_at=now_ts, head_sha_at_index=live_head
+        )
+
+        report = probe_drift(git_repo)
+        assert report.tier_used == 0
+        assert report.level == DriftLevel.FRESH
+
+    def test_falls_through_when_head_sha_at_index_empty(
+        self, git_repo: Path
+    ) -> None:
+        """Tier 0 falls through when head_sha_at_index is empty (legacy meta)."""
+        now_ts = datetime.now(timezone.utc).isoformat()
+        _write_host_json(git_repo, now_ts)
+        # head_sha_at_index defaults to '' when not set.
+        update_meta(git_repo, last_incremental_at=now_ts)
+
+        report = probe_drift(git_repo)
+        assert report.tier_used != 0
+
+    def test_fresh_when_watcher_recent_and_not_a_git_repo(
+        self, tmp_path: Path
+    ) -> None:
+        """Non-git repo with live watcher yields FRESH at tier_used=0."""
+        now_ts = datetime.now(timezone.utc).isoformat()
+        _write_host_json(tmp_path, now_ts)
+        update_meta(tmp_path, last_incremental_at=now_ts)
+
+        report = probe_drift(tmp_path)
+        assert report.tier_used == 0
+        assert report.level == DriftLevel.FRESH
+
 
 # ---------------------------------------------------------------------------
 # probe_drift - Tier 1
@@ -228,14 +290,6 @@ class TestProbeTier0:
 
 
 class TestProbeTier1:
-    @pytest.fixture()
-    def git_repo(self, tmp_path: Path) -> Path:
-        """Minimal git repo with .axon/ gitignored and a single committed file."""
-        (tmp_path / '.gitignore').write_text('.axon/\n', encoding='utf-8')
-        (tmp_path / 'main.py').write_text('pass\n', encoding='utf-8')
-        _init_git_repo(tmp_path)
-        return tmp_path
-
     def test_fresh_when_head_unchanged_clean_tree(
         self, git_repo: Path
     ) -> None:
@@ -304,6 +358,28 @@ class TestProbeTier1:
         report = probe_drift(git_repo)
         assert report.level == DriftLevel.STALE_MAJOR
         assert report.tier_used == 1
+
+    def test_major_when_head_diverged_non_ancestor(
+        self, git_repo: Path
+    ) -> None:
+        """STALE_MAJOR with 'non-ancestor' reason when stored sha is unreachable."""
+        # Capture the initial commit sha as the "indexed" sha.
+        old_sha = _git(['rev-parse', 'HEAD'], git_repo).stdout.strip()
+        update_meta(git_repo, head_sha_at_index=old_sha, indexed_file_count=1)
+
+        # Create a new commit, then hard-reset to an orphan commit so old_sha
+        # is not an ancestor of the new HEAD.
+        _commit_file(git_repo, 'extra.py', '# diverged')
+        _git(['checkout', '--orphan', 'diverged-branch'], git_repo)
+        _git(['rm', '-rf', '.'], git_repo)
+        (git_repo / 'new.py').write_text('# new\n', encoding='utf-8')
+        _git(['add', 'new.py'], git_repo)
+        _git(['commit', '-m', 'orphan commit'], git_repo)
+
+        report = probe_drift(git_repo)
+        assert report.level == DriftLevel.STALE_MAJOR
+        assert report.tier_used == 1
+        assert 'non-ancestor' in report.reason
 
 
 # ---------------------------------------------------------------------------

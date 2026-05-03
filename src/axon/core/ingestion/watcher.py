@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import watchfiles
@@ -104,6 +105,7 @@ async def watch_repo(
     stop_event: asyncio.Event | None = None,
     flush_policy: FlushPolicy | None = None,
     global_refresh_interval_seconds: int | None = None,
+    on_commit_transition: Callable[[Path], None] | None = None,
 ) -> None:
     """Main watch loop -- monitor files and re-index on changes.
 
@@ -119,6 +121,8 @@ async def watch_repo(
         flush_policy: Override default batching thresholds.
         global_refresh_interval_seconds: When set, a background task runs
             full global phases at this interval.
+        on_commit_transition: Optional callback forwarded to FlushCoordinator.
+            Called after each successful commit-transition flush.
     """
     policy = flush_policy or FlushPolicy()
     queue = ChangeQueue()
@@ -132,6 +136,7 @@ async def watch_repo(
         load_gitignore(repo_path),
         policy,
         global_lock,
+        on_commit_transition,
     )
 
     async with asyncio.TaskGroup() as tg:

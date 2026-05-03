@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -165,6 +166,11 @@ class FlushCoordinator:
         gitignore_patterns: Patterns loaded from .gitignore.
         policy: Trigger thresholds.
         global_lock: asyncio.Lock shared with _periodic_refresh.
+        on_commit_transition: Optional callback invoked after a successful
+            commit-transition flush. Receives repo_path. Exceptions are
+            logged and swallowed so callback errors never break the flush.
+            Only fires when the watcher and caller share a process (e.g.
+            axon serve --watch); cross-process callers are not notified.
     """
 
     def __init__(
@@ -175,6 +181,7 @@ class FlushCoordinator:
         gitignore_patterns: list[str] | None,
         policy: FlushPolicy,
         global_lock: asyncio.Lock,
+        on_commit_transition: Callable[[Path], None] | None = None,
     ) -> None:
         self._repo_path = repo_path
         self._db_path = db_path
@@ -184,6 +191,7 @@ class FlushCoordinator:
         self._global_lock = global_lock
         self._last_flush_at: float = 0.0
         self._last_known_commit: str | None = get_head_sha(repo_path)
+        self._on_commit_transition = on_commit_transition
 
     async def run_until_stopped(self, stop_event: asyncio.Event) -> None:
         """Poll for trigger conditions until stop_event is set.
@@ -293,6 +301,15 @@ class FlushCoordinator:
                     ),
                 )
                 self._last_known_commit = current_commit
+                if self._on_commit_transition is not None:
+                    try:
+                        self._on_commit_transition(self._repo_path)
+                    except Exception:
+                        logger.warning(
+                            'on_commit_transition callback failed for %s',
+                            self._repo_path,
+                            exc_info=True,
+                        )
 
             # Single authoritative write of last_incremental_at per flush (Major #1).
             update_meta(self._repo_path, last_incremental_at=now_iso())

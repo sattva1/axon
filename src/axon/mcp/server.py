@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from collections.abc import Callable
 from contextlib import AsyncExitStack, contextmanager
@@ -1112,40 +1113,33 @@ def _dispatch_tool(name: str, arguments: dict, ctx: RepoContext) -> str:
 
 
 def _maybe_drift_warning(result: str, ctx: RepoContext) -> str:
-    """Prepend a stale-minor drift warning when ctx is a foreign repo.
+    """Prepend a drift warning for both local and foreign repos.
 
-    No-op for the local repo (the watcher handles staleness there via the
-    existing render_with_dead_code_warning/render_with_communities_warning
-    mechanisms). No-op when drift_cache is uninitialised or the probe fails.
+    Applies to STALE_MINOR and STALE_MAJOR drift levels. Foreign STALE_MAJOR
+    repos are refused upstream in _build_repo_context and never reach this
+    function, so STALE_MAJOR here always means the local repo. No-op when
+    drift_cache is uninitialised, ctx.repo_path is None, or the probe fails.
+
+    This helper is orthogonal to the dead-code and communities lag warnings
+    in freshness.py, which signal global-phase lag rather than HEAD drift.
 
     Args:
         result: Handler response string.
         ctx: Per-call repo context.
 
     Returns:
-        result unchanged for local repos or non-STALE_MINOR drift levels.
-        For foreign STALE_MINOR repos, a warning line is prepended.
+        result unchanged when level is FRESH or UNKNOWN or repo_path is None.
+        For STALE_MINOR or STALE_MAJOR, a warning line is prepended.
     """
-    if ctx.is_local or ctx.repo_path is None:
+    if ctx.repo_path is None:
         return result
     drift_cache = _state.drift_cache
     if drift_cache is None:
         return result
     try:
         report = drift_cache.get_or_probe(ctx.repo_path)
-        if report.level == DriftLevel.STALE_MINOR:
-            decorated = report.__class__(
-                level=report.level,
-                reason=report.reason,
-                last_indexed_at=report.last_indexed_at,
-                head_sha=report.head_sha,
-                head_sha_at_index=report.head_sha_at_index,
-                files_changed_estimate=report.files_changed_estimate,
-                files_indexed_estimate=report.files_indexed_estimate,
-                watcher_alive=report.watcher_alive,
-                tier_used=report.tier_used,
-                slug=ctx.slug,
-            )
+        if report.level in (DriftLevel.STALE_MINOR, DriftLevel.STALE_MAJOR):
+            decorated = dataclasses.replace(report, slug=ctx.slug)
             return render_with_drift_warning(decorated, result)
     except Exception:
         pass

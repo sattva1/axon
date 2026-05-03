@@ -17,7 +17,10 @@ from axon.mcp.freshness import (
 
 
 def _make_report(
-    level: DriftLevel, reason: str = 'test reason', slug: str | None = None
+    level: DriftLevel,
+    reason: str = 'test reason',
+    slug: str | None = None,
+    watcher_alive: bool = False,
 ) -> DriftReport:
     """Build a minimal DriftReport for the given level."""
     return DriftReport(
@@ -28,7 +31,7 @@ def _make_report(
         head_sha_at_index=None,
         files_changed_estimate=None,
         files_indexed_estimate=None,
-        watcher_alive=False,
+        watcher_alive=watcher_alive,
         tier_used=None,
         slug=slug,
     )
@@ -256,16 +259,6 @@ class TestRenderWithDriftWarning:
         report = _make_report(DriftLevel.FRESH)
         assert render_with_drift_warning(report, body) == body
 
-    def test_noop_when_stale_major(self) -> None:
-        """STALE_MAJOR report leaves body unchanged.
-
-        The dispatcher already returns a refusal string for STALE_MAJOR; the
-        renderer must not double-annotate the (never-reached) body.
-        """
-        body = 'result body'
-        report = _make_report(DriftLevel.STALE_MAJOR)
-        assert render_with_drift_warning(report, body) == body
-
     def test_noop_when_unknown(self) -> None:
         """UNKNOWN report leaves body unchanged."""
         body = 'result body'
@@ -318,3 +311,52 @@ class TestRenderWithDriftWarning:
         result = render_with_drift_warning(report, body)
 
         assert reason in result
+
+    def test_stale_major_watcher_alive_includes_catching_up(self) -> None:
+        """STALE_MAJOR + watcher alive prepends a 'catching up' message."""
+        body = 'result body'
+        report = _make_report(
+            DriftLevel.STALE_MAJOR, reason='diverged', watcher_alive=True
+        )
+        result = render_with_drift_warning(report, body)
+
+        assert result.endswith(body)
+        assert result != body
+        warning_part = result[: result.index('\n\n')]
+        assert 'catching up' in warning_part
+        assert 'diverged' in warning_part
+
+    def test_stale_major_watcher_dead_includes_axon_analyze(self) -> None:
+        """STALE_MAJOR + watcher dead prepends a 'axon analyze' prompt."""
+        body = 'result body'
+        report = _make_report(
+            DriftLevel.STALE_MAJOR, reason='diverged', watcher_alive=False
+        )
+        result = render_with_drift_warning(report, body)
+
+        assert result.endswith(body)
+        assert result != body
+        warning_part = result[: result.index('\n\n')]
+        assert '`axon analyze`' in warning_part
+
+    def test_stale_major_includes_slug_when_set(self) -> None:
+        """STALE_MAJOR warning quotes the slug when report.slug is set."""
+        body = 'result'
+        report = _make_report(
+            DriftLevel.STALE_MAJOR, slug='my-repo', watcher_alive=False
+        )
+        result = render_with_drift_warning(report, body)
+
+        assert "'my-repo'" in result
+
+    def test_stale_major_uses_report_reason(self) -> None:
+        """STALE_MAJOR warning includes the report.reason verbatim."""
+        body = 'result'
+        report = _make_report(
+            DriftLevel.STALE_MAJOR,
+            reason='custom reason X',
+            watcher_alive=False,
+        )
+        result = render_with_drift_warning(report, body)
+
+        assert 'custom reason X' in result

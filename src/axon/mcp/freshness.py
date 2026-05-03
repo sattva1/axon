@@ -88,11 +88,18 @@ def render_with_communities_warning(repo_path: Path | None, body: str) -> str:
 
 
 def render_with_drift_warning(report: DriftReport, body: str) -> str:
-    """Prepend a one-liner when report.level is STALE_MINOR.
+    """Prepend a drift warning when report.level is STALE_MINOR or STALE_MAJOR.
 
-    No-op for FRESH, STALE_MAJOR, or UNKNOWN. The signature deliberately
-    takes a DriftReport (not a RepoContext) so this module stays free of
-    MCP-layer types and matches the existing render_with_* shape.
+    Dispatches on (level, watcher_alive):
+    - STALE_MINOR: one-liner noting minor drift and the reason.
+    - STALE_MAJOR + watcher_alive=True: note that the watcher is catching up.
+    - STALE_MAJOR + watcher_alive=False: prompt to run axon analyze.
+    - FRESH / UNKNOWN: pass-through, body returned unchanged.
+
+    The helper does not know about is_local vs. foreign repos. That
+    distinction is handled upstream in server.py: foreign STALE_MAJOR repos
+    are refused before reaching this function, so STALE_MAJOR here always
+    means the local repo.
 
     The report.slug field, when set, is included in the warning line to
     identify which repo shows drift. Callers that know the slug should
@@ -103,15 +110,32 @@ def render_with_drift_warning(report: DriftReport, body: str) -> str:
         body: Handler response body to potentially prepend the warning to.
 
     Returns:
-        Body unchanged when report.level is not STALE_MINOR. Otherwise,
-        a warning line followed by a blank line then the body.
+        Body with a warning prepended for STALE_MINOR or STALE_MAJOR.
+        Body unchanged for FRESH or UNKNOWN.
     """
-    if report.level != DriftLevel.STALE_MINOR:
-        return body
     slug_part = f" '{report.slug}'" if report.slug else ''
-    warning = (
-        f'Note: target repo{slug_part} shows minor drift since last index'
-        f' ({report.reason}).\n'
-        f'Results may not reflect uncommitted edits.\n\n'
-    )
-    return warning + body
+
+    if report.level == DriftLevel.STALE_MINOR:
+        warning = (
+            f'Note: target repo{slug_part} shows minor drift since last index'
+            f' ({report.reason}).\n'
+            f'Results may not reflect uncommitted edits.\n\n'
+        )
+        return warning + body
+
+    if report.level == DriftLevel.STALE_MAJOR:
+        if report.watcher_alive:
+            warning = (
+                f'Note: target repo{slug_part} index is significantly out of'
+                f' date ({report.reason}).'
+                f' Watcher is catching up - retry shortly for fresh results.\n\n'
+            )
+        else:
+            warning = (
+                f'Note: target repo{slug_part} index is significantly out of'
+                f' date ({report.reason}).'
+                f' Run `axon analyze` to refresh.\n\n'
+            )
+        return warning + body
+
+    return body
