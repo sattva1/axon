@@ -45,6 +45,7 @@ _TS_ENTRY_SUFFIXES: tuple[str, ...] = (
 def _is_ts_entry_file(file_path: str) -> bool:
     return any(file_path.endswith(suffix) for suffix in _TS_ENTRY_SUFFIXES)
 
+
 def find_entry_points(graph: KnowledgeGraph) -> list[GraphNode]:
     """Find functions/methods that serve as execution entry points."""
     entry_points: list[GraphNode] = []
@@ -57,25 +58,39 @@ def find_entry_points(graph: KnowledgeGraph) -> list[GraphNode]:
 
     return entry_points
 
+
 def _is_entry_point(node: GraphNode, graph: KnowledgeGraph) -> bool:
+    # Framework/path/name heuristics are checked BEFORE the has_incoming
+    # gate. Step 1 populates incoming CALLS edges for module-scope-invoked
+    # entry points; checking has_incoming first would incorrectly demote them.
     if _matches_framework_pattern(node):
+        return True
+
+    if node.is_exported:
+        return True
+
+    if node.name in ('main', 'cli', 'run', 'app', 'handler', 'entrypoint'):
+        return True
+
+    if node.label == NodeLabel.FUNCTION and node.file_path.endswith(
+        (
+            '__main__.py',
+            'cli.py',
+            'main.py',
+            'app.py',
+            'manage.py',
+            'wsgi.py',
+            'asgi.py',
+            'conftest.py',
+        )
+    ):
         return True
 
     if graph.has_incoming(node.id, RelType.CALLS):
         return False
 
-    if node.is_exported:
-        return True
-
-    if node.name in ("main", "cli", "run", "app", "handler", "entrypoint"):
-        return True
-
-    if node.label == NodeLabel.FUNCTION and node.file_path.endswith(
-        ("__main__.py", "cli.py", "main.py", "app.py")
-    ):
-        return True
-
     return False
+
 
 def _matches_framework_pattern(node: GraphNode) -> bool:
     name = node.name
@@ -90,16 +105,30 @@ def _matches_framework_pattern(node: GraphNode) -> bool:
         for pattern in _PYTHON_DECORATOR_PATTERNS:
             if pattern in content:
                 return True
+        # Alembic migration functions are framework entry points invoked by
+        # the Alembic runner, not by user code.
+        if name in ('upgrade', 'downgrade') and _is_alembic_migration(
+            node.file_path
+        ):
+            return True
 
-    if language in ("typescript", "ts", "") or node.file_path.endswith(
-        (".ts", ".tsx")
+    if language in ('typescript', 'ts', '') or node.file_path.endswith(
+        ('.ts', '.tsx')
     ):
-        if name in ("handler", "middleware"):
+        if name in ('handler', 'middleware'):
             return True
         if node.is_exported and _is_ts_entry_file(node.file_path):
             return True
 
     return False
+
+
+def _is_alembic_migration(file_path: str) -> bool:
+    """Return True when *file_path* is an Alembic or Django migration version file."""
+    return (
+        '/migrations/versions/' in file_path
+        or '/alembic/versions/' in file_path
+    )
 
 
 def trace_flow(
@@ -146,6 +175,7 @@ def trace_flow(
 
     return result
 
+
 def generate_process_label(steps: list[GraphNode]) -> str:
     """Create a human-readable label from the flow steps (max 4 names joined by →)."""
     if not steps:
@@ -156,6 +186,7 @@ def generate_process_label(steps: list[GraphNode]) -> str:
 
     names = [s.name for s in steps[:4]]
     return " \u2192 ".join(names)
+
 
 def deduplicate_flows(flows: list[list[GraphNode]]) -> list[list[GraphNode]]:
     """Remove flows that share >50% of nodes with a longer flow."""
@@ -184,6 +215,7 @@ def deduplicate_flows(flows: list[list[GraphNode]]) -> list[list[GraphNode]]:
 
     return kept
 
+
 def _determine_kind(steps: list[GraphNode], graph: KnowledgeGraph) -> str:
     """Return "intra_community", "cross_community", or "unknown" for a flow."""
     communities: set[str] = set()
@@ -200,6 +232,7 @@ def _determine_kind(steps: list[GraphNode], graph: KnowledgeGraph) -> str:
     if len(communities) <= 1:
         return "intra_community"
     return "cross_community"
+
 
 def process_processes(graph: KnowledgeGraph) -> int:
     """Detect execution flows and create Process nodes in the graph."""

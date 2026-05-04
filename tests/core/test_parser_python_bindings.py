@@ -334,6 +334,20 @@ class TestImportedTypeConstruction:
         assert calls[0].dispatch_kind == 'thread_executor'
 
 
+class TestReceiverType:
+    """receiver_type field populated by _resolve_receiver_type."""
+
+    def test_call_info_carries_receiver_type(
+        self, parser: PythonParser
+    ) -> None:
+        """u = User(); u.save() -> save CallInfo has receiver_type == 'User'."""
+        code = 'def f():\n    u = User()\n    u.save()\n'
+        result = parser.parse(code, 'test.py')
+        save_calls = [c for c in result.calls if c.name == 'save']
+        assert save_calls, 'Expected a CallInfo for save()'
+        assert save_calls[0].receiver_type == 'User'
+
+
 class TestDispatcherResolutionEndToEnd:
     """End-to-end: patterns mirroring real axon source files."""
 

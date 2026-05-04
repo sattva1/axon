@@ -42,10 +42,17 @@ _CALLABLE_LABELS: tuple[NodeLabel, ...] = (
     NodeLabel.CLASS,
 )
 
+# Confidence for CALLS edges created from function-reference patterns
+# (assignment alias, list/dict container literals). Lower than direct
+# calls to reflect the weaker signal.
+_REFERENCE_CONFIDENCE: float = 0.5
+# Scale factor applied to argument-callback edges.
+_CALLBACK_CONFIDENCE_SCALE: float = 0.8
+
 _KIND_TO_LABEL: dict[str, NodeLabel] = {
-    "function": NodeLabel.FUNCTION,
-    "method": NodeLabel.METHOD,
-    "class": NodeLabel.CLASS,
+    'function': NodeLabel.FUNCTION,
+    'method': NodeLabel.METHOD,
+    'class': NodeLabel.CLASS,
 }
 
 # Names that should never produce CALLS edges.  These are language builtins,
@@ -297,6 +304,7 @@ def _make_edge(
 
 def _resolve_receiver_method(
     receiver: str,
+    receiver_type: str,
     method_name: str,
     source_id: str,
     file_path: str,
@@ -305,10 +313,11 @@ def _resolve_receiver_method(
 ) -> ResolvedEdge | None:
     """Resolve ``Receiver.method()`` to the METHOD node and return a ResolvedEdge.
 
-    Looks for a METHOD node whose ``name`` matches *method_name* and whose
-    ``class_name`` matches *receiver*.  Searches same-file first, then
-    globally.
+    When *receiver_type* is non-empty (parser resolved the receiver's class
+    from local bindings), it is preferred over the literal *receiver* string.
+    Searches same-file first, then globally.
     """
+    target_class = receiver_type or receiver
     same_file_match: str | None = None
     global_match: str | None = None
 
@@ -317,7 +326,7 @@ def _resolve_receiver_method(
         if (
             node is not None
             and node.label == NodeLabel.METHOD
-            and node.class_name == receiver
+            and node.class_name == target_class
         ):
             if node.file_path == file_path:
                 same_file_match = nid
@@ -362,13 +371,32 @@ def resolve_file_calls(
             call.line, fpd.file_path, file_sym_index
         )
         if source_id is None:
-            logger.debug(
-                "No containing symbol for call %s at line %d in %s",
-                call.name,
-                call.line,
+            # Module-scope calls attribute to the FILE node; CALLS edges from
+            # FILE -> callable are intentional and dead-code-aware.
+            source_id = generate_id(NodeLabel.FILE, fpd.file_path)
+
+        if call.is_reference:
+            # Function references (assignment aliases, container literals) use a
+            # lower confidence and skip the argument/receiver-method passes.
+            # Only conf >= 1.0 resolutions emit edges to avoid noisy fuzzy hits.
+            target_id, conf = resolve_call(
+                call,
                 fpd.file_path,
+                call_index,
+                graph,
+                import_cache=import_cache,
             )
-            continue
+            if target_id is not None and conf >= 1.0:
+                edge = _make_edge(
+                    source_id,
+                    target_id,
+                    _REFERENCE_CONFIDENCE,
+                    seen,
+                    extra={'via': 'reference'},
+                )
+                if edge is not None:
+                    edges.append(edge)
+            continue  # references skip the argument/receiver-method passes
 
         caller_class_name: str | None = None
         if call.receiver in ("self", "this"):
@@ -404,7 +432,7 @@ def resolve_file_calls(
                 edge = _make_edge(
                     source_id,
                     arg_id,
-                    arg_conf * 0.8,
+                    arg_conf * _CALLBACK_CONFIDENCE_SCALE,
                     seen,
                     extra=call.extra_props(),
                 )
@@ -423,11 +451,23 @@ def resolve_file_calls(
                 if edge is not None:
                     edges.append(edge)
 
+            # receiver_type is populated by the parser when it resolved the
+            # receiver's class from local bindings. When receiver is "self" or
+            # "this" the parser intentionally leaves receiver_type empty and
+            # resolution goes through _resolve_self_method above.
             recv_method_edge = _resolve_receiver_method(
-                receiver, call.name, source_id, fpd.file_path,
-                call_index, graph,
+                receiver,
+                call.receiver_type,
+                call.name,
+                source_id,
+                fpd.file_path,
+                call_index,
+                graph,
             )
-            if recv_method_edge is not None and recv_method_edge.rel_id not in seen:
+            if (
+                recv_method_edge is not None
+                and recv_method_edge.rel_id not in seen
+            ):
                 seen.add(recv_method_edge.rel_id)
                 edges.append(recv_method_edge)
 

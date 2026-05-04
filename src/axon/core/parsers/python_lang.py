@@ -259,6 +259,158 @@ _LITERAL_NODE_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# Names that must never produce reference edges (aliases, list/dict values).
+# SOURCE OF TRUTH: axon.core.ingestion.calls._CALL_BLOCKLIST.
+# Kept as a local copy to avoid importing the full ingestion layer into the
+# parser. Keep in sync with any changes to _CALL_BLOCKLIST in calls.py.
+_REFERENCE_CALL_BLOCKLIST: frozenset[str] = frozenset(
+    {
+        # Python builtins
+        'print',
+        'len',
+        'range',
+        'map',
+        'filter',
+        'sorted',
+        'list',
+        'dict',
+        'set',
+        'str',
+        'int',
+        'float',
+        'bool',
+        'type',
+        'super',
+        'isinstance',
+        'issubclass',
+        'hasattr',
+        'getattr',
+        'setattr',
+        'open',
+        'iter',
+        'next',
+        'zip',
+        'enumerate',
+        'any',
+        'all',
+        'min',
+        'max',
+        'sum',
+        'abs',
+        'round',
+        'repr',
+        'id',
+        'hash',
+        'dir',
+        'vars',
+        'input',
+        'format',
+        'tuple',
+        'frozenset',
+        'bytes',
+        'bytearray',
+        'memoryview',
+        'object',
+        'property',
+        'classmethod',
+        'staticmethod',
+        'delattr',
+        'callable',
+        'compile',
+        'eval',
+        'exec',
+        'globals',
+        'locals',
+        'breakpoint',
+        'exit',
+        'quit',
+        # Python stdlib - common names that collide with user-defined symbols
+        'append',
+        'extend',
+        'update',
+        'pop',
+        'get',
+        'items',
+        'keys',
+        'values',
+        'split',
+        'join',
+        'strip',
+        'replace',
+        'startswith',
+        'endswith',
+        'lower',
+        'upper',
+        'encode',
+        'decode',
+        'read',
+        'write',
+        'close',
+        # JS/TS built-in globals
+        'console',
+        'setTimeout',
+        'setInterval',
+        'clearTimeout',
+        'clearInterval',
+        'JSON',
+        'Array',
+        'Object',
+        'Promise',
+        'Math',
+        'Date',
+        'Error',
+        'Symbol',
+        'parseInt',
+        'parseFloat',
+        'isNaN',
+        'isFinite',
+        'encodeURIComponent',
+        'decodeURIComponent',
+        'fetch',
+        'require',
+        'exports',
+        'module',
+        'document',
+        'window',
+        'process',
+        'Buffer',
+        'URL',
+        # JS/TS dotted method names extracted as bare names
+        'log',
+        'error',
+        'warn',
+        'info',
+        'debug',
+        'parse',
+        'stringify',
+        'assign',
+        'freeze',
+        'isArray',
+        'from',
+        'of',
+        'resolve',
+        'reject',
+        'race',
+        'floor',
+        'ceil',
+        'random',
+        # React hooks
+        'useState',
+        'useEffect',
+        'useRef',
+        'useCallback',
+        'useMemo',
+        'useContext',
+        'useReducer',
+        'useLayoutEffect',
+        'useImperativeHandle',
+        'useDebugValue',
+        'useId',
+        'useTransition',
+        'useDeferredValue',
+    }
+)
+
 
 def _is_final_annotation(node: Node | None) -> bool:
     """Return True if node represents ``Final`` or ``Final[...]``."""
@@ -487,6 +639,66 @@ def _prescan_class_self_bindings(
 
     _scan(class_body)
     return bindings
+
+
+def _resolve_receiver_type(call_node: Node, ctx: _ParseContext) -> str:
+    """Return canonical class name for a call's receiver, or ''.
+
+    Resolution order:
+    1. self.attr.method() - look up attr in the class self-frame. Skipped
+       when the immediate receiver root is 'self' or 'this'; those calls go
+       through _resolve_self_method in ingestion.
+    2. name.method() where ctx.lookup(name) yields a binding -> type_name.
+    3. import alias pkg.method() mapped via import_local_to_type -> class name.
+    4. otherwise '' (caller falls back to literal receiver string).
+    """
+    func = call_node.child_by_field_name('function')
+    if func is None or func.type != 'attribute':
+        return ''
+
+    obj_node = func.children[0] if func.children else None
+    if obj_node is None:
+        return ''
+
+    # Case 1: self.attr.method() - obj_node is itself an attribute.
+    if obj_node.type == 'attribute':
+        obj_root = obj_node.children[0] if obj_node.children else None
+        if (
+            obj_root is not None
+            and obj_root.type == 'identifier'
+            and obj_root.text.decode('utf8') == 'self'
+        ):
+            attr_name = ''
+            for ch in reversed(obj_node.children):
+                if ch.type == 'identifier':
+                    attr_name = ch.text.decode('utf8')
+                    break
+            if attr_name and attr_name != 'self':
+                binding = ctx.lookup_self(attr_name)
+                if binding is not None:
+                    return binding.type_name
+        return ''
+
+    if obj_node.type != 'identifier':
+        return ''
+
+    receiver_root = obj_node.text.decode('utf8')
+
+    # Skip self/this - ingestion handles these via _resolve_self_method.
+    if receiver_root in ('self', 'this'):
+        return ''
+
+    # Case 2: local/module-scope binding.
+    binding = ctx.lookup(receiver_root)
+    if binding is not None:
+        return binding.type_name
+
+    # Case 3: import alias mapped to a class name.
+    mapped = ctx.import_local_to_type.get(receiver_root)
+    if mapped is not None:
+        return mapped
+
+    return ''
 
 
 def _classify_dispatch_kind(
@@ -1542,6 +1754,7 @@ class PythonParser(LanguageParser):
                     self._try_extract_member_access_from_assignment(
                         child, result, ctx
                     )
+                    self._try_emit_reference_calls(child, result)
                 elif child.type == 'augmented_assignment':
                     self._try_extract_member_access_from_augmented(
                         child, result, ctx
@@ -1677,6 +1890,73 @@ class PythonParser(LanguageParser):
                 out.append(text)
         return out
 
+    def _try_emit_reference_calls(
+        self, assignment_node: Node, result: ParseResult
+    ) -> None:
+        """Emit is_reference=True CallInfo entries for function-reference patterns.
+
+        Detected patterns (module/function scope only):
+        - Assignment alias: ``target = identifier`` (bare, no call, no literal).
+        - List literal RHS: ``name = [id1, id2, ...]`` - one entry per bare id.
+        - Dict literal RHS: ``name = {"k": id1, ...}`` - one entry per bare value.
+
+        Skips:
+        - LHS is not a single plain identifier (tuple unpack, attribute, etc.).
+        - RHS identifier matches _ALL_CAPS_RE (module constants - tracked by MemberInfo).
+        - RHS identifier is in _REFERENCE_CALL_BLOCKLIST (language builtins etc.).
+        - self.attr = ... forms (class-attribute-level, explicitly out of scope).
+        """
+        left = assignment_node.child_by_field_name('left')
+        right = assignment_node.child_by_field_name('right')
+        if left is None or right is None:
+            return
+        # Only plain identifier LHS; skip self.attr = ..., a.b = ..., etc.
+        if left.type != 'identifier':
+            return
+
+        line = assignment_node.start_point[0] + 1
+
+        if right.type == 'identifier':
+            name = right.text.decode('utf8')
+            if (
+                not _ALL_CAPS_RE.match(name)
+                and name not in _REFERENCE_CALL_BLOCKLIST
+            ):
+                result.calls.append(
+                    CallInfo(name=name, line=line, is_reference=True)
+                )
+
+        elif right.type == 'list':
+            for child in right.children:
+                if child.type == 'identifier':
+                    name = child.text.decode('utf8')
+                    if (
+                        not _ALL_CAPS_RE.match(name)
+                        and name not in _REFERENCE_CALL_BLOCKLIST
+                    ):
+                        result.calls.append(
+                            CallInfo(name=name, line=line, is_reference=True)
+                        )
+
+        elif right.type == 'dictionary':
+            for child in right.children:
+                if child.type == 'pair':
+                    value_node = child.child_by_field_name('value')
+                    if (
+                        value_node is not None
+                        and value_node.type == 'identifier'
+                    ):
+                        name = value_node.text.decode('utf8')
+                        if (
+                            not _ALL_CAPS_RE.match(name)
+                            and name not in _REFERENCE_CALL_BLOCKLIST
+                        ):
+                            result.calls.append(
+                                CallInfo(
+                                    name=name, line=line, is_reference=True
+                                )
+                            )
+
     def _extract_call(
         self, call_node: Node, result: ParseResult, ctx: _ParseContext
     ) -> None:
@@ -1714,6 +1994,7 @@ class PythonParser(LanguageParser):
             )
         elif func_node.type == 'attribute':
             name, receiver = self._extract_attribute_call(func_node)
+            receiver_type = _resolve_receiver_type(call_node, ctx)
             result.calls.append(
                 CallInfo(
                     name=name,
@@ -1728,6 +2009,7 @@ class PythonParser(LanguageParser):
                     awaited=snap['awaited'],
                     context_managers=snap['context_managers'],
                     return_consumption=return_consumption,
+                    receiver_type=receiver_type,
                 )
             )
 

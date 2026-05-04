@@ -11,6 +11,7 @@ from axon.core.graph.model import (
     generate_id,
 )
 from axon.core.ingestion.dead_code import process_dead_code
+from axon.core.ingestion.processes import find_entry_points
 
 
 def _add_file_node(graph: KnowledgeGraph, path: str) -> str:
@@ -25,6 +26,7 @@ def _add_file_node(graph: KnowledgeGraph, path: str) -> str:
         )
     )
     return node_id
+
 
 def _add_symbol_node(
     graph: KnowledgeGraph,
@@ -54,6 +56,7 @@ def _add_symbol_node(
     )
     return node_id
 
+
 def _add_calls_relationship(
     graph: KnowledgeGraph,
     source_id: str,
@@ -69,6 +72,7 @@ def _add_calls_relationship(
             target=target_id,
         )
     )
+
 
 @pytest.fixture()
 def graph() -> KnowledgeGraph:
@@ -119,6 +123,7 @@ def graph() -> KnowledgeGraph:
 
     return g
 
+
 class TestDetectsUnusedFunction:
     def test_detects_unused_function(self, graph: KnowledgeGraph) -> None:
         process_dead_code(graph)
@@ -130,6 +135,7 @@ class TestDetectsUnusedFunction:
         assert node is not None
         assert node.is_dead is True
 
+
 class TestSkipsEntryPoints:
     def test_skips_entry_points(self, graph: KnowledgeGraph) -> None:
         process_dead_code(graph)
@@ -138,6 +144,7 @@ class TestSkipsEntryPoints:
         node = graph.get_node(main_id)
         assert node is not None
         assert node.is_dead is False
+
 
 class TestSkipsCalledFunctions:
     def test_skips_called_functions(self, graph: KnowledgeGraph) -> None:
@@ -150,6 +157,7 @@ class TestSkipsCalledFunctions:
         assert node is not None
         assert node.is_dead is False
 
+
 class TestSkipsConstructors:
     def test_skips_constructors(self, graph: KnowledgeGraph) -> None:
         process_dead_code(graph)
@@ -161,6 +169,7 @@ class TestSkipsConstructors:
         assert node is not None
         assert node.is_dead is False
 
+
 class TestSkipsTestFunctions:
     def test_skips_test_functions(self, graph: KnowledgeGraph) -> None:
         process_dead_code(graph)
@@ -171,6 +180,7 @@ class TestSkipsTestFunctions:
         node = graph.get_node(test_id)
         assert node is not None
         assert node.is_dead is False
+
 
 class TestSkipsDunderMethods:
     def test_skips_dunder_methods(self) -> None:
@@ -209,6 +219,7 @@ class TestSkipsDunderMethods:
         assert repr_node is not None
         assert repr_node.is_dead is False
 
+
 class TestReturnsCount:
     def test_returns_count(self, graph: KnowledgeGraph) -> None:
         count = process_dead_code(graph)
@@ -216,11 +227,13 @@ class TestReturnsCount:
         # unused_helper and orphan_function are the two dead symbols.
         assert count == 2
 
+
 class TestEmptyGraph:
     def test_empty_graph(self) -> None:
         g = KnowledgeGraph()
         count = process_dead_code(g)
         assert count == 0
+
 
 def _add_uses_type_relationship(
     graph: KnowledgeGraph,
@@ -237,6 +250,7 @@ def _add_uses_type_relationship(
             target=target_id,
         )
     )
+
 
 class TestSkipsTypeReferencedClasses:
     def test_class_with_uses_type_not_dead(self) -> None:
@@ -278,6 +292,7 @@ class TestSkipsTypeReferencedClasses:
         node = g.get_node(func_id)
         assert node is not None
         assert node.is_dead is True
+
 
 class TestSkipsFrameworkDecoratedFunctions:
     def test_framework_decorated_function_not_dead(self) -> None:
@@ -335,6 +350,7 @@ class TestSkipsFrameworkDecoratedFunctions:
         process_dead_code(g)
 
         assert node.is_dead is True
+
 
 class TestProtocolConformance:
     def test_conforming_class_methods_not_dead(self) -> None:
@@ -427,3 +443,36 @@ class TestProtocolConformance:
         partial_method = g.get_node(partial_method_id)
         assert partial_method is not None
         assert partial_method.is_dead is True
+
+
+class TestAlembicMigrationNotDead:
+    def test_upgrade_downgrade_not_dead(self) -> None:
+        """Alembic upgrade/downgrade with zero incoming CALLS are not dead.
+
+        find_entry_points marks them is_entry_point=True via the alembic
+        predicate; process_dead_code then respects that exemption.
+        """
+        g = KnowledgeGraph()
+        # Production code requires at least one directory before 'migrations/'
+        # (the check is for '/migrations/versions/' with a leading slash).
+        migration_path = 'src/migrations/versions/0001_init.py'
+        _add_file_node(g, migration_path)
+
+        upgrade_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, migration_path, 'upgrade'
+        )
+        downgrade_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, migration_path, 'downgrade'
+        )
+
+        # Run entry-point detection first (as the pipeline does).
+        find_entry_points(g)
+
+        process_dead_code(g)
+
+        upgrade_node = g.get_node(upgrade_id)
+        downgrade_node = g.get_node(downgrade_id)
+        assert upgrade_node is not None
+        assert upgrade_node.is_dead is False
+        assert downgrade_node is not None
+        assert downgrade_node.is_dead is False
