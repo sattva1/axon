@@ -83,3 +83,13 @@ class TestCallInfoExtraProps:
         assert props['in_loop'] is True
         assert props['context_managers'] == ['lock', 'conn']
         assert props['return_consumption'] == 'ignored'
+
+    def test_receiver_type_does_not_leak_into_metadata_json(self) -> None:
+        """receiver_type is a parser-internal hint and must not appear in extra_props."""
+        c = CallInfo(name='m', line=1, receiver='u', receiver_type='User')
+        assert c.extra_props() == {}
+
+    def test_is_reference_does_not_leak_into_metadata_json(self) -> None:
+        """is_reference is a parser-internal discriminator and must not appear in extra_props."""
+        c = CallInfo(name='f', line=1, is_reference=True)
+        assert c.extra_props() == {}

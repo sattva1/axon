@@ -74,6 +74,14 @@ class CallInfo:
     awaited: bool = False
     context_managers: tuple[str, ...] = ()
     return_consumption: str = 'stored'
+    # --- issue-55 additions ---
+    # Canonical class name when the parser resolved the receiver from local
+    # bindings; empty otherwise. Parser-internal hint - must NOT appear in
+    # edge metadata_json (excluded in extra_props below).
+    receiver_type: str = ''
+    # True when this entry is a function reference (alias/container/dict-value)
+    # rather than a live call. Parser-internal - excluded from metadata_json.
+    is_reference: bool = False
 
     def extra_props(self) -> dict[str, Any]:
         """Return non-default Phase-4a fields as serializable dict.
@@ -86,7 +94,16 @@ class CallInfo:
         # Build a dict of current -> default field values and emit only
         # the deltas. Skip the original 4 fields (name/line/receiver/
         # arguments); they are separately represented on the edge.
-        original = {'name', 'line', 'receiver', 'arguments'}
+        # receiver_type and is_reference are parser-internal resolution
+        # hints and must not serialise into edge metadata_json.
+        original = {
+            'name',
+            'line',
+            'receiver',
+            'arguments',
+            'receiver_type',
+            'is_reference',
+        }
         extra: dict[str, Any] = {}
         for f in fields(self):
             if f.name in original:
